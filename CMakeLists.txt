@@ -16,7 +16,6 @@ if(PROJECT_SOURCE_DIR STREQUAL PROJECT_BINARY_DIR)
   message(FATAL_ERROR "In-source builds are not allowed")
 endif()
 
-set(RPS_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/extern/RPS_SDK" CACHE PATH "RPS SDK checkout")
 set(COMMON_LIB_F4VR_PATH "${CMAKE_CURRENT_SOURCE_DIR}/extern/CommonLibF4VR" CACHE PATH "CommonLibF4VR checkout")
 
 set(F4SE_SUPPORT_XBYAK ON CACHE BOOL "" FORCE)
@@ -49,7 +48,6 @@ target_compile_definitions(WeaponVise PRIVATE
   WEAPONVISE_BUILD="${WEAPONVISE_BUILD}"
 )
 target_include_directories(WeaponVise PRIVATE
-  "${RPS_SDK_ROOT}/SDK/ROCK/include"
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 target_link_libraries(WeaponVise PRIVATE

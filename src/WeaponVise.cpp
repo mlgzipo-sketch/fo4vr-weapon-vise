@@ -6,7 +6,7 @@
 // snaps on. Grip on the weapon body and hold to take the weapon back.
 //
 // Work is split in two:
-//   - this plugin reads the hands (ROCK) every frame, finds the parts in the
+//   - this plugin reads the hands (FRIK, OpenVR) every frame, finds the parts in the
 //     weapon's 3D, carries loose parts and decides what the player did;
 //   - the quest script WeaponViseMain does everything that touches the game's
 //     inventory and records (drop, AttachMod, RemoveMod, spawning parts). It
@@ -16,9 +16,9 @@
 // models have no collision, so they never fall: this plugin keeps each part
 // where the player put it by writing its 3D transform every frame.
 
-#include <ROCK/Hands.h>
-#include <ROCK/Input.h>
 #include "Runtime.h"
+#include "api/FRIKApiV2.h"
+#include "api/openvr.h"
 
 #include <F4SE/F4SE.h>
 #include <RE/Fallout.h>
@@ -42,15 +42,13 @@
 namespace
 {
     using Clock = std::chrono::steady_clock;
-    namespace hands = rock::api::hands;
-    namespace input = rock::api::input;
+    using frik::api::FRIKApiV2;
     using weaponvise::runtime::logInfo;
     using weaponvise::runtime::logNote;
     using weaponvise::runtime::logWarning;
     using Mod = RE::BGSMod::Attachment::Mod;
 
-    const hands::ApiV1* g_hands{};
-    const input::ApiV1* g_input{};
+    vr::IVRSystem* g_vr{ nullptr };
 
     // ------------------------------------------------------------ settings
 
@@ -58,6 +56,7 @@ namespace
     {
         int gripButton{ 2 };            // OpenVR button id: 2 = grip
         int weaponHand{ 0 };            // 0 = right, 1 = left
+        int forwardAxis{ 1 };           // controller axis that points forward: 0 = X, 1 = Y, 2 = Z
         float benchReach{ 170.0f };     // hand this close to a workbench may clamp
         float clampHold{ 0.5f };        // seconds of grip to clamp
         float grabRadius{ 7.0f };       // hand this close to a part grabs it
@@ -93,6 +92,7 @@ namespace
                 auto& s = g_settings;
                 if (key == "iGripButton") s.gripButton = static_cast<int>(value);
                 else if (key == "iWeaponHand") s.weaponHand = static_cast<int>(value);
+                else if (key == "iForwardAxis") s.forwardAxis = std::clamp(static_cast<int>(value), 0, 2);
                 else if (key == "fBenchReach") s.benchReach = value;
                 else if (key == "fClampHold") s.clampHold = value;
                 else if (key == "fGrabRadius") s.grabRadius = value;
@@ -212,7 +212,7 @@ namespace
     }
 
     // ------------------------------------------------------------ shared state
-    // Written by the Papyrus natives (script threads), read in the ROCK frame.
+    // Written by the Papyrus natives (script threads), read in the frame callback.
 
     enum Command : int
     {
@@ -293,7 +293,7 @@ namespace
     }
 
     // ------------------------------------------------------------ memory safety
-    // ROCK treats a fault in our frame callback as fatal, so scene graph
+    // A fault in the frame callback would take the game down, so scene graph
     // pointers are checked before use.
 
     bool readable(const void* address, std::size_t size) noexcept
@@ -462,38 +462,40 @@ namespace
         logNote(message);
     }
 
-    bool readHand(std::uint64_t owner, int index) noexcept
+    bool gripHeld(int index) noexcept
+    {
+        if (!g_vr) {
+            return false;
+        }
+        const auto device = g_vr->GetTrackedDeviceIndexForControllerRole(index == 0 ? vr::TrackedControllerRole_RightHand : vr::TrackedControllerRole_LeftHand);
+        if (device == vr::k_unTrackedDeviceIndexInvalid) {
+            return false;
+        }
+        vr::VRControllerState_t state{};
+        if (!g_vr->GetControllerState(device, &state, sizeof(state))) {
+            return false;
+        }
+        return (state.ulButtonPressed & vr::ButtonMaskFromId(static_cast<vr::EVRButtonId>(g_settings.gripButton))) != 0;
+    }
+
+    bool readHand(int index) noexcept
     {
         auto& hand = g_hands_state[index];
-        const auto id = index == 0 ? rock::api::Hand::Right : rock::api::Hand::Left;
         hand.previousGrip = hand.grip;
         hand.valid = false;
-        if (!g_hands) {
+        const auto* frik = FRIKApiV2::inst;
+        if (!frik || !frik->getTrackedHandTransform) {
             return false;
         }
-        hands::HandFrameV1 frame{};
-        if (g_hands->getHandFrameV1(owner, id, &frame) != rock::api::Status::Ok ||
-            (frame.flags & static_cast<std::uint32_t>(hands::HandFrameFlagV1::Valid)) == 0) {
+        RE::NiTransform wand;
+        if (!frik->getTrackedHandTransform(index == 0 ? FRIKApiV2::Hand::Right : FRIKApiV2::Hand::Left, FRIKApiV2::TrackedHandKind::Wand, &wand)) {
             return false;
         }
-        for (int row = 0; row < 3; ++row) {
-            for (int column = 0; column < 3; ++column) {
-                hand.frame.rotate.entry[row][column] = frame.transform.rotate[row * 3 + column];
-            }
-        }
-        hand.frame.translate = { frame.transform.translate[0], frame.transform.translate[1], frame.transform.translate[2] };
+        hand.frame = wand;
         hand.frame.scale = 1.0f;
         hand.valid = true;
-
-        bool grip = false;
-        if (g_input) {
-            input::RawWandButtonStateV1 button{};
-            if (g_input->getRawWandButtonStateV1(owner, id, static_cast<std::uint32_t>(g_settings.gripButton), &button) == rock::api::Status::Ok) {
-                grip = button.available && button.held;
-            }
-        }
-        hand.grip = grip;
-        if (grip && !hand.previousGrip) {
+        hand.grip = gripHeld(index);
+        if (hand.grip && !hand.previousGrip) {
             hand.gripSince = Clock::now();
         }
         return true;
@@ -501,8 +503,9 @@ namespace
 
     RE::NiPoint3 fingers(const Hand& hand) noexcept
     {
-        // ROCK hand space: +X runs along the fingers; world = R^T * v.
-        return { hand.frame.rotate.entry[0][0], hand.frame.rotate.entry[0][1], hand.frame.rotate.entry[0][2] };
+        // A local axis in world space is a row of the rotation (world = R^T * v).
+        const int axis = g_settings.forwardAxis;
+        return { hand.frame.rotate.entry[axis][0], hand.frame.rotate.entry[axis][1], hand.frame.rotate.entry[axis][2] };
     }
 
     float seconds(Clock::time_point since) noexcept
@@ -921,10 +924,10 @@ namespace
         }
     }
 
-    void update(std::uint64_t owner) noexcept
+    void update() noexcept
     {
-        readHand(owner, 0);
-        readHand(owner, 1);
+        readHand(0);
+        readHand(1);
         syncShared();
 
         if (!g_weapon) {
@@ -1166,32 +1169,48 @@ namespace
         return true;
     }
 
-    // ------------------------------------------------------------ ROCK runtime hooks
+    // ------------------------------------------------------------ frame hook
 
-    bool connect(rock::api::Client& client, rock::api::QueryInterfaceV1) noexcept
+    void FRIK_CALL onFrikFrame(std::uint32_t, void*) noexcept
     {
-        if (client.acquire(static_cast<std::uint32_t>(hands::PermissionV1::Read), g_hands) != rock::api::Status::Ok) {
-            logWarning("ROCK hands interface unavailable");
-            return false;
+        __try {
+            update();
+        } __except (1) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                logWarning("A fault inside the frame update was caught; WeaponVise keeps running");
+            }
         }
-        if (client.acquire(static_cast<std::uint32_t>(input::PermissionV1::Read), g_input) != rock::api::Status::Ok) {
-            logWarning("ROCK input interface unavailable");
-            return false;
-        }
-        return true;
     }
 
-    bool start(std::uint64_t) noexcept
+    void gameReady() noexcept
     {
+        static bool done = false;
+        if (!done) {
+            done = true;
+            const int error = FRIKApiV2::initialize(3);
+            char message[192]{};
+            if (error != 0) {
+                std::snprintf(message, sizeof(message), "FRIK API v2.3+ unavailable (error %d); WeaponVise cannot see the hands", error);
+                logWarning(message);
+            } else {
+                const bool hooked = FRIKApiV2::inst->registerFrameCallback("WeaponVise",
+                    static_cast<std::uint32_t>(FRIKApiV2::FramePhase::AfterWorldFinal), onFrikFrame, nullptr, 0);
+                std::snprintf(message, sizeof(message), "FRIK %s, API v2.%u: frame callback %s",
+                    FRIKApiV2::inst->getModVersion(), FRIKApiV2::inst->getVersion(), hooked ? "registered" : "FAILED");
+                logNote(message);
+            }
+        }
+        if (!g_vr) {
+            using GetInterface_t = void* (*)(const char*, vr::EVRInitError*);
+            const auto module = REX::W32::GetModuleHandleW(L"openvr_api.dll");
+            const auto get = module ? reinterpret_cast<GetInterface_t>(REX::W32::GetProcAddress(module, "VR_GetGenericInterface")) : nullptr;
+            vr::EVRInitError error = vr::VRInitError_None;
+            g_vr = get ? static_cast<vr::IVRSystem*>(get(vr::IVRSystem_Version, &error)) : nullptr;
+            logNote(g_vr ? "OpenVR ready: reading the grip button" : "OpenVR not found: grip cannot be read");
+        }
         logNote("WeaponVise ready (build " WEAPONVISE_BUILD ")");
-        return true;
-    }
-
-    void stop(std::uint64_t) noexcept {}
-
-    void frame(std::uint64_t owner, const rock::api::core::SnapshotV1&) noexcept
-    {
-        update(owner);
     }
 }
 
@@ -1202,10 +1221,7 @@ namespace weaponvise::runtime
         static const Definition value{
             .pluginName = "WeaponVise",
             .pluginVersion = WEAPONVISE_VERSION,
-            .onConnect = &connect,
-            .onStart = &start,
-            .onStop = &stop,
-            .onFrame = &frame,
+            .onGameReady = &gameReady,
         };
         return value;
     }

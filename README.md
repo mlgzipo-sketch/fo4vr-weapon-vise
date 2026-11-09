@@ -16,7 +16,7 @@
 8. Если уйдёшь от верстака, пистолет и детали сами вернутся в инвентарь.
 
 ## Требования
-F4SE VR, ROCK, Address Library для F4SE VR.
+F4SE VR, FRIK (API v2.3 или новее), Address Library для F4SE VR. ROCK не нужен.
 
 ## Установка
 Через Vortex (архив), или распакуй в папку `Data` игры. Включи `WeaponVise.esp`.
@@ -30,5 +30,5 @@ F4SE VR, ROCK, Address Library для F4SE VR.
 Лог: `Документы\My Games\Fallout4VR\F4SE\WeaponVise.log`.
 
 ## Сборка
-GitHub Actions собирает DLL (CMake, CommonLibF4VR, RPS SDK), компилирует скрипты (Caprica) и делает ESP (`tools/build_esp.py`).
+GitHub Actions собирает DLL (CMake, CommonLibF4VR), компилирует скрипты (Caprica) и делает ESP (`tools/build_esp.py`).
 Таблицу `data/parts.csv` делает `tools/gen_parts.py` из Fallout4.esm.

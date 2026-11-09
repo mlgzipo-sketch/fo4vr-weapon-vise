@@ -1,4 +1,4 @@
-// Based on the RPS SDK example runtime (github.com/brunocatani/RPS_SDK).
+// F4SE entry points and logging.
 #include "Runtime.h"
 
 #include <F4SE/F4SE.h>
@@ -18,13 +18,7 @@
 
 namespace
 {
-    using weaponvise::runtime::hasLifecycleFlag;
-
-    rock::api::Client g_client;
-    const rock::api::core::ApiV1* g_core{};
     std::shared_ptr<spdlog::logger> g_logger;
-    std::uint64_t g_ownerToken{ 0 };
-    std::uint64_t g_callbackToken{ 0 };
 
     bool g_verbose{ false };
 
@@ -77,75 +71,6 @@ namespace
         g_verbose = readDebugLogSetting();
     }
 
-    void disconnectRock() noexcept
-    {
-        const auto& example = weaponvise::runtime::definition();
-        if (g_ownerToken != 0 && example.onStop) {
-            example.onStop(g_ownerToken);
-        }
-        const auto result=g_client.close();
-        if(result!=rock::api::Status::Ok && result!=rock::api::Status::OwnerNotRegistered) {
-            weaponvise::runtime::logWarning("ROCK owner cleanup was rejected");return;
-        }
-        g_callbackToken=0;g_ownerToken=0;g_core=nullptr;
-    }
-
-    void ROCK_CALL onRockFrame(
-        const rock::api::core::SnapshotV1* snapshot,
-        void*)
-    {
-        if (!snapshot || g_ownerToken == 0) {
-            return;
-        }
-        try {
-            const auto& example = weaponvise::runtime::definition();
-            if (example.onFrame) {
-                example.onFrame(g_ownerToken, *snapshot);
-            }
-        } catch (const std::exception& error) {
-            weaponvise::runtime::logWarning(error.what());
-        } catch (...) {
-            weaponvise::runtime::logWarning("Unhandled frame callback failure");
-        }
-    }
-
-    bool connectRock() noexcept
-    {
-        if (g_ownerToken != 0) {
-            return true;
-        }
-
-        const auto& example = weaponvise::runtime::definition();
-        const auto module=GetModuleHandleA("ROCK.dll");
-        const auto query=module?reinterpret_cast<rock::api::QueryInterfaceV1>(GetProcAddress(module,rock::api::kQueryExportName)):nullptr;
-        if(g_client.connect(query,example.pluginName)!=rock::api::Status::Ok)return false;
-        if(g_client.acquire(5,g_core)!=rock::api::Status::Ok ||
-           (example.onConnect && !example.onConnect(g_client,query))) {
-            (void)g_client.close();
-            weaponvise::runtime::logWarning("A required ROCK interface major or permission is unavailable");return false;
-        }
-        g_ownerToken=g_client.owner();
-        if (example.onStart && !example.onStart(g_ownerToken)) {
-            disconnectRock();
-            return false;
-        }
-
-        const auto callbackResult =
-            g_core->registerFrameCallbackForOwnerV1(
-                g_ownerToken,
-                &onRockFrame,
-                nullptr,
-                &g_callbackToken);
-        if (callbackResult != rock::api::Status::Ok || g_callbackToken == 0) {
-            disconnectRock();
-            weaponvise::runtime::logWarning("ROCK owner frame callback registration failed");
-            return false;
-        }
-
-        weaponvise::runtime::logNote("Connected to independently negotiated ROCK providers");
-        return true;
-    }
-
     void onF4SEMessage(F4SE::MessagingInterface::Message* message) noexcept
     {
         if (!message) {
@@ -156,10 +81,10 @@ namespace
         case F4SE::MessagingInterface::kGameDataReady:
         case F4SE::MessagingInterface::kPostLoadGame:
         case F4SE::MessagingInterface::kNewGame:
-            (void)connectRock();
+            if (const auto ready = weaponvise::runtime::definition().onGameReady) {
+                ready();
+            }
             break;
-        // The ROCK owner stays registered across save loads: ROCK rejects
-        // closing it from the load message, and frames keep flowing anyway.
         default:
             break;
         }
