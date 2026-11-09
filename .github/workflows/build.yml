@@ -1,0 +1,116 @@
+name: build
+
+on:
+  push:
+    branches-ignore:
+      - 'dist/**'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup cmake
+        uses: lukka/get-cmake@latest
+
+      - name: Setup vcpkg
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg "$env:VCPKG_ROOT"
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          New-Item -ItemType Directory -Force "$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-Null
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\vcpkg-cache
+          key: vcpkg-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      - name: Get Caprica (open-source Papyrus compiler)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v0.3.0 -R Orvid/Caprica -D caprica
+          Get-ChildItem caprica -Filter *.zip | ForEach-Object { Expand-Archive $_.FullName -DestinationPath caprica -Force }
+          Get-ChildItem caprica -Filter *.7z | ForEach-Object { 7z x $_.FullName -ocaprica -y | Out-Null }
+          $exe = Get-ChildItem caprica -Recurse -Filter Caprica.exe | Select-Object -First 1
+          if (-not $exe) { Get-ChildItem caprica -Recurse | Format-Table FullName; throw "Caprica.exe not found" }
+          "CAPRICA=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Compile scripts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package\Scripts | Out-Null
+          $out = (Resolve-Path package\Scripts).Path
+          Copy-Item Scripts\Source\User\WeaponVise.psc stubs\
+          $stubs = (Resolve-Path stubs).Path
+          # run from the source folder so the scripts get no namespace
+          Push-Location Scripts\Source\User
+          foreach ($script in @("WeaponVise.psc", "WeaponViseMain.psc")) {
+            & $env:CAPRICA --game fallout4 -i $stubs -o $out $script
+            if ($LASTEXITCODE -ne 0) { Pop-Location; throw "Caprica failed on $script" }
+          }
+          Pop-Location
+          Get-ChildItem package\Scripts -Recurse | Format-Table FullName, Length
+          foreach ($pex in @("WeaponVise.pex", "WeaponViseMain.pex")) {
+            if (-not (Test-Path "package\Scripts\$pex")) { throw "no $pex produced" }
+          }
+          New-Item -ItemType Directory -Force package\Scripts\Source\User | Out-Null
+          Copy-Item Scripts\Source\User\*.psc package\Scripts\Source\User
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $plugins = "package\F4SE\Plugins"
+          New-Item -ItemType Directory -Force $plugins | Out-Null
+          Copy-Item build\Release\WeaponVise.dll $plugins
+          Copy-Item WeaponVise.ini $plugins
+          python tools\build_esp.py package\WeaponVise.esp
+          if (-not (Test-Path "$plugins\WeaponVise_parts.csv")) { throw "parts table missing" }
+          Copy-Item README.md package\WeaponVise-README.md
+          Compress-Archive -Path package\* -DestinationPath WeaponVise.zip
+
+      - name: Upload mod
+        uses: actions/upload-artifact@v4
+        with:
+          name: WeaponVise
+          path: package
+
+      - name: Publish build to the dist branch
+        if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $branch = "dist/${{ github.ref_name }}"
+          Copy-Item WeaponVise.zip "WeaponVise-$sha.zip"
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git checkout --orphan dist-tmp
+          git rm -rfq --cached .
+          Remove-Item -Recurse -Force (Get-ChildItem -Force -Exclude .git,"WeaponVise-$sha.zip")
+          git add -A
+          git commit -qm "Build $sha"
+          git push -f origin "HEAD:refs/heads/$branch"
