@@ -1,4 +1,4 @@
-Scriptname WeaponVise Native Hidden
+Scriptname WeaponVise Native
 {Functions of WeaponVise.dll (F4SE plugin) for the workbench script.}
 
 Function SetWorkbench(ObjectReference akBench) global native
