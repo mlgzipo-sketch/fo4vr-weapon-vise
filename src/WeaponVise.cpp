@@ -16,12 +16,16 @@
 // models have no collision, so they never fall: this plugin keeps each part
 // where the player put it by writing its 3D transform every frame.
 
+#include <format>
+#include <string>
+
 #include "Runtime.h"
-#include "api/FRIKApiV2.h"
-#include "api/openvr.h"
 
 #include <F4SE/F4SE.h>
 #include <RE/Fallout.h>
+
+#include "api/FRIKApiV2.h"
+#include "api/openvr.h"
 
 #include <algorithm>
 #include <array>
