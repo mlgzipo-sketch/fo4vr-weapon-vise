@@ -3,7 +3,7 @@
 
 Records:
   MISC WV_Part_*       one loose part per weapon mod with a visible model of its own
-  FLST WV_Mods / WV_PartItems   parallel lists (same order, no duplicates)
+  FLST WV_Mods / WV_PartItems / WV_LooseMods   parallel lists (same order)
   FLST WV_Weapons      weapons that can be clamped
   QUST WV_Quest        start-game-enabled quest running WeaponViseMain
 Plain .esp, form version 131, master Fallout4.esm; works in Fallout 4 VR.
@@ -58,7 +58,7 @@ for r in parts:
         sub('OBND', b'\0' * 12),
         sub('FULL', zstr(pretty(r['edid']), 'latin1')),
         sub('MODL', zstr(r['model'], 'latin1')),
-        sub('DATA', struct.pack('<If', 0, 0.0)),
+        sub('DATA', struct.pack('<If', 5, 0.5)),
     ]))
 
 def flst(edid, forms):
@@ -66,6 +66,7 @@ def flst(edid, forms):
 
 flst('WV_Mods', [r['omod'] for r in parts])
 flst('WV_PartItems', part_items)
+flst('WV_LooseMods', [r['loose'] for r in parts])
 flst('WV_Weapons', sorted({r['weapon'] for r in rows}))
 
 def wstr(s): b = s.encode('latin1'); return struct.pack('<H', len(b)) + b
@@ -74,6 +75,7 @@ def prop_obj(name, formid): return wstr(name) + bytes([1, 1]) + struct.pack('<Hh
 props = {
     'WorkbenchKeyword': WORKBENCH_KEYWORD,
     'WV_Mods': ids['WV_Mods'], 'WV_PartItems': ids['WV_PartItems'], 'WV_Weapons': ids['WV_Weapons'],
+    'WV_LooseMods': ids['WV_LooseMods'],
 }
 vmad = struct.pack('<hhH', 6, 2, 1) + wstr('WeaponViseMain') + b'\0' + struct.pack('<H', len(props))
 vmad += b''.join(prop_obj(k, v) for k, v in props.items())

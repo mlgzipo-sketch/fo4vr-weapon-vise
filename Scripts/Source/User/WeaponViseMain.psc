@@ -7,6 +7,7 @@ Keyword Property WorkbenchKeyword Auto Const
 FormList Property WV_Mods Auto Const          ; mods that are physical parts
 FormList Property WV_PartItems Auto Const     ; the part item of each mod (same order)
 FormList Property WV_Weapons Auto Const       ; weapons that can be clamped
+FormList Property WV_LooseMods Auto Const     ; the game's loose mod item of each mod (same order)
 
 int Property CmdClamp = 1 AutoReadOnly
 int Property CmdUnclamp = 2 AutoReadOnly
@@ -15,7 +16,7 @@ int Property CmdAttach = 4 AutoReadOnly
 int Property CmdDrop = 5 AutoReadOnly
 int Property TimerScan = 1 AutoReadOnly
 int Property TimerFast = 2 AutoReadOnly
-int Property MaxParts = 12 AutoReadOnly
+int Property MaxParts = 120 AutoReadOnly
 
 ObjectReference Bench
 ObjectReference Clamped
@@ -24,6 +25,7 @@ ObjectReference[] Parts
 ObjectMod[] PartMods
 bool FastRunning
 bool Busy
+int SkipPartPickups   ; part items we put into the inventory ourselves (attaching)
 
 Event OnInit()
 	Setup()
@@ -34,7 +36,14 @@ Function Setup()
 		Parts = new ObjectReference[0]
 		PartMods = new ObjectMod[0]
 	endif
-	RegisterForRemoteEvent(Game.GetPlayer(), "OnPlayerLoadGame")
+	Actor player = Game.GetPlayer()
+	RegisterForRemoteEvent(player, "OnPlayerLoadGame")
+	; Parts and loose mods change into each other when they enter or leave the inventory.
+	AddInventoryEventFilter(WV_PartItems)
+	AddInventoryEventFilter(WV_LooseMods)
+	RegisterForRemoteEvent(player, "OnItemAdded")
+	RegisterForRemoteEvent(player, "OnItemRemoved")
+	SkipPartPickups = 0
 	FastRunning = false
 	Busy = false
 	StartTimer(1.0, TimerScan)
@@ -54,9 +63,79 @@ Event Actor.OnPlayerLoadGame(Actor akSender)
 	endwhile
 EndEvent
 
+; A part picked up (by hand or by activating it) becomes the game's loose mod,
+; so the workbench menu and other weapons can use it.
+Event ObjectReference.OnItemAdded(ObjectReference akSender, Form akBaseItem, int aiItemCount, ObjectReference akItemReference, ObjectReference akSourceContainer)
+	int i = WV_PartItems.Find(akBaseItem)
+	if i < 0
+		return
+	endif
+	if akItemReference
+		ForgetPartRef(akItemReference)
+	endif
+	if SkipPartPickups > 0
+		SkipPartPickups -= 1
+		return
+	endif
+	Actor player = Game.GetPlayer()
+	player.RemoveItem(akBaseItem, aiItemCount, true)
+	player.AddItem(WV_LooseMods.GetAt(i), aiItemCount, true)
+EndEvent
+
+; A loose mod dropped into the world turns into the part itself.
+Event ObjectReference.OnItemRemoved(ObjectReference akSender, Form akBaseItem, int aiItemCount, ObjectReference akItemReference, ObjectReference akDestContainer)
+	if akDestContainer || !akItemReference
+		return
+	endif
+	int i = WV_LooseMods.Find(akBaseItem)
+	if i < 0 || Parts.Length >= MaxParts
+		return
+	endif
+	WaitFor3D(akItemReference)
+	float[] pose = new float[4]
+	pose[0] = akItemReference.GetPositionX()
+	pose[1] = akItemReference.GetPositionY()
+	pose[2] = akItemReference.GetPositionZ() + 3.0
+	pose[3] = 0.0
+	akItemReference.Disable()
+	akItemReference.Delete()
+	int n = aiItemCount
+	while n > 0 && Parts.Length < MaxParts
+		SpawnPart(i, pose, false)
+		pose[2] = pose[2] + 4.0
+		n -= 1
+	endwhile
+EndEvent
+
+Function ForgetPartRef(ObjectReference part)
+	int k = Parts.Find(part)
+	if k >= 0
+		Parts.Remove(k)
+		PartMods.Remove(k)
+	endif
+	WeaponVise.ForgetPart(part)
+EndFunction
+
+; Parts that are gone (picked up, deleted) are dropped from the list.
+Function PruneParts()
+	int i = Parts.Length - 1
+	while i >= 0
+		ObjectReference part = Parts[i]
+		if !part || part.IsDeleted() || part.GetContainer()
+			Parts.Remove(i)
+			PartMods.Remove(i)
+			WeaponVise.ForgetPart(part)
+		endif
+		i -= 1
+	endwhile
+EndFunction
+
 Event OnTimer(int aiTimerID)
 	if aiTimerID == TimerScan
 		Scan()
+		if !Busy
+			PruneParts()
+		endif
 		StartTimer(1.0, TimerScan)
 	elseif aiTimerID == TimerFast
 		if !Busy
@@ -96,7 +175,6 @@ Function Scan()
 			Busy = true
 			Clamped = None
 			WeaponVise.SetWeapon(None, new ObjectMod[0])
-			ReturnParts()
 			Busy = false
 		elseif !Clamped.Is3DLoaded() || player.GetDistance(Clamped) > 700.0
 			Busy = true
@@ -171,28 +249,7 @@ Function Clamp()
 	Clamped = ref
 	ClampedBase = w
 	WeaponVise.SetWeapon(ref, ref.GetAllMods())
-	LayOutParts()
 	WeaponVise.Notify(4)
-EndFunction
-
-; Loose mods for this weapon come out of the inventory as real parts.
-Function LayOutParts()
-	Actor player = Game.GetPlayer()
-	int i = 0
-	while i < WV_Mods.GetSize() && Parts.Length < MaxParts
-		ObjectMod m = WV_Mods.GetAt(i) as ObjectMod
-		MiscObject loose = m.GetLooseMod()
-		int n = 0
-		if loose
-			n = player.GetItemCount(loose)
-		endif
-		while n > 0 && Parts.Length < MaxParts
-			player.RemoveItem(loose, 1, true)
-			SpawnPart(i, WeaponVise.RackPose(Parts.Length), false)
-			n -= 1
-		endwhile
-		i += 1
-	endwhile
 EndFunction
 
 ObjectReference Function SpawnPart(int index, float[] pose, bool inHand)
@@ -204,6 +261,12 @@ ObjectReference Function SpawnPart(int index, float[] pose, bool inHand)
 	part.SetPosition(pose[0], pose[1], pose[2])
 	part.SetAngle(0.0, 0.0, pose[3])
 	part.Enable()
+	WaitFor3D(part)
+	if inHand
+		part.SetMotionType(2, true)   ; keyframed: follows the hand that pulled it off
+	else
+		part.SetMotionType(1, true)   ; a normal physical object
+	endif
 	Parts.Add(part)
 	PartMods.Add(m)
 	WeaponVise.AddPart(part, m, inHand)
@@ -242,7 +305,11 @@ Function AttachPart(ObjectReference part, ObjectMod m)
 	Parts.Remove(k)
 	PartMods.Remove(k)
 	WeaponVise.ForgetPart(part)
-	part.Delete()
+	; taken like a pickup (what ROCK expects of an object near the hand), then removed
+	SkipPartPickups += 1
+	Actor player = Game.GetPlayer()
+	player.AddItem(part, 1, true)
+	player.RemoveItem(WV_PartItems.GetAt(WV_Mods.Find(m)), 1, true)
 	ObjectMod[] after = Clamped.GetAllMods()
 	WeaponVise.SetWeapon(Clamped, after)
 	; whatever the new part pushed out goes onto the bench (or back to the inventory)
@@ -252,9 +319,9 @@ Function AttachPart(ObjectReference part, ObjectMod m)
 		if old && old != m && after.Find(old) < 0
 			int j = WV_Mods.Find(old)
 			if j >= 0 && Parts.Length < MaxParts
-				SpawnPart(j, WeaponVise.RackPose(Parts.Length), false)
+				SpawnPart(j, WeaponVise.CommandPose(), false)
 			elseif !WeaponVise.IsFreeMod(old) && old.GetLooseMod()
-				Game.GetPlayer().AddItem(old.GetLooseMod(), 1, true)
+				player.AddItem(old.GetLooseMod(), 1, true)
 			endif
 		endif
 		b += 1
@@ -265,6 +332,7 @@ Function DropPart(ObjectReference part)
 	if part && Parts.Find(part) >= 0
 		float[] pose = WeaponVise.CommandPose()
 		part.SetPosition(pose[0], pose[1], pose[2])
+		part.SetMotionType(1, true)   ; let go: it falls and ROCK can pick it up
 	endif
 EndFunction
 
@@ -290,24 +358,4 @@ Function Unclamp(bool equip)
 			WeaponVise.Notify(6)
 		endif
 	endif
-	ReturnParts()
-EndFunction
-
-Function ReturnParts()
-	Actor player = Game.GetPlayer()
-	int i = Parts.Length - 1
-	while i >= 0
-		ObjectReference part = Parts[i]
-		ObjectMod m = PartMods[i]
-		if m && m.GetLooseMod()
-			player.AddItem(m.GetLooseMod(), 1, true)
-		endif
-		WeaponVise.ForgetPart(part)
-		if part
-			part.Delete()
-		endif
-		i -= 1
-	endwhile
-	Parts = new ObjectReference[0]
-	PartMods = new ObjectMod[0]
 EndFunction

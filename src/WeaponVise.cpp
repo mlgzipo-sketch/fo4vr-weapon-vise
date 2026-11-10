@@ -67,7 +67,7 @@ namespace
         float viseZ{ 68.0f };
         float viseLift{ 9.0f };         // the clamped weapon sits this far above the vise point
         float clampHold{ 0.5f };        // seconds of grip to clamp
-        float grabRadius{ 9.0f };       // hand this close to a part grabs it
+        float grabRadius{ 10.0f };       // hand this close to a part grabs it
         float pullDistance{ 8.0f };     // hand moved this far pulls a part off
         float attachRadius{ 9.0f };     // part this close to its place snaps on
         float attachRadiusAny{ 6.0f };  // ...or this close to the weapon when its place is unknown
@@ -80,7 +80,7 @@ namespace
         float rackStep{ 6.0f };
         int rackPerRow{ 6 };
         bool logGrab{ true };           // log what each grip press near the weapon found
-        bool refresh3D{ true };         // reload the weapon's 3D when it does not show a change
+        bool refresh3D{ false };         // reload the weapon's 3D when it does not show a change
         bool logTree{ true };
         bool messages{ true };
     } g_settings;
@@ -784,32 +784,9 @@ namespace
                         distance(hand.point, hand.frame.translate));
                     logNote(text);
                 }
-                // 1) a loose part
+                // Loose parts are physical objects: ROCK picks them up, not us.
                 float best = g_settings.grabRadius;
-                std::uint32_t bestPart = 0;
-                RE::NiAVObject* best3D = nullptr;
-                for (auto& [id, part] : g_parts) {
-                    if (part.carriedBy >= 0) {
-                        continue;
-                    }
-                    auto* ref = lookupRef(id);
-                    auto* root = ref ? ref->Get3D() : nullptr;
-                    if (!looksLikeObject(root)) {
-                        continue;
-                    }
-                    const float d = distance(hand.point, centerOf(root));
-                    if (d < best) {
-                        best = d;
-                        bestPart = id;
-                        best3D = root;
-                    }
-                }
-                if (bestPart) {
-                    startCarry(index, bestPart, best3D->world);
-                    break;
-                }
                 // 2) a part on the weapon
-                best = g_settings.grabRadius;
                 const Anchor* bestAnchor = nullptr;
                 for (const auto& anchor : g_anchors) {
                     const float d = distance(hand.point, anchor.center);
@@ -920,26 +897,6 @@ namespace
         (void)released;
     }
 
-    void keepPartsInPlace() noexcept
-    {
-        for (auto& [id, part] : g_parts) {
-            if (part.carriedBy != -1) {
-                continue;
-            }
-            auto* ref = lookupRef(id);
-            auto* root = ref ? ref->Get3D() : nullptr;
-            if (!looksLikeObject(root)) {
-                continue;
-            }
-            if (!part.placed) {
-                part.home = root->world;
-                part.placed = true;
-                continue;
-            }
-            place3D(root, part.home);
-        }
-    }
-
     void syncShared() noexcept
     {
         std::vector<std::pair<std::uint32_t, std::uint32_t>> added;
@@ -1009,6 +966,119 @@ namespace
         }
     }
 
+    // The clamped weapon must not be a physics object: ROCK would grab it as a loose
+    // weapon, and its cached bodies go stale when a mod change rebuilds the model.
+    std::uint64_t g_detachedRevision{ ~0ull };
+    RE::NiAVObject* g_detached3D{ nullptr };
+    Clock::time_point g_detachTime{};
+    int g_detachPasses{ 0 };
+
+    void keepWeaponOutOfPhysics(RE::TESObjectREFR* weapon, RE::NiAVObject* root) noexcept
+    {
+        if (root != g_detached3D || g_revision != g_detachedRevision) {
+            g_detached3D = root;
+            g_detachedRevision = g_revision;
+            g_detachPasses = 0;
+            g_detachTime = Clock::now();
+        }
+        // right away, then again a little later: a mod change may rebuild the collision
+        static constexpr float passes[] = { 0.0f, 0.25f, 0.75f, 2.0f };
+        if (g_detachPasses >= 4 || seconds(g_detachTime) < passes[g_detachPasses]) {
+            return;
+        }
+        ++g_detachPasses;
+        const bool done = weapon->DetachHavok(root);
+        if (g_detachPasses == 1) {
+            char text[96]{};
+            std::snprintf(text, sizeof(text), "Weapon %08X taken out of physics (%d)", weapon->GetFormID(), done);
+            logNote(text);
+        }
+    }
+
+    // A part let go of (ROCK drops it) next to its place on the weapon goes on.
+    void attachReleasedParts(RE::NiAVObject* weapon3D) noexcept
+    {
+        bool released = false;
+        for (const auto& hand : g_hands_state) {
+            released = released || (hand.valid && hand.previousGrip && !hand.grip && hand.mode != Hand::Mode::Carry);
+        }
+        if (!released) {
+            return;
+        }
+        for (auto& [id, part] : g_parts) {
+            if (part.carriedBy != -1) {
+                continue;
+            }
+            auto* ref = lookupRef(id);
+            auto* root = ref ? ref->Get3D() : nullptr;
+            const auto* info = partInfo(part.mod);
+            if (!looksLikeObject(root) || !info) {
+                continue;
+            }
+            const auto here = centerOf(root);
+            RE::NiPoint3 target{};
+            bool snap = false;
+            if (targetFor(*info, weapon3D, target)) {
+                snap = distance(here, target) < g_settings.attachRadius;
+            } else {
+                snap = distance(here, centerOf(weapon3D)) < g_settings.attachRadiusAny + weapon3D->worldBound.fRadius * 0.5f;
+            }
+            char text[160]{};
+            if (g_settings.logGrab) {
+                std::snprintf(text, sizeof(text), "Release: part %08X %s %.1f from its place%s", id, info->edid.c_str(),
+                    targetFor(*info, weapon3D, target) ? distance(here, target) : -1.0f, snap ? " -> attach" : "");
+                if (distance(here, centerOf(weapon3D)) < 40.0f) {
+                    logNote(text);
+                }
+            }
+            if (snap) {
+                PendingCommand command;
+                command.type = kAttach;
+                command.mod = part.mod;
+                command.part = id;
+                command.pose = poseOf(here, 0.0f);
+                pushCommand(command);
+                part.carriedBy = -2;
+                return;  // one at a time
+            }
+        }
+    }
+
+    // Tell which part the hand would take off.
+    std::uint32_t g_hinted{ 0 };
+    Clock::time_point g_hintTime{};
+
+    void hintPart(int index) noexcept
+    {
+        const auto& hand = g_hands_state[index];
+        if (!hand.valid || hand.mode != Hand::Mode::Idle) {
+            return;
+        }
+        const Anchor* nearest = nullptr;
+        float best = g_settings.grabRadius;
+        for (const auto& anchor : g_anchors) {
+            const float d = distance(hand.point, anchor.center);
+            if (d < best) {
+                best = d;
+                nearest = &anchor;
+            }
+        }
+        if (nearest && nearest->mod != g_hinted && seconds(g_hintTime) > 1.5f) {
+            const auto* info = partInfo(nearest->mod);
+            if (info) {
+                char text[160]{};
+                std::snprintf(text, sizeof(text), "Грип и потянуть: снять %s", slotName(info->slot));
+                hud(text);
+                g_hintTime = Clock::now();
+            }
+        }
+        if (nearest) {
+            g_hinted = nearest->mod;
+        } else if (seconds(g_hintTime) > 3.0f) {
+            g_hinted = 0;
+        }
+    }
+
     void update() noexcept
     {
         readHand(0);
@@ -1020,7 +1090,6 @@ namespace
                 hand.mode = Hand::Mode::Idle;
             }
             updateClampGesture();
-            keepPartsInPlace();
             return;
         }
         auto* weaponRef = lookupRef(g_weapon);
@@ -1069,9 +1138,12 @@ namespace
                 g_shared.modelOutdated = true;
             }
         }
+        keepWeaponOutOfPhysics(weaponRef, root);
         updateHandAtWeapon(0, root);
         updateHandAtWeapon(1, root);
-        keepPartsInPlace();
+        attachReleasedParts(root);
+        hintPart(0);
+        hintPart(1);
     }
 
     // ------------------------------------------------------------ Papyrus natives

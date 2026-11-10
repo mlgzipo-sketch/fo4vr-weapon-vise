@@ -21,3 +21,10 @@ Function SetPosition(float afX, float afY, float afZ) native
 ObjectMod[] Function GetAllMods() native
 Event OnItemAdded(Form akBaseItem, int aiItemCount, ObjectReference akItemReference, ObjectReference akSourceContainer)
 EndEvent
+float Function GetPositionX() native
+float Function GetPositionY() native
+float Function GetPositionZ() native
+bool Function IsDisabled() native
+Form Function GetBaseObject() native
+Event OnItemRemoved(Form akBaseItem, int aiItemCount, ObjectReference akItemReference, ObjectReference akDestContainer)
+EndEvent
