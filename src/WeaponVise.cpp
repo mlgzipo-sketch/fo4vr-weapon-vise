@@ -306,11 +306,11 @@ namespace
             return false;
         }
         REX::W32::MEMORY_BASIC_INFORMATION info{};
-        if (REX::W32::VirtualQuery(address, &info, sizeof(info)) == 0 || info.state != REX::W32::MEM_COMMIT) {
+        if (REX::W32::VirtualQuery(address, &info, sizeof(info)) == 0 || info.state != 0x1000u /* MEM_COMMIT */) {
             return false;
         }
-        constexpr std::uint32_t mask = REX::W32::PAGE_READONLY | REX::W32::PAGE_READWRITE | REX::W32::PAGE_WRITECOPY |
-                                       REX::W32::PAGE_EXECUTE_READ | REX::W32::PAGE_EXECUTE_READWRITE;
+        // PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE
+        constexpr std::uint32_t mask = 0x02u | 0x04u | 0x08u | 0x20u | 0x40u;
         if ((info.protect & mask) == 0 || (info.protect & 0x100u) != 0) {
             return false;
         }
@@ -626,8 +626,8 @@ namespace
             hand.clampSent = false;
             return;
         }
-        const bool near = distance(hand.frame.translate, bench->GetPosition()) < g_settings.benchReach;
-        if (!near || !player->GetWeaponMagicDrawn()) {
+        const bool nearBench = distance(hand.frame.translate, bench->GetPosition()) < g_settings.benchReach;
+        if (!nearBench || !player->GetWeaponMagicDrawn()) {
             hand.clampSent = false;
             return;
         }
