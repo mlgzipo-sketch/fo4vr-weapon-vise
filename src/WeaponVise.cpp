@@ -61,18 +61,25 @@ namespace
         int gripButton{ 2 };            // OpenVR button id: 2 = grip
         int weaponHand{ 0 };            // 0 = right, 1 = left
         int forwardAxis{ 1 };           // controller axis that points forward: 0 = X, 1 = Y, 2 = Z
-        float benchReach{ 170.0f };     // hand this close to a workbench may clamp
+        float viseRadius{ 20.0f };      // weapon hand this close to the vise may clamp
+        float viseX{ 33.0f };           // the vise in the workbench model's space
+        float viseY{ 26.0f };
+        float viseZ{ 68.0f };
+        float viseLift{ 9.0f };         // the clamped weapon sits this far above the vise point
         float clampHold{ 0.5f };        // seconds of grip to clamp
-        float grabRadius{ 7.0f };       // hand this close to a part grabs it
+        float grabRadius{ 9.0f };       // hand this close to a part grabs it
         float pullDistance{ 8.0f };     // hand moved this far pulls a part off
         float attachRadius{ 9.0f };     // part this close to its place snaps on
         float attachRadiusAny{ 6.0f };  // ...or this close to the weapon when its place is unknown
         float weaponGrabRadius{ 14.0f };
-        float unclampHold{ 0.8f };
+        float unclampHold{ 1.5f };
         float unclampStill{ 6.0f };     // hand must stay within this while holding
-        float rackStart{ 14.0f };       // loose parts are laid out beside the weapon
-        float rackStep{ 7.0f };
-        float rackDrop{ 0.0f };         // and this much lower
+        float rackX{ 48.0f };           // loose parts are laid out on the bench top (workbench model space)
+        float rackY{ 48.0f };
+        float rackZ{ 61.0f };
+        float rackStep{ 6.0f };
+        int rackPerRow{ 6 };
+        bool logGrab{ true };           // log what each grip press near the weapon found
         bool refresh3D{ true };         // reload the weapon's 3D when it does not show a change
         bool logTree{ true };
         bool messages{ true };
@@ -97,7 +104,11 @@ namespace
                 if (key == "iGripButton") s.gripButton = static_cast<int>(value);
                 else if (key == "iWeaponHand") s.weaponHand = static_cast<int>(value);
                 else if (key == "iForwardAxis") s.forwardAxis = std::clamp(static_cast<int>(value), 0, 2);
-                else if (key == "fBenchReach") s.benchReach = value;
+                else if (key == "fViseRadius") s.viseRadius = value;
+                else if (key == "fViseX") s.viseX = value;
+                else if (key == "fViseY") s.viseY = value;
+                else if (key == "fViseZ") s.viseZ = value;
+                else if (key == "fViseLift") s.viseLift = value;
                 else if (key == "fClampHold") s.clampHold = value;
                 else if (key == "fGrabRadius") s.grabRadius = value;
                 else if (key == "fPullDistance") s.pullDistance = value;
@@ -106,9 +117,12 @@ namespace
                 else if (key == "fWeaponGrabRadius") s.weaponGrabRadius = value;
                 else if (key == "fUnclampHold") s.unclampHold = value;
                 else if (key == "fUnclampStill") s.unclampStill = value;
-                else if (key == "fRackStart") s.rackStart = value;
+                else if (key == "fRackX") s.rackX = value;
+                else if (key == "fRackY") s.rackY = value;
+                else if (key == "fRackZ") s.rackZ = value;
                 else if (key == "fRackStep") s.rackStep = value;
-                else if (key == "fRackDrop") s.rackDrop = value;
+                else if (key == "iRackPerRow") s.rackPerRow = (std::max)(1, static_cast<int>(value));
+                else if (key == "bLogGrab") s.logGrab = value != 0.0f;
                 else if (key == "bRefresh3D") s.refresh3D = value != 0.0f;
                 else if (key == "bLogTree") s.logTree = value != 0.0f;
                 else if (key == "bMessages") s.messages = value != 0.0f;
@@ -117,8 +131,8 @@ namespace
         }
         char message[256]{};
         std::snprintf(message, sizeof(message),
-            "Settings: grip=%d weaponHand=%d benchReach=%.0f grab=%.0f pull=%.0f attach=%.0f/%.0f refresh3D=%d",
-            g_settings.gripButton, g_settings.weaponHand, g_settings.benchReach, g_settings.grabRadius,
+            "Settings: grip=%d weaponHand=%d viseRadius=%.0f grab=%.0f pull=%.0f attach=%.0f/%.0f refresh3D=%d",
+            g_settings.gripButton, g_settings.weaponHand, g_settings.viseRadius, g_settings.grabRadius,
             g_settings.pullDistance, g_settings.attachRadius, g_settings.attachRadiusAny, g_settings.refresh3D);
         logNote(message);
     }
@@ -249,6 +263,8 @@ namespace
         std::deque<PendingCommand> commands;
         PendingCommand current;
         std::array<float, 4> weaponPose{};  // where the weapon was clamped
+        RE::NiTransform benchWorld{};       // the workbench model at clamp time
+        bool benchKnown{ false };
         bool modelOutdated{ false };
     } g_shared;
 
@@ -405,6 +421,7 @@ namespace
     {
         bool valid{ false };
         RE::NiTransform frame{};
+        RE::NiPoint3 point{};  // middle of the palm: what grabs
         bool grip{ false };
         bool previousGrip{ false };
         Clock::time_point gripSince{};
@@ -497,6 +514,20 @@ namespace
         }
         hand.frame = wand;
         hand.frame.scale = 1.0f;
+        hand.point = wand.translate;
+        {
+            // The palm: halfway between the wrist and the index fingertip of the rendered hand.
+            const auto which = index == 0 ? FRIKApiV2::Hand::Right : FRIKApiV2::Hand::Left;
+            FRIKApiV2::ArmChainTransforms chain{};
+            chain.structSize = sizeof(chain);
+            if (frik->getArmChain && frik->getIndexFingerTipPosition && frik->getArmChain(which, &chain) && (chain.validMask & (1u << 6))) {
+                const auto tip = frik->getIndexFingerTipPosition(which);
+                const auto wrist = chain.hand.translate;
+                if (distance(tip, wrist) < 40.0f) {
+                    hand.point = (tip + wrist) * 0.5f;
+                }
+            }
+        }
         hand.valid = true;
         hand.grip = gripHeld(index);
         if (hand.grip && !hand.previousGrip) {
@@ -617,21 +648,45 @@ namespace
         return { at.x, at.y, at.z, heading };
     }
 
+    // The workbench model's world transform (the reference's own when its 3D is not loaded).
+    bool benchFrame(RE::TESObjectREFR* bench, RE::NiTransform& out) noexcept
+    {
+        if (!bench) {
+            return false;
+        }
+        auto* root = bench->Get3D();
+        if (looksLikeObject(root)) {
+            out = root->world;
+            if (out.scale <= 0.0f || out.scale > 10.0f) {
+                out.scale = 1.0f;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    RE::NiPoint3 benchPoint(const RE::NiTransform& bench, float x, float y, float z) noexcept
+    {
+        return compose(bench, pointTransform({ x, y, z })).translate;
+    }
+
     void updateClampGesture() noexcept
     {
         auto* player = RE::PlayerCharacter::GetSingleton();
         auto* bench = lookupRef(g_bench);
         auto& hand = g_hands_state[g_settings.weaponHand == 1 ? 1 : 0];
-        if (!player || !bench || !hand.valid) {
+        RE::NiTransform benchWorld;
+        if (!player || !bench || !hand.valid || !benchFrame(bench, benchWorld)) {
             hand.clampSent = false;
             return;
         }
-        const bool nearBench = distance(hand.frame.translate, bench->GetPosition()) < g_settings.benchReach;
-        if (!nearBench || !player->GetWeaponMagicDrawn()) {
+        const auto vise = benchPoint(benchWorld, g_settings.viseX, g_settings.viseY, g_settings.viseZ);
+        const bool atVise = distance(hand.point, vise) < g_settings.viseRadius;
+        if (!atVise || !player->GetWeaponMagicDrawn()) {
             hand.clampSent = false;
             return;
         }
-        if (seconds(g_lastHint) > 45.0f) {
+        if (seconds(g_lastHint) > 20.0f) {
             g_lastHint = Clock::now();
             hud("Тиски: держи грип, чтобы зажать оружие");
         }
@@ -643,10 +698,13 @@ namespace
             hand.clampSent = true;
             PendingCommand command;
             command.type = kClamp;
-            command.pose = poseOf(hand.frame.translate, headingOf(fingers(hand)));
+            const RE::NiPoint3 at{ vise.x, vise.y, vise.z + g_settings.viseLift };
+            command.pose = poseOf(at, headingOf(fingers(hand)));
             {
                 std::scoped_lock guard(g_shared.lock);
                 g_shared.weaponPose = command.pose;
+                g_shared.benchWorld = benchWorld;
+                g_shared.benchKnown = true;
             }
             pushCommand(command);
         }
@@ -707,6 +765,25 @@ namespace
                 if (!pressed) {
                     break;
                 }
+                if (g_settings.logGrab) {
+                    float nearestPart = 9999.0f;
+                    for (auto& [id, part] : g_parts) {
+                        auto* ref = lookupRef(id);
+                        auto* root = ref ? ref->Get3D() : nullptr;
+                        if (looksLikeObject(root)) {
+                            nearestPart = (std::min)(nearestPart, distance(hand.point, centerOf(root)));
+                        }
+                    }
+                    float nearestAnchor = 9999.0f;
+                    for (const auto& anchor : g_anchors) {
+                        nearestAnchor = (std::min)(nearestAnchor, distance(hand.point, anchor.center));
+                    }
+                    char text[200]{};
+                    std::snprintf(text, sizeof(text), "Grip %s: loose part %.1f, part on weapon %.1f, weapon %.1f (palm-wand %.1f)",
+                        index == 0 ? "R" : "L", nearestPart, nearestAnchor, distance(hand.point, centerOf(weapon3D)),
+                        distance(hand.point, hand.frame.translate));
+                    logNote(text);
+                }
                 // 1) a loose part
                 float best = g_settings.grabRadius;
                 std::uint32_t bestPart = 0;
@@ -720,7 +797,7 @@ namespace
                     if (!looksLikeObject(root)) {
                         continue;
                     }
-                    const float d = distance(hand.frame.translate, centerOf(root));
+                    const float d = distance(hand.point, centerOf(root));
                     if (d < best) {
                         best = d;
                         bestPart = id;
@@ -735,7 +812,7 @@ namespace
                 best = g_settings.grabRadius;
                 const Anchor* bestAnchor = nullptr;
                 for (const auto& anchor : g_anchors) {
-                    const float d = distance(hand.frame.translate, anchor.center);
+                    const float d = distance(hand.point, anchor.center);
                     if (d < best) {
                         best = d;
                         bestAnchor = &anchor;
@@ -744,14 +821,18 @@ namespace
                 if (bestAnchor) {
                     hand.mode = Hand::Mode::Pull;
                     hand.mod = bestAnchor->mod;
-                    hand.start = hand.frame.translate;
+                    hand.start = hand.point;
                     hand.offset = relative(hand.frame, looksLikeObject(bestAnchor->node) ? bestAnchor->node->world : weapon3D->world);
                     break;
                 }
-                // 3) the weapon itself
-                if (distance(hand.frame.translate, centerOf(weapon3D)) < g_settings.weaponGrabRadius) {
+                // 3) the weapon itself, when no part is close (a near miss should not unclamp)
+                bool partClose = false;
+                for (const auto& anchor : g_anchors) {
+                    partClose = partClose || distance(hand.point, anchor.center) < g_settings.grabRadius * 1.6f;
+                }
+                if (!partClose && distance(hand.point, centerOf(weapon3D)) < g_settings.weaponGrabRadius) {
                     hand.mode = Hand::Mode::Unclamp;
-                    hand.start = hand.frame.translate;
+                    hand.start = hand.point;
                     hand.since = Clock::now();
                 }
                 break;
@@ -759,7 +840,7 @@ namespace
         case Hand::Mode::Pull:
             if (!hand.grip) {
                 hand.mode = Hand::Mode::Idle;
-            } else if (distance(hand.frame.translate, hand.start) > g_settings.pullDistance) {
+            } else if (distance(hand.point, hand.start) > g_settings.pullDistance) {
                 PendingCommand command;
                 command.type = kRemove;
                 command.mod = hand.mod;
@@ -819,7 +900,7 @@ namespace
                 break;
             }
         case Hand::Mode::Unclamp:
-            if (!hand.grip || distance(hand.frame.translate, hand.start) > g_settings.unclampStill) {
+            if (!hand.grip || distance(hand.point, hand.start) > g_settings.unclampStill) {
                 hand.mode = hand.grip ? Hand::Mode::Done : Hand::Mode::Idle;
             } else if (seconds(hand.since) >= g_settings.unclampHold) {
                 if (unclampAllowed()) {
@@ -1089,21 +1170,34 @@ namespace
     std::vector<float> RackPose(std::monostate, std::int32_t index)
     {
         std::array<float, 4> weapon;
+        RE::NiTransform bench;
+        bool benchKnown = false;
         {
             std::scoped_lock guard(g_shared.lock);
             weapon = g_shared.weaponPose;
+            bench = g_shared.benchWorld;
+            benchKnown = g_shared.benchKnown;
         }
+        if (benchKnown) {
+            const int perRow = g_settings.rackPerRow;
+            const float x = g_settings.rackX + g_settings.rackStep * static_cast<float>(index / perRow);
+            const float y = g_settings.rackY + g_settings.rackStep * static_cast<float>(index % perRow);
+            const auto at = benchPoint(bench, x, y, g_settings.rackZ);
+            const RE::NiPoint3 benchForward{ bench.rotate.entry[1][0], bench.rotate.entry[1][1], bench.rotate.entry[1][2] };
+            return { at.x, at.y, at.z, headingOf(benchForward) + 90.0f };
+        }
+        const float rackStart = 14.0f;
         const float heading = weapon[3] * 0.01745329f;
         const float rightX = std::cos(heading);
         const float rightY = -std::sin(heading);
-        const float along = g_settings.rackStart + g_settings.rackStep * static_cast<float>(index % 6);
+        const float along = rackStart + g_settings.rackStep * static_cast<float>(index % 6);
         const float back = static_cast<float>(index / 6) * g_settings.rackStep;
         const float forwardX = std::sin(heading);
         const float forwardY = std::cos(heading);
         return {
             weapon[0] + rightX * along - forwardX * back,
             weapon[1] + rightY * along - forwardY * back,
-            weapon[2] - g_settings.rackDrop,
+            weapon[2],
             weapon[3],
         };
     }
