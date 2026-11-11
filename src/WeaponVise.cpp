@@ -784,6 +784,7 @@ namespace
             if (released && seconds(hand.gripSince) >= 0.15f) {
                 PendingCommand command;
                 command.type = kClamp;
+                command.mod = g_weapon ? 1 : 0;   // 1: the vise holds a weapon that is not here: replace it
                 command.pose = poseOf(hand.point, headingOf(fingers(hand)));
                 pushCommand(command);
                 g_clampPoint = hand.point;
@@ -1631,6 +1632,13 @@ namespace
             resolveSlots(root);
         }
         keepWeaponOutOfPhysics(weaponRef, root);
+        {
+            // the clamped weapon is not above the vise (an old save, a moved bench): another may take its place
+            RE::NiPoint3 zone;
+            if (g_weaponHeldBy < 0 && viseArea(zone) && distance(g_weaponWorld.translate, zone) > g_settings.zoneRadius * 3.0f) {
+                updateClampGesture();
+            }
+        }
         updateHandAtWeapon(0, root);
         updateHandAtWeapon(1, root);
         updateHeldParts(root);
@@ -1710,6 +1718,12 @@ namespace
         g_shared.current = g_shared.commands.front();
         g_shared.commands.pop_front();
         return g_shared.current.type;
+    }
+
+    std::int32_t CommandFlag(std::monostate)
+    {
+        std::scoped_lock guard(g_shared.lock);
+        return static_cast<std::int32_t>(g_shared.current.mod);
     }
 
     Mod* CommandMod(std::monostate)
@@ -1850,6 +1864,7 @@ namespace
         vm->BindNativeMethod(kScript, "IsFreeMod", IsFreeMod, true);
         vm->BindNativeMethod(kScript, "AddGhost", AddGhost, true);
         vm->BindNativeMethod(kScript, "SetFrame", SetFrame, true);
+        vm->BindNativeMethod(kScript, "CommandFlag", CommandFlag, true);
         logNote("Papyrus functions of script WeaponVise registered");
         return true;
     }

@@ -321,6 +321,10 @@ ObjectReference Function FindDroppedWeapon(float[] pose)
 EndFunction
 
 Function Clamp()
+	if Clamped && WeaponVise.CommandFlag() == 1
+		; the vise held a weapon somewhere else (an old save): it goes back to the inventory
+		Unclamp(false)
+	endif
 	if Clamped
 		return
 	endif

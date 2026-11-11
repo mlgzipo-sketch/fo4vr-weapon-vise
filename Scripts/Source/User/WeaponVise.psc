@@ -10,6 +10,7 @@ Function SetFrame(ObjectReference akFrame) global native
 Function AddGhost(ObjectReference akGhost, ObjectMod akMod) global native
 int Function PollCommand() global native
 ObjectMod Function CommandMod() global native
+int Function CommandFlag() global native
 ObjectReference Function CommandPart() global native
 float[] Function CommandPose() global native
 float[] Function RackPose(int aiIndex) global native
