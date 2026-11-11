@@ -39,6 +39,8 @@ namespace
         bool blockReload{ true };
         bool toggleMagazine{ true };
         int  dumpDepth{ 12 };
+        // raw gunState the VR game reports while reloading (flat FO4 enum says 4, VR log shows 8)
+        int  reloadGunState{ 8 };
     };
     Settings g_settings;
 
@@ -61,6 +63,8 @@ namespace
                     g_settings.blockReload = value != 0.0f;
                 } else if (key == "bToggleMagazine") {
                     g_settings.toggleMagazine = value != 0.0f;
+                } else if (key == "iReloadGunState") {
+                    g_settings.reloadGunState = static_cast<int>(value);
                 } else if (key == "iDumpDepth") {
                     g_settings.dumpDepth = static_cast<int>(value);
                 }
@@ -68,8 +72,8 @@ namespace
         } catch (...) {
         }
         char message[160]{};
-        std::snprintf(message, sizeof(message), "Settings: bBlockReload=%d bToggleMagazine=%d iDumpDepth=%d",
-            g_settings.blockReload ? 1 : 0, g_settings.toggleMagazine ? 1 : 0, g_settings.dumpDepth);
+        std::snprintf(message, sizeof(message), "Settings: bBlockReload=%d bToggleMagazine=%d iReloadGunState=%d iDumpDepth=%d",
+            g_settings.blockReload ? 1 : 0, g_settings.toggleMagazine ? 1 : 0, g_settings.reloadGunState, g_settings.dumpDepth);
         logNote(message);
     }
 
@@ -431,17 +435,26 @@ namespace
             }
         }
 
-        const auto ammo = gun.data->ammoCount;
+        auto ammo = gun.data->ammoCount;
         const auto inventory = inventoryCount(player, gun.data->ammo);
         const auto gunState = static_cast<std::uint32_t>(player->gunState);
+        const auto reloading = static_cast<std::uint32_t>(g_settings.reloadGunState);
         if (ammo != g_state.lastAmmo || inventory != g_state.lastInventory || gunState != g_state.lastGunState) {
             char message[160]{};
             std::snprintf(message, sizeof(message), "ammoCount %u, ammo in inventory %u, gunState %u%s",
-                ammo, inventory, gunState, gunState == 4 ? " (reloading)" : "");
+                ammo, inventory, gunState, gunState == reloading ? " (reloading)" : "");
             logInfo(message);
         }
-        const bool reloadStarted = gunState == 4 && g_state.lastGunState != 4 && g_state.lastGunState != 0xFFFFFFFF;
-        g_state.lastAmmo = ammo;
+        // VR refills the gun without going through the player's ReloadWeapon vfunc,
+        // so any rise of the count that we did not make is the game's reload: undo it.
+        if (g_settings.blockReload && g_state.lastAmmo != 0xFFFFFFFF && ammo > g_state.lastAmmo) {
+            char message[120]{};
+            std::snprintf(message, sizeof(message), "Game refill %u -> %u reverted", g_state.lastAmmo, ammo);
+            logNote(message);
+            gun.data->ammoCount = g_state.lastAmmo;
+            ammo = g_state.lastAmmo;
+        }
+        const bool reloadStarted = gunState == reloading && g_state.lastGunState != reloading && g_state.lastGunState != 0xFFFFFFFF;
         g_state.lastInventory = inventory;
         g_state.lastGunState = gunState;
 
@@ -452,6 +465,7 @@ namespace
         if (g_toggleRequested.exchange(false)) {
             toggleMagazine(player, gun, "ReloadWeapon");
         }
+        g_state.lastAmmo = gun.data->ammoCount;
         if (g_state.magazineOut) {
             // the game may redraw the gun; keep the magazine hidden
             setCulled(findNamed(weaponRoot(player), "WeaponMagazine"), true);
