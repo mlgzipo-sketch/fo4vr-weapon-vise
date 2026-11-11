@@ -60,6 +60,7 @@ namespace
     {
         int gripButton{ 2 };            // OpenVR button id: 2 = grip
         int triggerButton{ 33 };        // OpenVR button id: 33 = trigger
+        int selectButton{ 7 };          // OpenVR button id: 7 = A / X: held, the hand picks parts off the weapon
         bool highlight{ true };         // glow the part a hand holds
         bool haptics{ true };
         int weaponHand{ 0 };            // 0 = right, 1 = left
@@ -112,6 +113,7 @@ namespace
                 auto& s = g_settings;
                 if (key == "iGripButton") s.gripButton = static_cast<int>(value);
                 else if (key == "iWeaponHand") s.weaponHand = static_cast<int>(value);
+                else if (key == "iSelectButton") s.selectButton = static_cast<int>(value);
                 else if (key == "iTriggerButton") s.triggerButton = static_cast<int>(value);
                 else if (key == "bHighlight") s.highlight = value != 0.0f;
                 else if (key == "bHaptics") s.haptics = value != 0.0f;
@@ -447,6 +449,8 @@ namespace
         bool grip{ false };
         bool previousGrip{ false };
         bool trigger{ false };
+        bool select{ false };      // A / X held: picking a part
+        std::uint32_t hover{ 0 };  // part under the hand while picking
         bool previousTrigger{ false };
         bool armed{ false };   // a pulled part has left its place: it may snap back on
         Clock::time_point gripSince{};
@@ -524,10 +528,11 @@ namespace
     }
 
     // Grip and trigger of one controller.
-    void readButtons(int index, bool& grip, bool& trigger) noexcept
+    void readButtons(int index, bool& grip, bool& trigger, bool& select) noexcept
     {
         grip = false;
         trigger = false;
+        select = false;
         const auto device = controllerOf(index);
         if (device == vr::k_unTrackedDeviceIndexInvalid) {
             return;
@@ -538,6 +543,7 @@ namespace
         }
         grip = (state.ulButtonPressed & vr::ButtonMaskFromId(static_cast<vr::EVRButtonId>(g_settings.gripButton))) != 0;
         trigger = (state.ulButtonPressed & vr::ButtonMaskFromId(static_cast<vr::EVRButtonId>(g_settings.triggerButton))) != 0;
+        select = (state.ulButtonPressed & vr::ButtonMaskFromId(static_cast<vr::EVRButtonId>(g_settings.selectButton))) != 0;
     }
 
     void buzz(int index, unsigned short microseconds) noexcept
@@ -579,7 +585,7 @@ namespace
             }
         }
         hand.valid = true;
-        readButtons(index, hand.grip, hand.trigger);
+        readButtons(index, hand.grip, hand.trigger, hand.select);
         if (hand.grip && !hand.previousGrip) {
             hand.gripSince = Clock::now();
         }
@@ -1048,27 +1054,59 @@ namespace
         switch (hand.mode) {
         case Hand::Mode::Idle:
             {
+                // A / X held: the part under the hand shows in red; grip takes it off
+                const auto* anchor = hand.select ? nearestAnchor(hand.point, g_settings.grabRadius) : nullptr;
+                const std::uint32_t hover = anchor ? anchor->mod : 0;
+                if (hover != hand.hover) {
+                    endHoldPart(hand);
+                    hand.hover = hover;
+                    hand.holdNode = anchor ? anchor->node : nullptr;
+                    if (hover) {
+                        buzz(index, 800);
+                        soundCue(1);
+                    }
+                }
+                RE::NiTransform hoverSlot;
+                const auto* hoverInfo = hover ? partInfo(hover) : nullptr;
+                const bool hoverKnown = hoverInfo && slotWorld(*hoverInfo, hoverSlot);
+                if (hover && hoverKnown) {
+                    wishGhost(hover, 1, hoverSlot);
+                    // the outline stands in for the real part once it is showing
+                    if (!hand.hidden && ghostShowing(hover) && looksLikeObject(hand.holdNode)) {
+                        hand.hidden = hand.holdNode;
+                        setCulled(hand.hidden, true);
+                    }
+                }
                 if (!pressed) {
                     break;
                 }
-                const auto* anchor = nearestAnchor(hand.point, g_settings.grabRadius);
                 const float toWeapon = distance(hand.point, centerOf(weapon3D));
+                const auto* touched = nearestAnchor(hand.point, g_settings.grabRadius);
                 if (g_settings.logGrab) {
                     char text[200]{};
-                    std::snprintf(text, sizeof(text), "Grip %s: part on weapon %s, weapon %.1f",
-                        index == 0 ? "R" : "L", anchor ? nodeName(anchor->node).c_str() : "-", toWeapon);
+                    std::snprintf(text, sizeof(text), "Grip %s%s: part %s, weapon %.1f",
+                        index == 0 ? "R" : "L", hand.select ? " +A" : "",
+                        anchor ? nodeName(anchor->node).c_str() : "-", toWeapon);
                     logNote(text);
                 }
-                if (anchor) {
-                    // hold a part: it shows in red; trigger takes it off
-                    hand.mode = Hand::Mode::HoldPart;
-                    hand.mod = anchor->mod;
-                    hand.hidden = nullptr;
-                    hand.holdNode = anchor->node;
-                    buzz(index, 1500);
-                    soundCue(1);
-                } else if (toWeapon < g_settings.weaponGrabRadius && g_weaponHeldBy < 0) {
-                    // hold the weapon itself: it follows the hand
+                if (hover) {
+                    endHoldPart(hand);
+                    hand.hover = 0;
+                    PendingCommand command;
+                    command.type = kRemove;
+                    command.mod = hover;
+                    const auto from = hoverKnown ? hoverSlot : weapon3D->world;
+                    command.pose = poseOf(from.translate, headingOf({ from.rotate.entry[1][0], from.rotate.entry[1][1], from.rotate.entry[1][2] }));
+                    pushCommand(command);
+                    hand.mod = hover;
+                    hand.offset = relative(hand.frame, from);
+                    hand.armed = false;
+                    hand.mode = Hand::Mode::Await;
+                    hand.since = Clock::now();
+                    buzz(index, 3000);
+                    soundCue(3);
+                } else if ((touched || toWeapon < g_settings.weaponGrabRadius) && g_weaponHeldBy < 0 && !hand.select) {
+                    // grip anywhere on the weapon: it follows the hand
                     hand.mode = Hand::Mode::HoldWeapon;
                     hand.offset = relative(hand.frame, g_weaponWorld);
                     g_weaponHeldBy = index;
@@ -1114,17 +1152,6 @@ namespace
             }
         case Hand::Mode::HoldWeapon:
             {
-                if (hand.trigger && !hand.previousTrigger) {
-                    if (unclampAllowed()) {
-                        PendingCommand command;
-                        command.type = kUnclamp;
-                        pushCommand(command);
-                        buzz(index, 3000);
-                    }
-                    g_weaponHeldBy = -1;
-                    hand.mode = Hand::Mode::Done;
-                    break;
-                }
                 g_weaponWorld = compose(hand.frame, hand.offset);
                 if (!hand.grip) {
                     g_weaponHeldBy = -1;
@@ -1273,6 +1300,7 @@ namespace
                 for (auto& hand : g_hands_state) {
                     hand.hidden = nullptr;
                     hand.holdNode = nullptr;
+                    hand.hover = 0;
                     if (hand.mode == Hand::Mode::HoldPart) {
                         hand.mode = Hand::Mode::Done;
                     }
@@ -1375,6 +1403,7 @@ namespace
             for (auto& hand : g_hands_state) {
                 hand.mode = Hand::Mode::Idle;
                 hand.hidden = nullptr;
+                hand.hover = 0;
             }
             updateClampGesture();
             return;
@@ -1617,7 +1646,7 @@ namespace
         case 1: hud("Сначала возьми оружие в руку"); break;
         case 2: hud("В тиски пока можно зажать только 10-мм пистолет"); break;
         case 3: hud("Не получилось положить оружие в тиски"); break;
-        case 4: hud("Оружие в тисках. Грип на детали и курок: снять. Поднеси деталь к месту и отпусти: поставить"); break;
+        case 4: hud("Оружие в тисках. Держи A и наведи руку на деталь, грип: снять. Поднеси деталь к месту и отпусти: поставить"); break;
         case 5: hud("Эта деталь сюда не подходит"); break;
         case 6: hud("Оружие снова в руке"); break;
         case 7: hud("Ты отошёл: оружие и детали вернулись в инвентарь"); break;
