@@ -90,7 +90,8 @@ namespace
         float wellShiftX{ 0.0f };       // ..and move it by these (gun frame: x right, y forward, z up)
         float wellShiftY{ 0.0f };
         float wellShiftZ{ 0.0f };
-        bool  rockOffhand{ true };      // ask ROCK to keep the free hand off the gun while it reloads      // a slide held open stands this part of its travel back         // the well's slope back from straight down (degrees); below 0 = learned from the model
+        bool  rockOffhand{ true };      // ask ROCK to keep the free hand off the gun while it reloads
+        bool  rockApi{ false };         // talk to ROCK through its API (ROCK 0.92.2 refuses this SDK's version and closes the game)      // a slide held open stands this part of its travel back         // the well's slope back from straight down (degrees); below 0 = learned from the model
         float handRadius{ 16.0f };      // a hand this close to a magazine is the one holding it
         float looseLifetime{ 90.0f };   // seconds a dropped magazine stays before it is cleaned up
         int   maxLoose{ 6 };
@@ -124,6 +125,7 @@ namespace
                 else if (key == "fWellShiftY") s.wellShiftY = value;
                 else if (key == "fWellShiftZ") s.wellShiftZ = value;
                 else if (key == "bRockOffhand") s.rockOffhand = value != 0.0f;
+                else if (key == "bRockApi") s.rockApi = value != 0.0f;
                 else if (key == "iDumpDepth") s.dumpDepth = static_cast<int>(value);
                 else if (key == "iGunHand") s.gunHand = value != 0.0f ? 1 : 0;
                 else if (key == "iGripButton") s.gripButton = static_cast<int>(value);
@@ -693,6 +695,10 @@ namespace
                 return false;
             }
             g_tried = true;
+            if (!g_settings.rockApi) {
+                logNote("ROCK API: off (bRockApi=0)");
+                return false;
+            }
             const auto module = GetModuleHandleA("ROCK.dll");
             const auto query = module ? reinterpret_cast<api::QueryInterfaceV1>(GetProcAddress(module, api::kQueryExportName)) : nullptr;
             char message[200]{};
