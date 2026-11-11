@@ -99,10 +99,10 @@ namespace
         float seatRelease{ 1.5f };      // let go this close to home: it clicks in, further out it falls
         float magGrabRadius{ 9.0f };    // the palm this close to a magazine that sticks out takes it
         float grabUp{ 2.0f };           // the palm takes the magazine this far above its bottom
-        float holdUp{ 2.0f };           // magazine from the belt: its bottom sits this far below the palm's middle
+        float holdUp{ -0.5f };           // magazine from the belt: its bottom sits this far below the palm's middle
         float holdSide{ 0.0f };
         float holdForward{ 0.0f };
-        float holdRotX{ 0.0f };
+        float holdRotX{ 90.0f };
         float holdRotY{ 0.0f };
         float holdRotZ{ 0.0f };
         int   holdFlip{ 0 };            // 1 = the magazine from the belt is upside down in the hand: turn it
@@ -114,6 +114,8 @@ namespace
         float handRadius{ 16.0f };
         float looseLifetime{ 90.0f };
         int   maxLoose{ 6 };
+        bool  nativeSound{ true };      // sounds played by the plugin (the script's Sound objects are not heard)
+        int   soundFlags{ 16 };
         bool  showRound{ true };        // a cartridge is seen in the chamber / on top of the magazine while the slide is open
         float roundOpenAt{ 0.3f };      // ..once the slide is back this part of its travel
         float chamberUp{ 0.9f };        // the chambered round: from the magazine's top this much up..
@@ -147,7 +149,7 @@ namespace
             { "iHoldFlip", 1, &s.holdFlip }, { "fFingerCurl", 2, &s.fingerCurl }, { "fFreezeSeconds", 2, &s.freezeSeconds },
             { "fSlideGrabRadius", 2, &s.slideGrabRadius }, { "fRackTravel", 2, &s.rackTravel }, { "fSlideLockAt", 2, &s.slideLockAt },
             { "fHandRadius", 2, &s.handRadius }, { "fLooseLifetime", 2, &s.looseLifetime }, { "iMaxLoose", 1, &s.maxLoose },
-            { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
+            { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
             { "fChamberForward", 2, &s.chamberForward }, { "fRoundUp", 2, &s.roundUp }, { "fRoundRotX", 2, &s.roundRotX },
             { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale },
         };
@@ -964,8 +966,45 @@ namespace
         g_shared.commands.push_back(command);
     }
 
+    // Sounds are played here by the descriptor's editor ID (the plugin's own ones first: their output is 2D,
+    // so they need no position). The script's Sound objects are only the fallback.
+    bool playByName(const char* name) noexcept
+    {
+        auto* audio = RE::BSAudioManager::GetSingleton();
+        if (!audio || !name || !*name) {
+            return false;
+        }
+        RE::BSSoundHandle handle;
+        handle.soundID = 0xFFFFFFFF;
+        handle.assumeSuccess = false;
+        handle.state = 0;
+        audio->GetSoundHandleByName(handle, name, 0.0f, static_cast<std::uint32_t>(g_settings.soundFlags), nullptr);
+        if (handle.soundID == 0xFFFFFFFF) {
+            return false;
+        }
+        return handle.FadeInPlay(0);
+    }
+
     void playSound(int index) noexcept
     {
+        static const std::array<std::array<const char*, 2>, 5> names{ {
+            { "MRF_DescIn", "WPNPistol10mmReloadMagIn" }, { "MRF_DescOut", "WPNPistol10mmReloadMagOut" },
+            { "MRF_DescSlideBack", "WPNPistol10mmReloadBoltOpen" }, { "MRF_DescSlideHome", "WPNPistol10mmReloadBoltClose" },
+            { "ItemPickUpMetal1Small", nullptr } } };
+        static std::array<int, 5> logged{};
+        if (g_settings.nativeSound && index >= 0 && index < static_cast<int>(names.size())) {
+            for (const char* name : names[index]) {
+                if (name && playByName(name)) {
+                    if (logged[index]++ == 0) {
+                        note("Sound %d: played %s", index, name);
+                    }
+                    return;
+                }
+            }
+            if (logged[index]++ == 0) {
+                note("Sound %d: no descriptor found by name, the script tries", index);
+            }
+        }
         PendingCommand command;
         command.type = kSound;
         command.kind = index;
@@ -2006,7 +2045,8 @@ namespace
         }
         auto* magazine = parts[0];
         auto* bolt = parts[1];
-        const bool frozen = g_settings.blockReload && (gunState == reloading || now < st.freezeUntil || pressed);
+        // an empty gun: the game would play its own reload by itself; the parts stay put (the slide stays open)
+        const bool frozen = g_settings.blockReload && (gunState == reloading || now < st.freezeUntil || pressed || st.slideLocked || st.lastAmmo == 0);
         const bool quiet = !frozen && st.place == kSeated && st.s <= 0.0f && gunState == static_cast<std::uint32_t>(g_settings.idleGunState) &&
                            !st.racking && st.rackPull <= 0.0f && !st.slideLocked && now - st.lastShot > std::chrono::milliseconds(600) &&
                            now - st.equippedAt > std::chrono::milliseconds(1500);
@@ -2175,7 +2215,8 @@ namespace
                 const float limit = st.length + g_settings.captureAhead + 1.0f;
                 if (target > limit) {
                     // clear of the well: from here it goes with the hand
-                    startBlend(st.lastDrawnValid ? st.lastDrawn : railPose(root, st.s), 0.10f);
+                    startBlend(st.lastDrawnValid ? st.lastDrawn : railPose(root, st.s), 0.20f);
+                    st.magInWand = relative(free.wand, holdPose(free, gunScale(root)));   // held by its baseplate, as ROCK holds it
                     st.place = kHand;
                     st.mustLeave = true;
                     unpinHand();
