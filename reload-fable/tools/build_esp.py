@@ -27,7 +27,8 @@ def group(tag, records):
 
 IDS = {'MRF_Mag10mm': 0x800, 'MRF_Mag10mmLarge': 0x801, 'MRF_SndIn': 0x802, 'MRF_SndOut': 0x803,
        'MRF_SndSlideBack': 0x804, 'MRF_SndSlideHome': 0x805, 'MRF_SndPutAway': 0x806,
-       'MRF_Mags': 0x807, 'MRF_Sounds': 0x808, 'MRF_Quest': 0x809}
+       'MRF_Mags': 0x807, 'MRF_Sounds': 0x808, 'MRF_Quest': 0x809,
+       'MRF_DescIn': 0x80A, 'MRF_DescOut': 0x80B, 'MRF_DescSlideBack': 0x80C, 'MRF_DescSlideHome': 0x80D}
 recs = {}
 def add(tag, edid, subs):
     fid = OWN | IDS[edid]
@@ -41,8 +42,18 @@ mags = [add('MISC', 'MRF_Mag' + k, [sub('OBND', b'\0' * 12), sub('FULL', zstr(na
 
 # Sound descriptors of Fallout4.esm: WPNPistol10mmReloadMagIn / MagOut / BoltOpen / BoltClose, ItemPickUpMetal1Small.
 # The order is the sound index the plugin sends.
-SOUNDS = [('MRF_SndIn', 0x0C7D62), ('MRF_SndOut', 0x0C7D61), ('MRF_SndSlideBack', 0x0C7D63),
-          ('MRF_SndSlideHome', 0x0C7D64), ('MRF_SndPutAway', 0x0196B0)]
+# Own descriptors for the pistol's reload sounds (the game's wav files): the game's descriptors
+# (WPNPistol10mmReload*, 14 dB down, the weapon reload category) were not heard when played from a script,
+# so these use the category and output of the workshop sounds, which are heard, and are louder.
+W = 'data\\Sound\\FX\\WPN\\Pistol10mm\\Reload\\WPN_Pistol10mm_Reload_'
+def sndr(edid, name):
+    return add('SNDR', edid, [sub('CNAM', bytes.fromhex('0a54ef1e')), sub('GNAM', struct.pack('<I', 0x0172A1)),
+                              sub('ANAM', zstr(W + name + '_01.wav')), sub('ANAM', zstr(W + name + '_02.wav')),
+                              sub('ONAM', struct.pack('<I', 0x05A28A)), sub('LNAM', struct.pack('<I', 0)),
+                              sub('BNAM', struct.pack('<bBBBH', 0, 5, 0x80, 2, 150))])
+SOUNDS = [('MRF_SndIn', sndr('MRF_DescIn', 'MagIn')), ('MRF_SndOut', sndr('MRF_DescOut', 'MagOut')),
+          ('MRF_SndSlideBack', sndr('MRF_DescSlideBack', 'BoltOpen')),
+          ('MRF_SndSlideHome', sndr('MRF_DescSlideHome', 'BoltClose')), ('MRF_SndPutAway', 0x0196B0)]
 sounds = [add('SOUN', e, [sub('OBND', b'\0' * 12), sub('SDSC', struct.pack('<I', s))]) for e, s in SOUNDS]
 
 def flst(edid, forms):
@@ -59,7 +70,7 @@ add('QUST', 'MRF_Quest', [sub('VMAD', vmad), sub('FULL', zstr('Manual Reload F')
                           sub('DNAM', bytes.fromhex('110000000000000000000000')), sub('NEXT', b''),
                           sub('ANAM', struct.pack('<I', 0))])
 
-ORDER = ['SOUN', 'MISC', 'QUST', 'FLST']
+ORDER = ['SNDR', 'SOUN', 'MISC', 'QUST', 'FLST']
 nrec = sum(len(recs[t]) for t in ORDER)
 tes4 = record('TES4', 0, [sub('HEDR', struct.pack('<fII', 1.0, nrec, max(IDS.values()) + 1)), sub('CNAM', zstr('Aleshon')),
                           sub('SNAM', zstr('Manual Reload F: reload guns by hand in VR.')),

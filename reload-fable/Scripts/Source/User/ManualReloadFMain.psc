@@ -102,6 +102,8 @@ Function PlaySound(int index)
 		Sound s = MRF_Sounds.GetAt(index) as Sound
 		if s
 			s.Play(Game.GetPlayer())
+		else
+			ManualReloadF.Notify(100 + index)
 		endif
 	endif
 EndFunction

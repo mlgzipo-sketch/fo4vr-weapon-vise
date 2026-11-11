@@ -98,8 +98,8 @@ namespace
         float seatAt{ 0.3f };           // pushed this close to home: it clicks in
         float seatRelease{ 1.5f };      // let go this close to home: it clicks in, further out it falls
         float magGrabRadius{ 9.0f };    // the palm this close to a magazine that sticks out takes it
-        float grabUp{ 1.0f };           // the palm takes the magazine this far above its bottom
-        float holdUp{ 2.5f };           // magazine from the belt: its bottom sits this far below the palm's middle
+        float grabUp{ 2.0f };           // the palm takes the magazine this far above its bottom
+        float holdUp{ 2.0f };           // magazine from the belt: its bottom sits this far below the palm's middle
         float holdSide{ 0.0f };
         float holdForward{ 0.0f };
         float holdRotX{ 0.0f };
@@ -1089,6 +1089,9 @@ namespace
         RE::NiTransform    magRest{};                      // the magazine node when seated
         RE::NiPoint3       axis{ 0.0f, 0.0f, -1.0f };      // the way out of the well
         float              length{ 8.5f };                 // travel until it is clear of the well
+        float              bottomAt{ -3.5f };              // from the node's origin down to the baseplate (negative)
+        RE::NiTransform    wristInBolt{};                  // the drawn hand against the slide while it is racked
+        bool               rackPinned{ false };
         float              topAt{ 7.0f };                  // from the node's origin (the bottom) up to the top
         RE::NiTransform    looseInNode{};                  // a loose magazine model against the gun's magazine node
         // the magazine
@@ -1210,7 +1213,7 @@ namespace
     RE::NiPoint3 grabPoint(const RE::NiAVObject* root) noexcept
     {
         const auto pose = railPose(root, g_state.s);
-        return pose.translate + axisOf(pose, 2) * (g_settings.grabUp * pose.scale);
+        return pose.translate + axisOf(pose, 2) * ((g_state.bottomAt + g_settings.grabUp) * pose.scale);
     }
 
     RE::NiPoint3 tiltAxis(float degrees) noexcept
@@ -1243,6 +1246,16 @@ namespace
         }
         st.topAt = top > 3.0f && top < 16.0f ? top : 7.0f;
         st.length = g_settings.railLength > 0.0f ? g_settings.railLength : st.topAt + 1.2f;
+        // the baseplate: the lowest point of the magazine's bound along its own axis
+        st.bottomAt = -3.5f;
+        const auto& bound = magazine->worldBound;
+        const float nodeScale = magazine->world.scale > 0.0f ? magazine->world.scale : 1.0f;
+        const float middle = relative(magazine->world, pointTransform(bound.center)).translate.z;
+        const float low = middle - bound.fRadius / nodeScale;
+        const bool measured = bound.fRadius / nodeScale > 4.0f && bound.fRadius / nodeScale < 9.0f && low < -0.5f && low > -8.0f;
+        if (measured) {
+            st.bottomAt = low;
+        }
         if (auto* attach = findNamed(magazine, "P-Mag"); looksLikeObject(attach)) {
             st.looseInNode = relative(magazine->world, attach->world);
         } else {
@@ -1259,6 +1272,7 @@ namespace
             }
             note("Rail: way out (%.2f, %.2f, %.2f) from %s, slope %.1f deg back; top %.2f above the origin (%s), travel %.2f", st.axis.x, st.axis.y, st.axis.z,
                 how, std::atan2(-st.axis.y, -st.axis.z) * 57.29578f, st.topAt, top > 3.0f && top < 16.0f ? "top round" : "default", st.length);
+            note("Rail: baseplate %.2f below the origin (%s; bound middle %.2f, radius %.2f)", -st.bottomAt, measured ? "measured" : "default", middle, bound.fRadius);
             note("Rail: loose model against the node: (%.2f, %.2f, %.2f)", st.looseInNode.translate.x, st.looseInNode.translate.y, st.looseInNode.translate.z);
         }
     }
@@ -1514,7 +1528,7 @@ namespace
         RE::NiTransform pose = identityTransform();
         pose.rotate = fromMat(mul(turn, toMat(base.rotate)));
         pose.scale = scale;
-        pose.translate = hand.palm - axisOf(pose, 2) * (g_settings.holdUp * scale) + axisOf(pose, 0) * (g_settings.holdSide * scale) +
+        pose.translate = hand.palm - axisOf(pose, 2) * ((g_state.bottomAt + g_settings.holdUp) * scale) + axisOf(pose, 0) * (g_settings.holdSide * scale) +
                          axisOf(pose, 1) * (g_settings.holdForward * scale);
         return pose;
     }
@@ -2090,20 +2104,29 @@ namespace
         st.lastDrawn = drawn;
         st.lastDrawnValid = draw;
 
-        // the free hand on the magazine
-        if (st.place == kRailHand && free.valid) {
-            pinHand(compose(drawn, st.wristInMag));
-        } else {
-            unpinHand();
-        }
-        poseFingers(st.place == kRailHand || st.place == kHand);
-
         // the slide: the game shows it open on an empty gun, but here it is open only after the last shot
         if (st.idleKnown && looksLikeObject(bolt) && (gun.data->ammoCount == 0 || st.slideLocked || st.racking || st.rackPull > 0.0f)) {
             bolt->local = st.idle[1];
             refreshSubtree(bolt, RE::NiPoint3{});
         }
         rackByHand(gun, root, bolt, dt);
+
+        // the free hand stays on what it holds: the magazine in the well, or the slide
+        if (st.racking && looksLikeObject(bolt) && free.valid) {
+            if (!st.rackPinned) {
+                st.rackPinned = true;
+                st.wristInBolt = relative(bolt->world, free.wrist);
+            }
+            pinHand(compose(bolt->world, st.wristInBolt));
+        } else {
+            st.rackPinned = false;
+            if (st.place == kRailHand && free.valid) {
+                pinHand(compose(drawn, st.wristInMag));
+            } else {
+                unpinHand();
+            }
+        }
+        poseFingers(st.place == kRailHand || st.place == kHand || st.racking);
 
         looseMagazines(&gun, root);
 
