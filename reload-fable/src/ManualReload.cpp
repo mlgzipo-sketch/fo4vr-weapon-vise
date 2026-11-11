@@ -346,6 +346,20 @@ namespace
         return total;
     }
 
+    // Guns with a detachable magazine and a slide / bolt / charging handle (group 1). A gun is handled when the
+    // magazine mod it wears has one of these models; the index is the magazine's kind (MRF_Mags order in the ESP).
+    constexpr std::array<const char*, 16> kMagModels{
+        "weapons\\10mmpistol\\10mmmag01.nif", "weapons\\10mmpistol\\10mmmaglarge.nif",
+        "weapons\\machinegun\\mgmagstraight.nif", "weapons\\machinegun\\mgmagdrum.nif",
+        "weapons\\combatshotgun\\combatriflemagmedium.nif", "weapons\\combatshotgun\\combatriflemaglarge.nif",
+        "weapons\\combatshotgun\\tgundrummagsmall.nif", "weapons\\combatshotgun\\tgundrummag.nif",
+        "weapons\\covertsidearm\\covertsidearmmagazine.nif", "weapons\\covertsidearm\\covertsidearmmagazinelarge.nif",
+        "weapons\\handmade\\magazines\\45straightmagshort.nif", "weapons\\handmade\\magazines\\45straightmag.nif",
+        "weapons\\handmade\\magazines\\piperifledrummag.nif",
+        "weapons\\combatshotgun\\combatshotgunsmallmag.nif", "weapons\\combatshotgun\\combatshotgunmediummag.nif",
+        "weapons\\combatshotgun\\drummag.nif",
+    };
+
     // The magazine the equipped gun wears: its magazine mod's model, looked up in kMagModels (-1: none of ours).
     int magazineKindOf(RE::PlayerCharacter* player, const RE::TESForm* weapon, std::string& model) noexcept
     {
@@ -1140,19 +1154,6 @@ namespace
 
     constexpr std::uint32_t k10mmPistol = 0x00004822;   // Fallout4.esm
 
-    // Guns with a detachable magazine and a slide / bolt / charging handle (group 1). A gun is handled when the
-    // magazine mod it wears has one of these models; the index is the magazine's kind (MRF_Mags order in the ESP).
-    constexpr std::array<const char*, 16> kMagModels{
-        "weapons\\10mmpistol\\10mmmag01.nif", "weapons\\10mmpistol\\10mmmaglarge.nif",
-        "weapons\\machinegun\\mgmagstraight.nif", "weapons\\machinegun\\mgmagdrum.nif",
-        "weapons\\combatshotgun\\combatriflemagmedium.nif", "weapons\\combatshotgun\\combatriflemaglarge.nif",
-        "weapons\\combatshotgun\\tgundrummagsmall.nif", "weapons\\combatshotgun\\tgundrummag.nif",
-        "weapons\\covertsidearm\\covertsidearmmagazine.nif", "weapons\\covertsidearm\\covertsidearmmagazinelarge.nif",
-        "weapons\\handmade\\magazines\\45straightmagshort.nif", "weapons\\handmade\\magazines\\45straightmag.nif",
-        "weapons\\handmade\\magazines\\piperifledrummag.nif",
-        "weapons\\combatshotgun\\combatshotgunsmallmag.nif", "weapons\\combatshotgun\\combatshotgunmediummag.nif",
-        "weapons\\combatshotgun\\drummag.nif",
-    };
     constexpr float kGravity = 686.0f;                   // game units per second squared
 
     enum Place : int
