@@ -1194,8 +1194,10 @@ namespace
                     PendingCommand command;
                     command.type = kRemove;
                     command.mod = hover;
-                    // the part appears right in the palm (as in 0.4, where ROCK then holds it with the fingers)
-                    command.pose = poseOf(hand.point, headingOf(fingers(hand)));
+                    // exactly as 0.4: the part keeps where it was relative to the hand that took it
+                    const auto from = looksLikeObject(anchor->node) ? anchor->node->world : weapon3D->world;
+                    hand.offset = relative(hand.frame, from);
+                    command.pose = poseOf(compose(hand.frame, hand.offset).translate, headingOf(fingers(hand)));
                     pushCommand(command);
                     hand.mod = hover;
                     hand.armed = false;
@@ -1479,8 +1481,7 @@ namespace
                 if (hand.mode != Hand::Mode::Await || !hand.grip) {
                     continue;
                 }
-                // it stays where it appeared, in the palm
-                hand.offset = relative(hand.frame, root->world);
+                // hand.offset stays what it was when the part was taken (as in 0.4)
                 hand.mode = Hand::Mode::Carry;
                 hand.carried3D = nullptr;
                 hand.part = id;
