@@ -26,6 +26,9 @@ namespace
 {
 griphook::Log g_log{ nullptr };
 std::atomic<bool> g_hide{ true };
+// set while the plugin itself reads the controller: one interface version forwards to another inside
+// vrclient, so the plugin's own read would come back through the other version's hook with the grip hidden
+thread_local bool t_bypass{ false };
 
 void note(const char* format, ...) noexcept
 {
@@ -89,7 +92,7 @@ void arbitrate(bool raw) noexcept
 
 void filter(vr::TrackedDeviceIndex_t device, vr::VRControllerState_t& state) noexcept
 {
-    if (device != g_device.load()) {
+    if (t_bypass || device != g_device.load()) {
         return;
     }
     const auto mask = g_gripMask.load();
@@ -325,6 +328,9 @@ namespace griphook
         if (!g_origState[0] || !g_self[0] || !state) {
             return false;
         }
-        return g_origState[0](g_self[0], device, static_cast<vr::VRControllerState_t*>(state), size);
+        t_bypass = true;
+        const bool ok = g_origState[0](g_self[0], device, static_cast<vr::VRControllerState_t*>(state), size);
+        t_bypass = false;
+        return ok;
     }
 }
