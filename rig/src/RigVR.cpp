@@ -147,7 +147,7 @@ namespace
         bool  messages{ true };
         float slotRadius{ 8.0f };      // the palm this close to a pouch / a free place
         float mannequinReach{ 150.0f };// the mannequin is used within this distance
-        float wearRadius{ 20.0f };     // both hands this close to the rig's chest to put it on / take it off
+        float wearRadius{ 12.0f };     // both hands this close to the mannequin's shoulders to put the rig on / hang it back
         float wearWindow{ 0.5f };      // ..both grips pressed within this many seconds
         float packSeconds{ 1.5f };     // hold the grip on the mannequin's head this long to fold it up
         float storeRadius{ 16.0f };    // an item let go this close to the palm over a pouch goes in
@@ -1350,7 +1350,6 @@ namespace
                 hud("Держи грип, чтобы сложить манекен");
                 continue;
             }
-            st.gripAt[h] = now;
         }
 
         // folding
@@ -1373,23 +1372,32 @@ namespace
             }
         }
 
-        // put the rig on: both grips at the mannequin's chest at once
-        const auto chestPoint = f.chest.at(0.0f, 6.0f, -4.0f);
+        // put the rig on / hang it back: both hands take the mannequin by the shoulders, both grips at once
+        const auto leftShoulder = f.chest.at(-13.0f, 0.0f, 10.0f);
+        const auto rightShoulder = f.chest.at(13.0f, 0.0f, 10.0f);
         const bool both = g_hands[0].grip && g_hands[1].grip;
         if (!both) {
             st.wearArmed = true;
         }
-        if (rigHere && both && st.wearArmed && st.heldType == kEmpty &&
-            distance(g_hands[0].palm, chestPoint) < g_settings.wearRadius && distance(g_hands[1].palm, chestPoint) < g_settings.wearRadius &&
-            std::chrono::duration<float>(st.gripAt[0] > st.gripAt[1] ? st.gripAt[0] - st.gripAt[1] : st.gripAt[1] - st.gripAt[0]).count() < g_settings.wearWindow) {
+        const auto atShoulders = [&]() {
+            const float r = g_settings.wearRadius;
+            const auto& p0 = g_hands[0].palm;
+            const auto& p1 = g_hands[1].palm;
+            return (distance(p0, rightShoulder) < r && distance(p1, leftShoulder) < r) ||
+                   (distance(p0, leftShoulder) < r && distance(p1, rightShoulder) < r);
+        };
+        const auto apart = st.gripAt[0] > st.gripAt[1] ? st.gripAt[0] - st.gripAt[1] : st.gripAt[1] - st.gripAt[0];
+        if (both && st.wearArmed && st.heldType == kEmpty && atShoulders() &&
+            std::chrono::duration<float>(apart).count() < g_settings.wearWindow) {
             st.wearArmed = false;
-            g_rig.worn = true;
+            g_rig.worn = !g_rig.worn;
             sound(0);
             buzz(0, 3000);
             buzz(1, 3000);
-            hud("Разгрузка надета");
-            note("Rig put on");
+            hud(g_rig.worn ? "Разгрузка надета" : "Разгрузка снята и висит на манекене");
+            note(g_rig.worn ? "Rig put on" : "Rig taken off");
             markDirty();
+            return;
         }
 
         // free places
@@ -1423,6 +1431,7 @@ namespace
     {
         auto& st = g_state;
         const auto f = bodyFrames(player);
+        (void)mannequin;
 
         for (int i = 0; i < kSlots; ++i) {
             const int type = g_rig.slots[i].type;
@@ -1555,31 +1564,6 @@ namespace
             hideVisual(kVisCursor);
         }
 
-        // take it off: both grips at your own chest while the mannequin is near
-        if (mannequin) {
-            const auto chestPoint = f.chest.at(0.0f, 6.0f, -4.0f);
-            const bool both = g_hands[0].grip && g_hands[1].grip;
-            if (!both) {
-                st.wearArmed = true;
-            }
-            for (int h = 0; h < 2; ++h) {
-                if (g_hands[h].pressed()) {
-                    st.gripAt[h] = now;
-                }
-            }
-            if (both && st.wearArmed && !gun && distance(g_hands[0].palm, chestPoint) < g_settings.wearRadius &&
-                distance(g_hands[1].palm, chestPoint) < g_settings.wearRadius &&
-                std::chrono::duration<float>(st.gripAt[0] > st.gripAt[1] ? st.gripAt[0] - st.gripAt[1] : st.gripAt[1] - st.gripAt[0]).count() < g_settings.wearWindow) {
-                st.wearArmed = false;
-                g_rig.worn = false;
-                sound(0);
-                buzz(0, 3000);
-                buzz(1, 3000);
-                hud("Разгрузка снята и висит на манекене");
-                note("Rig taken off");
-                markDirty();
-            }
-        }
     }
 
     // A chem or food from a pouch brought to the mouth is used.
@@ -1678,6 +1662,11 @@ namespace
         takeNewRefs();
         readHand(0);
         readHand(1);
+        for (int h = 0; h < 2; ++h) {
+            if (g_hands[h].pressed()) {
+                g_state.gripAt[h] = now;
+            }
+        }
 
         if (menuOpen()) {
             for (int i = 0; i < kVisuals; ++i) {
