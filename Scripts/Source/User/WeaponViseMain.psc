@@ -407,6 +407,11 @@ Function AttachPart(ObjectReference part, ObjectMod m)
 	ObjectMod[] before = Clamped.GetAllMods()
 	if !Clamped.AttachMod(m)
 		WeaponVise.Notify(5)
+		; the snap took it out of physics: rebuild it as a normal object
+		part.Disable()
+		part.Enable()
+		WaitFor3D(part)
+		part.SetMotionType(1, true)
 		WeaponVise.AddPart(part, m, false)
 		return
 	endif

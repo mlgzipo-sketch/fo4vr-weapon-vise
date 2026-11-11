@@ -488,6 +488,8 @@ namespace
         bool placed{ false };       // home holds where the player left it
         RE::NiTransform home{};
         int carriedBy{ -1 };
+        bool previewing{ false };   // ghost shown while a gripping hand holds it near its place
+        Clock::time_point previewSince{};
     };
     std::unordered_map<std::uint32_t, LoosePart> g_parts;
 
@@ -506,6 +508,7 @@ namespace
     std::uint64_t g_revision{ ~0ull };
     RE::NiAVObject* g_weapon3D{ nullptr };
     bool g_treeLogged{ false };
+    bool g_treeLoggedLate{ false };
     bool g_stemsWork{ false };
     Clock::time_point g_revisionTime{};
     Clock::time_point g_lastHint{};
@@ -1077,11 +1080,6 @@ namespace
                 }
                 if (hover && hoverKnown) {
                     wishGhost(hover, 1, hoverSlot);
-                    // the outline stands in for the real part once it is showing
-                    if (!hand.hidden && ghostShowing(hover) && looksLikeObject(hand.holdNode)) {
-                        hand.hidden = hand.holdNode;
-                        setCulled(hand.hidden, true);
-                    }
                 }
                 if (!pressed) {
                     break;
@@ -1263,19 +1261,25 @@ namespace
                     holder = index;
                 }
             }
-            if (holder < 0) {
-                continue;
-            }
             RE::NiTransform target;
-            if (!previewAttach(part, root->world, target)) {
+            if (holder < 0 || !previewAttach(part, root->world, target)) {
+                part.previewing = false;
                 continue;
             }
             const auto& hand = g_hands_state[holder];
             if (hand.grip) {
+                if (!part.previewing) {
+                    part.previewing = true;
+                    part.previewSince = Clock::now();
+                }
                 wishGhost(part.mod, 2, target);
-            } else {
+            } else if (part.previewing && seconds(part.previewSince) > 0.25f) {
+                // let go while its ghost was showing: it snaps on
+                part.previewing = false;
                 buzz(holder, 2000);
                 startSnap(id, part, root->world, target);
+            } else {
+                part.previewing = false;
             }
         }
     }
@@ -1305,6 +1309,7 @@ namespace
                         }
                     }
                     g_treeLogged = false;
+                    g_treeLoggedLate = false;
                     g_clampFeedback = g_weapon != 0;
                     if (!g_weapon) {
                         g_ghosts.clear();
@@ -1395,7 +1400,16 @@ namespace
         }
         // right away, then again a little later: a mod change may rebuild the collision
         static constexpr float passes[] = { 0.0f, 0.25f, 0.75f, 2.0f };
-        if (g_detachPasses >= 4 || seconds(g_detachTime) < passes[g_detachPasses]) {
+        if (g_detachPasses >= 4) {
+            // and every half second after that: moving the reference (SetPosition) brings physics back
+            if (seconds(g_detachTime) < 2.5f) {
+                return;
+            }
+            g_detachTime = Clock::now() - std::chrono::milliseconds(2000);
+            weapon->DetachHavok(root);
+            return;
+        }
+        if (seconds(g_detachTime) < passes[g_detachPasses]) {
             return;
         }
         ++g_detachPasses;
@@ -1535,6 +1549,19 @@ namespace
                 std::snprintf(message, sizeof(message), "  part %s -> node '%s', attach point '%s'", info ? info->edid.c_str() : "?",
                     nodeName(anchor.node).c_str(), nodeName(attachPointOf(anchor.node)).c_str());
                 logNote(message);
+            }
+        }
+        if (g_settings.logTree && !g_treeLoggedLate && seconds(g_revisionTime) > 1.5f) {
+            g_treeLoggedLate = true;
+            logNote("Tree again, 1.5 s after the change:");
+            logTree(root);
+            if (auto* parent = root->parent; looksLikeObject(parent)) {
+                auto& children = parent->GetRuntimeData().children;
+                std::string text = "Parent '" + nodeName(parent) + "' children:";
+                for (std::uint16_t i = 0; i < children.size() && i < 20; ++i) {
+                    text += " '" + nodeName(children[i].get()) + "'";
+                }
+                logNote(text);
             }
         }
         // parts may be re-created after a change
