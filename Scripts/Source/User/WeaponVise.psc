@@ -21,3 +21,5 @@ Function Notify(int aiMessage) global native
 int Function FallbackID(ObjectMod akMod) global native
 ; True for such fillers: they come for free and are not given back as loose mods.
 bool Function IsFreeMod(ObjectMod akMod) global native
+; True: a removed part is carried by the plugin (old way); false: it is a physical object ROCK takes.
+bool Function RemoveIntoHand() global native

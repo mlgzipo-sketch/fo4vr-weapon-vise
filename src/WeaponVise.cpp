@@ -90,7 +90,7 @@ namespace
         float snapTime{ 0.15f };        // seconds of the snap-on animation
         float ghostFade{ 0.5f };        // how see-through the attach ghost is
         float heldRadius{ 15.0f };      // a part held by ROCK this close to its place previews
-        bool removeIntoHand{ true };   // false: a removed part drops as a real object for ROCK to take
+        bool removeIntoHand{ false };   // false: a removed part drops as a real object for ROCK to take
         bool logGrab{ true };           // log what each grip press near the weapon found
         bool refresh3D{ false };         // reload the weapon's 3D when it does not show a change
         bool logTree{ true };
@@ -1194,14 +1194,17 @@ namespace
                     PendingCommand command;
                     command.type = kRemove;
                     command.mod = hover;
-                    // exactly as 0.4: the part keeps where it was relative to the hand that took it
+                    // The part appears as a normal physical object right in the palm while grip is
+                    // still held: ROCK's grab leeway (fGrabInputLeewaySeconds) then takes it with the fingers.
                     const auto from = looksLikeObject(anchor->node) ? anchor->node->world : weapon3D->world;
                     hand.offset = relative(hand.frame, from);
-                    command.pose = poseOf(compose(hand.frame, hand.offset).translate, headingOf(fingers(hand)));
+                    command.pose = g_settings.removeIntoHand
+                        ? poseOf(compose(hand.frame, hand.offset).translate, headingOf(fingers(hand)))
+                        : poseOf(hand.point, headingOf(fingers(hand)));
                     pushCommand(command);
                     hand.mod = hover;
                     hand.armed = false;
-                    hand.mode = Hand::Mode::Await;
+                    hand.mode = g_settings.removeIntoHand ? Hand::Mode::Await : Hand::Mode::Done;
                     hand.since = Clock::now();
                     buzz(index, 3000);
                     soundCue(3);
@@ -1820,6 +1823,11 @@ namespace
         return static_cast<std::int32_t>(g_shared.current.mod);
     }
 
+    bool RemoveIntoHand(std::monostate)
+    {
+        return g_settings.removeIntoHand;
+    }
+
     std::int32_t CommandPartID(std::monostate)
     {
         std::scoped_lock guard(g_shared.lock);
@@ -1936,6 +1944,7 @@ namespace
         vm->BindNativeMethod(kScript, "PollCommand", PollCommand, true);
         vm->BindNativeMethod(kScript, "CommandModID", CommandModID, true);
         vm->BindNativeMethod(kScript, "CommandPartID", CommandPartID, true);
+        vm->BindNativeMethod(kScript, "RemoveIntoHand", RemoveIntoHand, true);
         vm->BindNativeMethod(kScript, "CommandPose", CommandPose, true);
         vm->BindNativeMethod(kScript, "RackPose", RackPose, true);
         vm->BindNativeMethod(kScript, "ModelOutdated", ModelOutdated, true);

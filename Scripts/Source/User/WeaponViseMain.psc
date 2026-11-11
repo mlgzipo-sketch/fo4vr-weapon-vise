@@ -424,7 +424,8 @@ Function RemovePart(ObjectMod m)
 		Clamped.AttachMod(filler)
 	endif
 	WeaponVise.SetWeapon(Clamped, Clamped.GetAllMods())
-	SpawnPart(i, pose, true)
+	; a normal physical object in the palm: ROCK takes it into the fingers (grip is still held)
+	SpawnPart(i, pose, WeaponVise.RemoveIntoHand())
 EndFunction
 
 Function AttachPart(ObjectReference part, ObjectMod m)
@@ -475,12 +476,7 @@ Function DropPart(ObjectReference part)
 	if part && Parts.Find(part) >= 0
 		float[] pose = WeaponVise.CommandPose()
 		part.SetPosition(pose[0], pose[1], pose[2])
-		; it was carried without collision: rebuild it here as a normal object,
-		; or it hangs in the air and ROCK can not take it
-		part.Disable()
-		part.Enable()
-		WaitFor3D(part)
-		part.SetMotionType(1, true)   ; let go: it falls and ROCK can pick it up
+		part.SetMotionType(1, true)   ; let go: it falls and ROCK can pick it up (as in 0.4)
 	endif
 EndFunction
 
