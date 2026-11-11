@@ -60,7 +60,7 @@ namespace
     {
         int gripButton{ 2 };            // OpenVR button id: 2 = grip
         int triggerButton{ 33 };        // OpenVR button id: 33 = trigger
-        int selectButton{ 7 };          // OpenVR button id: 7 = A / X: held, the hand picks parts off the weapon
+        int selectButton{ 33 };         // OpenVR button id (33 = trigger): held, the hand picks parts off the weapon
         bool highlight{ true };         // glow the part a hand holds
         bool haptics{ true };
         int weaponHand{ 0 };            // 0 = right, 1 = left
@@ -480,6 +480,7 @@ namespace
     RE::NiPoint3 g_clampPoint{};      // where the last clamp asked the weapon to go
     Clock::time_point g_clampAt{};
     bool g_missing3DLogged{ false };
+    bool g_clampFeedback{ false };   // a weapon was just clamped: buzz and click once
 
     struct LoosePart
     {
@@ -756,30 +757,21 @@ namespace
     void updateClampGesture() noexcept
     {
         auto* player = RE::PlayerCharacter::GetSingleton();
-        auto& hand = g_hands_state[g_settings.weaponHand == 1 ? 1 : 0];
-        if (!player || !hand.valid || !inViseArea(hand.point)) {
-            return;
-        }
-        // ROCK drops the weapon on the same release, so "drawn" may already be gone on that frame
-        static Clock::time_point drawnAt{};
-        if (player->GetWeaponMagicDrawn()) {
-            drawnAt = Clock::now();
-        } else if (seconds(drawnAt) > 0.5f) {
-            return;
-        }
-        if (seconds(g_lastHint) > 20.0f) {
-            g_lastHint = Clock::now();
-            hud("Тиски: отпусти грип, чтобы оставить оружие здесь");
-        }
-        const bool released = hand.previousGrip && !hand.grip;
-        if (released && seconds(hand.gripSince) >= 0.15f) {
-            PendingCommand command;
-            command.type = kClamp;
-            command.pose = poseOf(hand.point, headingOf(fingers(hand)));
-            pushCommand(command);
-            g_clampPoint = hand.point;
-            g_clampAt = Clock::now();
-            buzz(g_settings.weaponHand == 1 ? 1 : 0, 2000);
+        for (int index = 0; index < 2; ++index) {
+            auto& hand = g_hands_state[index];
+            if (!player || !hand.valid || !inViseArea(hand.point)) {
+                continue;
+            }
+            // a weapon let go here (drawn or carried loose) is looked for by the script
+            const bool released = hand.previousGrip && !hand.grip;
+            if (released && seconds(hand.gripSince) >= 0.15f) {
+                PendingCommand command;
+                command.type = kClamp;
+                command.pose = poseOf(hand.point, headingOf(fingers(hand)));
+                pushCommand(command);
+                g_clampPoint = hand.point;
+                g_clampAt = Clock::now();
+            }
         }
     }
 
@@ -1076,7 +1068,13 @@ namespace
                 }
                 RE::NiTransform hoverSlot;
                 const auto* hoverInfo = hover ? partInfo(hover) : nullptr;
-                const bool hoverKnown = hoverInfo && slotWorld(*hoverInfo, hoverSlot);
+                bool hoverKnown = hoverInfo && slotWorld(*hoverInfo, hoverSlot);
+                if (hover && !hoverKnown && looksLikeObject(anchor->node)) {
+                    // slot not found on the model: the part's own node stands in for it
+                    hoverSlot = anchor->node->world;
+                    hoverSlot.scale = 1.0f;
+                    hoverKnown = true;
+                }
                 if (hover && hoverKnown) {
                     wishGhost(hover, 1, hoverSlot);
                     // the outline stands in for the real part once it is showing
@@ -1113,9 +1111,20 @@ namespace
                     hand.since = Clock::now();
                     buzz(index, 3000);
                     soundCue(3);
+                } else if (touched && !hand.select && unclampAllowed() && partInfo(touched->mod)
+                           && partInfo(touched->mod)->slot == "ap_gun_Grip") {
+                    // grip on the handle: the weapon goes back into the hand the normal way
+                    PendingCommand command;
+                    command.type = kUnclamp;
+                    pushCommand(command);
+                    buzz(index, 2500);
+                    soundCue(3);
+                    hand.mode = Hand::Mode::Done;
                 } else if ((touched || toWeapon < g_settings.weaponGrabRadius) && g_weaponHeldBy < 0 && !hand.select) {
-                    // grip anywhere on the weapon: it follows the hand
+                    // grip anywhere else on the weapon: it follows the hand, the touched spot in the palm
                     hand.mode = Hand::Mode::HoldWeapon;
+                    const auto grabbed = touched ? touched->center : centerOf(weapon3D);
+                    g_weaponWorld.translate = g_weaponWorld.translate + (hand.point - grabbed);
                     hand.offset = relative(hand.frame, g_weaponWorld);
                     g_weaponHeldBy = index;
                     buzz(index, 1200);
@@ -1296,6 +1305,7 @@ namespace
                         }
                     }
                     g_treeLogged = false;
+                    g_clampFeedback = g_weapon != 0;
                     if (!g_weapon) {
                         g_ghosts.clear();
                         g_ghostColor.clear();
@@ -1351,6 +1361,14 @@ namespace
                     std::scoped_lock guard(g_shared.lock);
                     g_shared.inHandParts.push_back(id);
                     break;
+                }
+                {
+                    // the part sits in the palm: its middle where the hand grips
+                    auto world = compose(hand.frame, hand.offset);
+                    const auto localCenter = relative(root->world, pointTransform(centerOf(root))).translate;
+                    const auto center = compose(world, pointTransform(localCenter)).translate;
+                    world.translate = world.translate + (hand.point - center);
+                    hand.offset = relative(hand.frame, world);
                 }
                 hand.mode = Hand::Mode::Carry;
                 hand.part = id;
@@ -1423,9 +1441,14 @@ namespace
             const auto& hand = g_hands_state[g_settings.weaponHand == 1 ? 1 : 0];
             auto* player = RE::PlayerCharacter::GetSingleton();
             if (!g_weapon) {
-                // a weapon in hand coming close
-                show = player && player->GetWeaponMagicDrawn() && hand.valid && distance(hand.point, center) < g_settings.zoneRadius * 3.0f;
-                inside = show && inViseArea(hand.point);
+                // a hand coming close (with a drawn weapon or one carried loose)
+                (void)player;
+                for (const auto& h : g_hands_state) {
+                    if (h.valid && distance(h.point, center) < g_settings.zoneRadius * 2.5f) {
+                        show = true;
+                        inside = inside || inViseArea(h.point);
+                    }
+                }
             } else if (g_weaponHeldBy >= 0) {
                 // the clamped weapon is being carried
                 show = true;
@@ -1472,6 +1495,12 @@ namespace
             return;
         }
         g_missing3DLogged = false;
+        if (g_clampFeedback) {
+            g_clampFeedback = false;
+            buzz(0, 2000);
+            buzz(1, 2000);
+            soundCue(2);
+        }
         if (!g_weaponWorldSet) {
             // wait until the script's SetPosition has reached the 3D, or the weapon would be pinned
             // where it was dropped (in the hand) and look like it vanished
@@ -1707,7 +1736,7 @@ namespace
         case 1: hud("Сначала возьми оружие в руку"); break;
         case 2: hud("В тиски пока можно зажать только 10-мм пистолет"); break;
         case 3: hud("Не получилось положить оружие в тиски"); break;
-        case 4: hud("Оружие в тисках. Держи A и наведи руку на деталь, грип: снять. Поднеси деталь к месту и отпусти: поставить"); break;
+        case 4: hud("Оружие в тисках. Держи курок и наведи руку на деталь, грип: снять. Грип за рукоять: забрать оружие"); break;
         case 5: hud("Эта деталь сюда не подходит"); break;
         case 6: hud("Оружие снова в руке"); break;
         case 7: hud("Ты отошёл: оружие и детали вернулись в инвентарь"); break;

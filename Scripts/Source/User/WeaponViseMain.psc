@@ -294,7 +294,7 @@ EndFunction
 ObjectReference Function FindDroppedWeapon(float[] pose)
 	ObjectReference[] found = Game.GetPlayer().FindAllReferencesOfType(WV_Weapons, 300.0)
 	ObjectReference best = None
-	float bestDistance = 3600.0 ; 60 units, squared
+	float bestDistance = 1600.0 ; 40 units, squared
 	int i = 0
 	while i < found.Length
 		ObjectReference r = found[i]
@@ -320,26 +320,21 @@ Function Clamp()
 	Actor player = Game.GetPlayer()
 	float[] pose = WeaponVise.CommandPose()
 	Weapon w = player.GetEquippedWeapon()
+	bool drawn = player.IsWeaponDrawn()
+	; a weapon let go here: carried loose, or just dropped by ROCK out of the hand
 	ObjectReference ref = None
-	if !w || WV_Weapons.Find(w) < 0
-		; ROCK may have just dropped it: give the drop a moment, then take it from the world
-		int tries = 0
-		while !ref && tries < 10
-			Utility.Wait(0.05)
-			ref = FindDroppedWeapon(pose)
-			tries += 1
-		endwhile
+	int tries = 0
+	while !ref && tries < 8
+		ref = FindDroppedWeapon(pose)
 		if !ref
-			if !w
-				WeaponVise.Notify(1)
-			else
-				WeaponVise.Notify(2)
-			endif
-			return
+			Utility.Wait(0.05)
 		endif
+		tries += 1
+	endwhile
+	if ref
 		w = ref.GetBaseObject() as Weapon
 		WeaponVise.Notify(10)
-	else
+	elseif w && drawn && WV_Weapons.Find(w) >= 0 && player.GetEquippedWeapon() == w
 		player.UnequipItem(w, false, true)
 		ref = player.DropObject(w, 1)
 		if !ref
@@ -347,6 +342,11 @@ Function Clamp()
 			player.EquipItem(w, false, true)
 			return
 		endif
+	else
+		if w && drawn && WV_Weapons.Find(w) < 0
+			WeaponVise.Notify(2)
+		endif
+		return
 	endif
 	WaitFor3D(ref)
 	ref.SetMotionType(2, true)
