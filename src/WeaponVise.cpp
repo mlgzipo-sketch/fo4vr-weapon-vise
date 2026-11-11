@@ -1208,24 +1208,16 @@ namespace
                     hand.since = Clock::now();
                     buzz(index, 3000);
                     soundCue(3);
-                } else if (touched && !hand.select && unclampAllowed() && partInfo(touched->mod)
-                           && partInfo(touched->mod)->slot == "ap_gun_Grip") {
-                    // grip on the handle: the weapon goes back into the hand the normal way
+                } else if ((touched || toWeapon < g_settings.weaponGrabRadius) && g_weaponHeldBy < 0 && !hand.select) {
+                    // grip anywhere on the weapon: it becomes a normal physical weapon right in the hand
+                    // and ROCK takes it with the fingers (the press is still held), like the parts
                     PendingCommand command;
                     command.type = kUnclamp;
+                    command.mod = 2;   // flag: leave it loose for ROCK, do not put it in the inventory
                     pushCommand(command);
                     buzz(index, 2500);
                     soundCue(3);
                     hand.mode = Hand::Mode::Done;
-                } else if ((touched || toWeapon < g_settings.weaponGrabRadius) && g_weaponHeldBy < 0 && !hand.select) {
-                    // grip anywhere else on the weapon: it follows the hand, the touched spot in the palm
-                    hand.mode = Hand::Mode::HoldWeapon;
-                    const auto grabbed = touched ? touched->center : centerOf(weapon3D);
-                    g_weaponWorld.translate = g_weaponWorld.translate + (hand.point - grabbed);
-                    hand.offset = relative(hand.frame, g_weaponWorld);
-                    g_weaponHeldBy = index;
-                    buzz(index, 1200);
-                    soundCue(3);
                 }
                 break;
             }

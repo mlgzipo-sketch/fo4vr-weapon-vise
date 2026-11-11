@@ -262,7 +262,11 @@ Function Handle()
 		if cmd == CmdClamp
 			Clamp()
 		elseif cmd == CmdUnclamp
-			Unclamp(true)
+			if WeaponVise.CommandFlag() == 2
+				ReleaseToHand()
+			else
+				Unclamp(true)
+			endif
 		elseif cmd == CmdRemove
 			RemovePart(CmdMod())
 		elseif cmd == CmdAttach
@@ -573,6 +577,21 @@ Function ClearGhosts()
 	Ghosts = new ObjectReference[0]
 	GhostMods = new ObjectMod[0]
 	GhostColors = new int[0]
+EndFunction
+
+; Grip on the clamped weapon: it gets its physics back where it is, in the gripping hand,
+; and ROCK takes it like any loose weapon (as it does with the parts).
+Function ReleaseToHand()
+	ObjectReference ref = Clamped
+	Clamped = None
+	WeaponVise.SetWeapon(None, new ObjectMod[0])
+	ClearGhosts()
+	if ref
+		ref.Disable()
+		ref.Enable()
+		WaitFor3D(ref)
+		ref.SetMotionType(1, true)
+	endif
 EndFunction
 
 Function Unclamp(bool equip)
