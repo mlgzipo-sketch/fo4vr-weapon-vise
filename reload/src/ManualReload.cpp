@@ -54,6 +54,7 @@ namespace
     {
         bool  blockReload{ true };
         int   reloadGunState{ 8 };      // raw gunState of VR while reloading
+        int   idleGunState{ 12 };       // raw gunState of VR at rest (the moving parts are learned then)
         int   dumpDepth{ 12 };
         int   gunHand{ 0 };             // 0 = right hand holds the gun, 1 = left
         int   gripButton{ 2 };          // OpenVR button id of the grip
@@ -61,7 +62,7 @@ namespace
         bool  messages{ true };
         float beltLow{ 55.0f };         // belt zone: palm height above the feet, from..to (game units)
         float beltHigh{ 80.0f };
-        float beltRadius{ 17.0f };      // ..and at most this far from the body sideways
+        float beltRadius{ 22.0f };      // ..and at most this far from the body sideways
         float extendDistance{ 3.0f };   // how far the magazine sticks out while the reload button is held
         float dropDistance{ 9.0f };     // how far it slides before it falls free
         float slideSpeed{ 45.0f };      // units per second, out and in
@@ -73,10 +74,11 @@ namespace
         float rackTravel{ 2.5f };       // how far the slide goes back
         float holdRotX{ 0.0f };         // magazine in the hand: turns in the hand bone's frame (degrees)
         float holdRotY{ 0.0f };
-        float holdRotZ{ 180.0f };
+        float holdRotZ{ 0.0f };
         float holdUp{ 3.0f };           // ..and how far its top sits above the palm
         float ghostRadius{ 14.0f };     // a magazine this close to the well shows the ghost
-        float snapRadius{ 4.0f };       // ..and this close goes in by itself
+        float snapRadius{ 5.0f };       // ..and this close goes in by itself, even still in the hand
+        float magTilt{ -1.0f };         // the well's slope back from straight down (degrees); below 0 = learned from the model
         float handRadius{ 16.0f };      // a hand this close to a magazine is the one holding it
         float looseLifetime{ 90.0f };   // seconds a dropped magazine stays before it is cleaned up
         int   maxLoose{ 6 };
@@ -101,6 +103,8 @@ namespace
                 auto& s = g_settings;
                 if (key == "bBlockReload") s.blockReload = value != 0.0f;
                 else if (key == "iReloadGunState") s.reloadGunState = static_cast<int>(value);
+                else if (key == "iIdleGunState") s.idleGunState = static_cast<int>(value);
+                else if (key == "fMagTilt") s.magTilt = value;
                 else if (key == "iDumpDepth") s.dumpDepth = static_cast<int>(value);
                 else if (key == "iGunHand") s.gunHand = value != 0.0f ? 1 : 0;
                 else if (key == "iGripButton") s.gripButton = static_cast<int>(value);
@@ -381,6 +385,26 @@ namespace
     RE::NiPoint3 axisOf(const RE::NiTransform& t, int axis) noexcept
     {
         return { t.rotate.entry[axis][0], t.rotate.entry[axis][1], t.rotate.entry[axis][2] };
+    }
+
+    float dot(const RE::NiPoint3& a, const RE::NiPoint3& b) noexcept
+    {
+        return a.x * b.x + a.y * b.y + a.z * b.z;
+    }
+
+    RE::NiPoint3 normalized(const RE::NiPoint3& v) noexcept
+    {
+        const float length = std::sqrt(dot(v, v));
+        if (length < 1e-5f) {
+            return { 0.0f, 0.0f, -1.0f };
+        }
+        return v * (1.0f / length);
+    }
+
+    // A direction given in a transform's own frame, in world space.
+    RE::NiPoint3 directionToWorld(const RE::NiTransform& t, const RE::NiPoint3& v) noexcept
+    {
+        return axisOf(t, 0) * v.x + axisOf(t, 1) * v.y + axisOf(t, 2) * v.z;
     }
 
     // Places an object's 3D: root at `world`, children follow.
@@ -749,6 +773,7 @@ namespace
         int               kind{ 0 };
         Clock::time_point born{};
         bool              fromBelt{ false };
+        bool              awayFromWell{ false };   // has been clear of the well since it came out
     };
 
     struct Pending
@@ -790,6 +815,13 @@ namespace
         float              rackPull{ 0.0f };
         float              rackGrabY{ 0.0f };
         bool               rackCycled{ false };
+        bool               slideLocked{ false };  // held back after the last shot until racked
+        Clock::time_point  lastShot{};
+        // learned from the gun at rest, in the gun root's frame
+        RE::NiPoint3       magAxis{ 0.0f, 0.0f, -1.0f };   // the way the magazine leaves the well
+        bool               magAxisKnown{ false };
+        RE::NiPoint3       slideCenter{};                   // middle of the slide
+        bool               slideCenterKnown{ false };
     };
     State g_state;
 
@@ -1189,16 +1221,23 @@ namespace
             const bool inHand = nearHand >= 0 && handDistance < g_settings.handRadius && g_hands[nearHand].grip;
             const bool letGo = nearHand >= 0 && handDistance < g_settings.handRadius && g_hands[nearHand].previousGrip && !g_hands[nearHand].grip;
             if (wellOpen && loose.kind == g_state.kind && !toInsert) {
-                // in the gun's frame (+Z up): the magazine has to come up from below the well
+                // in the gun's frame, along the well's own slope: the magazine has to come up it from below
                 const auto rel = relative(root->world, mag3D->world).translate - g_state.wellLocal.translate;
-                const float side = std::sqrt(rel.x * rel.x + rel.y * rel.y);
-                const bool below = rel.z > -g_settings.ghostRadius && rel.z < 2.0f && side < g_settings.wellSide;
+                const float along = dot(rel, g_state.magAxis);   // how far out of the well, along its axis
+                const auto off = rel - g_state.magAxis * along;
+                const float side = std::sqrt(dot(off, off));
+                const bool below = along > -2.0f && along < g_settings.ghostRadius && side < g_settings.wellSide;
                 if (below && (inHand || letGo)) {
                     ghost = loose.kind;
                 }
-                if ((below && letGo) || (side < g_settings.wellSide * 0.6f && rel.z > -g_settings.snapRadius && rel.z < 2.0f && !inHand)) {
+                // in the mouth of the well it goes in by itself, even still in the hand (it cannot pass the gun's body)
+                if (along > g_settings.snapRadius + 3.0f || side > g_settings.wellSide * 1.5f) {
+                    loose.awayFromWell = true;
+                }
+                const bool mouth = loose.awayFromWell && side < g_settings.wellSide * 0.7f && along > -2.0f && along < g_settings.snapRadius;
+                if ((below && letGo && loose.awayFromWell) || mouth) {
                     toInsert = id;
-                    insertDepth = -rel.z;
+                    insertDepth = std::max(along, 0.0f);
                 }
             }
             if (!toInsert && player && letGo && nearHand == freeHand && inBelt(player, g_hands[freeHand].palm)) {
@@ -1308,13 +1347,24 @@ namespace
         const float scale = root->world.scale > 0.0f ? root->world.scale : 1.0f;
         const auto handLocal = relative(root->world, pointTransform(spare.palm)).translate;
         if (!g_state.racking && spare.valid && spare.grip && !spare.previousGrip && g_state.phase != kExtending) {
-            const float toSlide = distance(spare.palm, bolt->world.translate);
+            auto slideAt = bolt->world.translate;
+            if (g_state.slideCenterKnown) {
+                slideAt = compose(root->world, pointTransform(g_state.slideCenter)).translate +
+                          axisOf(root->world, 1) * (-g_state.rackPull * scale);
+            }
+            const float toSlide = distance(spare.palm, slideAt);
             const float toMag = looksLikeObject(magazine) ? distance(spare.palm, magazine->world.translate) : 1e9f;
             if (toSlide < g_settings.slideGrabRadius && toSlide <= toMag) {
                 g_state.racking = true;
                 g_state.rackGrabY = handLocal.y + g_state.rackPull;
+                if (g_state.slideLocked) {
+                    g_state.slideLocked = false;   // already back: let go and it runs home
+                    g_state.rackCycled = true;
+                }
                 buzz(1 - g_settings.gunHand, 500);
-                logInfo("Slide taken by the free hand");
+                char message[120]{};
+                std::snprintf(message, sizeof(message), "Slide taken by the free hand (%.1f from its middle)", toSlide);
+                logInfo(message);
             }
         }
         if (g_state.racking && !(spare.valid && spare.grip)) {
@@ -1322,10 +1372,12 @@ namespace
         }
         if (g_state.racking) {
             g_state.rackPull = std::clamp(g_state.rackGrabY - handLocal.y, 0.0f, g_settings.rackTravel);
+        } else if (g_state.slideLocked) {
+            g_state.rackPull = g_settings.rackTravel;   // held open after the last shot
         } else {
             g_state.rackPull = approach(g_state.rackPull, 0.0f, 80.0f * dt);
         }
-        if (!g_state.rackCycled && g_state.rackPull >= g_settings.rackTravel * 0.85f) {
+        if (!g_state.rackCycled && !g_state.slideLocked && g_state.rackPull >= g_settings.rackTravel * 0.85f) {
             g_state.rackCycled = true;
             if (g_state.chamber) {
                 g_state.chamber = false;   // the round flies out (back to the ammo you carry)
@@ -1351,6 +1403,73 @@ namespace
         }
         if (g_state.rackPull > 0.0f) {
             refreshSubtree(bolt, axisOf(root->world, 1) * (-g_state.rackPull * scale));
+        }
+    }
+
+    // The gun at rest tells which way its magazine well runs and where the middle of its slide is.
+    void learnGunShape(RE::NiAVObject* root, RE::NiAVObject* bolt) noexcept
+    {
+        auto* well = findNamed(root, "P-Mag");
+        if (!looksLikeObject(well)) {
+            return;
+        }
+        g_state.wellLocal = relative(root->world, well->world);
+        g_state.wellKnown = true;
+        const bool wasKnown = g_state.magAxisKnown && g_state.slideCenterKnown;
+        RE::NiPoint3 axis{ 0.0f, 0.0f, -1.0f };
+        bool axisFound = false;
+        const char* how = "straight down";
+        if (g_settings.magTilt >= 0.0f) {
+            const float t = g_settings.magTilt * 0.01745329f;
+            axis = { 0.0f, -std::sin(t), -std::cos(t) };
+            axisFound = true;
+            how = "fMagTilt";
+        } else {
+            const auto& bound = well->worldBound;
+            if (bound.fRadius > 1.0f && bound.fRadius < 100.0f) {
+                const auto toCenter = relative(root->world, pointTransform(bound.center)).translate - g_state.wellLocal.translate;
+                if (dot(toCenter, toCenter) > 1.0f) {
+                    const auto fromBound = normalized(toCenter);
+                    axis = fromBound;
+                    how = "the magazine's middle";
+                    // the magazine's own axes are cleaner, if one of them runs that way
+                    float best = 0.82f;
+                    for (int i = 0; i < 3; ++i) {
+                        for (const float sign : { 1.0f, -1.0f }) {
+                            const auto candidate = axisOf(g_state.wellLocal, i) * sign;
+                            const float d = dot(candidate, fromBound);
+                            if (d > best) {
+                                best = d;
+                                axis = normalized(candidate);
+                                how = "the magazine's own axis";
+                            }
+                        }
+                    }
+                    axisFound = axis.z < -0.5f;
+                    if (!axisFound) {
+                        axis = { 0.0f, 0.0f, -1.0f };
+                        how = "straight down (the model's answer pointed elsewhere)";
+                    }
+                }
+            }
+        }
+        if (axisFound || !g_state.magAxisKnown) {
+            g_state.magAxis = axis;
+            g_state.magAxisKnown = axisFound;
+        }
+        if (looksLikeObject(bolt)) {
+            const auto& bound = bolt->worldBound;
+            if (bound.fRadius > 1.0f && bound.fRadius < 100.0f) {
+                g_state.slideCenter = relative(root->world, pointTransform(bound.center)).translate;
+                g_state.slideCenterKnown = true;
+            }
+        }
+        if (!wasKnown && g_state.magAxisKnown && g_state.slideCenterKnown) {
+            char message[220]{};
+            std::snprintf(message, sizeof(message), "Gun shape: magazine leaves along (%.2f, %.2f, %.2f) from %s, slide middle at (%.1f, %.1f, %.1f)",
+                g_state.magAxis.x, g_state.magAxis.y, g_state.magAxis.z, how,
+                g_state.slideCenter.x, g_state.slideCenter.y, g_state.slideCenter.z);
+            logNote(message);
         }
     }
 
@@ -1400,6 +1519,13 @@ namespace
             g_state.equippedAt = now;
             g_state.wellKnown = false;
             g_state.idleKnown = false;
+            g_state.magAxisKnown = false;
+            g_state.magAxis = { 0.0f, 0.0f, -1.0f };
+            g_state.slideCenterKnown = false;
+            g_state.slideLocked = false;
+            g_state.racking = false;
+            g_state.rackPull = 0.0f;
+            g_state.rackCycled = false;
             g_state.lastAmmo = 0xFFFFFFFF;
             g_state.lastGunState = 0xFFFFFFFF;
             g_state.magIn = true;
@@ -1443,7 +1569,12 @@ namespace
         }
         auto* magazine = parts[0];
         const bool frozen = g_settings.blockReload && (gunState == reloading || now < g_state.freezeUntil || pressed);
-        if (!frozen && g_state.phase == kIn && gunState != 0) {
+        const auto ammoNow = gun.data->ammoCount;
+        const bool atRest = !frozen && g_state.phase == kIn && g_state.offset <= 0.0f &&
+                            gunState == static_cast<std::uint32_t>(g_settings.idleGunState) && ammoNow > 0 &&
+                            !g_state.racking && g_state.rackPull <= 0.0f && !g_state.slideLocked &&
+                            now - g_state.lastShot > std::chrono::milliseconds(600);
+        if (atRest) {
             bool all = true;
             for (std::size_t i = 0; i < parts.size(); ++i) {
                 if (looksLikeObject(parts[i])) {
@@ -1462,9 +1593,10 @@ namespace
                 }
             }
         }
-        if (g_state.phase == kIn && looksLikeObject(root)) {
-            auto* well = findNamed(root, "P-Mag");
-            if (looksLikeObject(well)) {
+        if (atRest && looksLikeObject(root)) {
+            learnGunShape(root, parts[1]);
+        } else if (!g_state.wellKnown && g_state.phase == kIn && looksLikeObject(root)) {
+            if (auto* well = findNamed(root, "P-Mag"); looksLikeObject(well)) {
                 g_state.wellLocal = relative(root->world, well->world);
                 g_state.wellKnown = true;
             }
@@ -1480,6 +1612,11 @@ namespace
                 ammo = g_state.lastAmmo;
                 gun.data->ammoCount = ammo;
             } else if (ammo < g_state.lastAmmo) {
+                g_state.lastShot = now;
+                if (ammo == 0 && g_state.lastAmmo == 1) {
+                    g_state.slideLocked = true;   // the last round: the slide stays open
+                    logInfo("Last round fired: slide locked open");
+                }
                 g_state.chamber = ammo > 0;
                 if (g_state.magIn) {
                     g_state.magRounds = ammo > 0 ? ammo - 1 : 0;
@@ -1545,12 +1682,19 @@ namespace
         } else {
             setCulled(magazine, false);
             if (g_state.offset > 0.0f && looksLikeObject(magazine) && looksLikeObject(root)) {
-                const auto down = axisOf(root->world, 2) * (-g_state.offset * root->world.scale);
+                const auto down = directionToWorld(root->world, g_state.magAxis) * (g_state.offset * root->world.scale);
                 refreshSubtree(magazine, down);
             }
         }
 
-        rackByHand(gun, root, parts[1], magazine, dt);
+        // the slide: the game shows it open on an empty gun, but here it is open only after the last shot
+        auto* bolt = parts[1];
+        if (g_state.idleKnown && looksLikeObject(bolt) &&
+            (gun.data->ammoCount == 0 || g_state.slideLocked || g_state.racking || g_state.rackPull > 0.0f)) {
+            bolt->local = g_state.idle[1];
+            refreshSubtree(bolt, RE::NiPoint3{});
+        }
+        rackByHand(gun, root, bolt, magazine, dt);
 
         if ((g_state.phase == kOut || g_state.phase == kIn) && !g_state.racking) {
             beltGrab(gun, player, inventory);
