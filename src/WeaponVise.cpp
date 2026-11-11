@@ -1370,7 +1370,7 @@ namespace
             for (int index = 0; index < 2; ++index) {
                 const auto& hand = g_hands_state[index];
                 const bool gripping = hand.grip || hand.previousGrip;
-                if (hand.valid && gripping && hand.mode == Hand::Mode::Idle && distance(hand.point, centerOf(root)) < g_settings.heldRadius) {
+                if (hand.valid && gripping && (hand.mode == Hand::Mode::Idle || hand.mode == Hand::Mode::Done) && distance(hand.point, centerOf(root)) < g_settings.heldRadius) {
                     holder = index;
                 }
             }
