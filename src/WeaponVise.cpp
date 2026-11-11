@@ -853,7 +853,7 @@ namespace
             setCulled(root, false);
             place3D(root, wish->second.world);
             if (auto* fade = root->IsFadeNode()) {
-                fade->GetRuntimeData().currentFade = wish->second.color == 2 ? g_settings.ghostFade : 1.0f;
+                fade->GetFadeNodeRuntimeData().currentFade = wish->second.color == 2 ? g_settings.ghostFade : 1.0f;
             }
         }
         g_ghostWish.clear();
