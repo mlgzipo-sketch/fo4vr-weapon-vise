@@ -85,7 +85,7 @@ namespace
         int rackPerRow{ 6 };
         float zoneLift{ 16.0f };        // the weapon hangs in a ball this high above the vise point...
         float zoneRadius{ 18.0f };      // ...of this radius
-        float previewRadius{ 12.0f };   // a carried part this close to its place shows the ghost
+        float previewRadius{ 15.0f };   // a carried part this close to its place shows the ghost
         float snapTime{ 0.15f };        // seconds of the snap-on animation
         float ghostFade{ 0.5f };        // how see-through the attach ghost is
         float heldRadius{ 15.0f };      // a part held by ROCK this close to its place previews
@@ -489,6 +489,7 @@ namespace
         Clock::time_point since{};
         RE::NiAVObject* hidden{ nullptr };   // real part node hidden under the red ghost
         RE::NiAVObject* holdNode{ nullptr };
+        RE::NiAVObject* carried3D{ nullptr };   // carried part taken out of physics
     };
     std::array<Hand, 2> g_hands_state{};
     RE::NiPoint3 g_clampPoint{};      // where the last clamp asked the weapon to go
@@ -902,9 +903,7 @@ namespace
             }
             setCulled(root, false);
             auto world = wish->second.world;
-            if (wish->second.color == 1) {
-                world.scale = 1.06f;   // around the real part, not inside it
-            }
+            world.scale = 1.0f;   // exactly the part's size (1.06 looked inflated)
             place3D(root, world);
             if (auto* fade = root->IsFadeNode()) {
                 fade->GetFadeNodeRuntimeData().currentFade = wish->second.color == 2 ? g_settings.ghostFade : 1.0f;
@@ -1067,7 +1066,7 @@ namespace
     }
 
     // A part close to its place shows where it goes; let go there, it snaps on.
-    bool previewAttach(const LoosePart& part, const RE::NiTransform& partWorld, RE::NiTransform& target) noexcept
+    bool previewAttach(const LoosePart& part, const RE::NiAVObject* root, const RE::NiTransform& partWorld, RE::NiTransform& target) noexcept
     {
         const auto* info = partInfo(part.mod);
         if (!info || !slotWorld(*info, target)) {
@@ -1076,7 +1075,14 @@ namespace
         if (std::find(g_mods.begin(), g_mods.end(), part.mod) != g_mods.end()) {
             return false;  // already on
         }
-        return distance(partWorld.translate, target.translate) < g_settings.previewRadius;
+        if (distance(partWorld.translate, target.translate) < g_settings.previewRadius) {
+            return true;
+        }
+        // held crooked: the part's middle near where its middle goes counts too
+        const auto localCenter = relative(root->world, pointTransform(centerOf(root))).translate;
+        const auto now = compose(partWorld, pointTransform(localCenter)).translate;
+        const auto there = compose(target, pointTransform(localCenter)).translate;
+        return distance(now, there) < g_settings.previewRadius;
     }
 
     // ------------------------------------------------------------ hands at the weapon
@@ -1246,10 +1252,15 @@ namespace
                     break;
                 }
                 auto& part = it->second;
+                if (hand.carried3D != root) {
+                    // no collision while carried: a keyframed part pushes the player away
+                    hand.carried3D = root;
+                    ref->DetachHavok(root);
+                }
                 const auto world = compose(hand.frame, hand.offset);
                 place3D(root, world);
                 RE::NiTransform target;
-                const bool closeBy = previewAttach(part, world, target);
+                const bool closeBy = previewAttach(part, root, world, target);
                 const auto* info = partInfo(part.mod);
                 RE::NiTransform slot;
                 if (info && slotWorld(*info, slot)) {
@@ -1263,6 +1274,7 @@ namespace
                     if (show) {
                         startSnap(hand.part, part, world, target);
                     } else {
+                        // the script rebuilds its physics where it was let go
                         PendingCommand command;
                         command.type = kDrop;
                         command.part = hand.part;
@@ -1304,7 +1316,7 @@ namespace
                 }
             }
             RE::NiTransform target;
-            if (holder < 0 || !previewAttach(part, root->world, target)) {
+            if (holder < 0 || !previewAttach(part, root, root->world, target)) {
                 part.previewing = false;
                 continue;
             }
@@ -1418,6 +1430,7 @@ namespace
                     hand.offset = relative(hand.frame, world);
                 }
                 hand.mode = Hand::Mode::Carry;
+                hand.carried3D = nullptr;
                 hand.part = id;
                 g_parts[id].carriedBy = index;
                 break;

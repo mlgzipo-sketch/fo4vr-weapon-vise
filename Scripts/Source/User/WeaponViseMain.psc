@@ -11,6 +11,7 @@ FormList Property WV_LooseMods Auto Const     ; the game's loose mod item of eac
 FormList Property WV_Ghosts Auto Const        ; outline model of each mod's part (same order)
 FormList Property WV_Sounds Auto Const        ; focus, focus red, snap, pick up
 Static Property ZoneFrame Auto Const            ; corner brackets above the vise
+Container Property WV_Stash Auto Const          ; hidden box: other copies of the pistol wait here while this one is equipped
 EffectShader Property OutlineAttach Auto Const
 EffectShader Property OutlineRemove Auto Const
 
@@ -458,6 +459,11 @@ Function DropPart(ObjectReference part)
 	if part && Parts.Find(part) >= 0
 		float[] pose = WeaponVise.CommandPose()
 		part.SetPosition(pose[0], pose[1], pose[2])
+		; it was carried without collision: rebuild it here as a normal object,
+		; or it hangs in the air and ROCK can not take it
+		part.Disable()
+		part.Enable()
+		WaitFor3D(part)
 		part.SetMotionType(1, true)   ; let go: it falls and ROCK can pick it up
 	endif
 EndFunction
@@ -564,10 +570,27 @@ Function Unclamp(bool equip)
 	WeaponVise.SetWeapon(None, new ObjectMod[0])
 	if ref
 		ref.SetMotionType(1, true)
-		player.AddItem(ref, 1, true)
 		if equip && ClampedBase
+			; EquipItem takes the first pistol of that kind in the backpack, not this one:
+			; other copies wait in a hidden box until this one is in the hands
+			ObjectReference stash = None
+			int others = player.GetItemCount(ClampedBase)
+			if others > 0 && WV_Stash
+				stash = player.PlaceAtMe(WV_Stash, 1, false, true, false)
+				if stash
+					player.RemoveItem(ClampedBase, others, true, stash)
+				endif
+			endif
+			player.AddItem(ref, 1, true)
 			player.EquipItem(ClampedBase, false, true)
+			if stash
+				Utility.Wait(0.2)
+				stash.RemoveAllItems(player, false)
+				stash.Delete()
+			endif
 			WeaponVise.Notify(6)
+		else
+			player.AddItem(ref, 1, true)
 		endif
 	endif
 	ClearGhosts()

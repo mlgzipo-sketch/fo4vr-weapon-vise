@@ -111,6 +111,11 @@ flst('WV_Ghosts', ghosts)
 flst('WV_Sounds', sounds)
 flst('WV_Weapons', sorted({r['weapon'] for r in rows}))
 
+# Hidden box: other copies of a pistol wait here while the one from the vise is equipped.
+# Added last so the ids of everything above stay the same.
+add('CONT', 'WV_Stash', [sub('OBND', b'\0' * 12), sub('COCT', struct.pack('<I', 0)),
+                         sub('DATA', struct.pack('<Bf', 0, 0.0))])
+
 def wstr(s): b = s.encode('latin1'); return struct.pack('<H', len(b)) + b
 def prop_obj(name, formid): return wstr(name) + bytes([1, 1]) + struct.pack('<HhI', 0, -1, formid)
 
@@ -119,7 +124,7 @@ props = {
     'WV_Mods': ids['WV_Mods'], 'WV_PartItems': ids['WV_PartItems'], 'WV_Weapons': ids['WV_Weapons'],
     'WV_LooseMods': ids['WV_LooseMods'],
     'WV_Ghosts': ids['WV_Ghosts'], 'WV_Sounds': ids['WV_Sounds'],
-    'ZoneFrame': ids['WV_ZoneFrame'],
+    'ZoneFrame': ids['WV_ZoneFrame'], 'WV_Stash': ids['WV_Stash'],
     'OutlineAttach': ids['WV_OutlineAttach'], 'OutlineRemove': ids['WV_OutlineRemove'],
 }
 vmad = struct.pack('<hhH', 6, 2, 1) + wstr('WeaponViseMain') + b'\0' + struct.pack('<H', len(props))
@@ -128,7 +133,7 @@ add('QUST', 'WV_Quest', [sub('VMAD', vmad), sub('FULL', zstr('Weapon Vise', 'lat
                          sub('DNAM', bytes.fromhex('110000000000000000000000')), sub('NEXT', b''),
                          sub('ANAM', struct.pack('<I', 0))])
 
-ORDER = ['SOUN', 'MISC', 'STAT', 'QUST', 'EFSH', 'FLST']
+ORDER = ['SOUN', 'MISC', 'STAT', 'CONT', 'QUST', 'EFSH', 'FLST']
 nrec = sum(len(recs[t]) for t in ORDER)
 tes4 = record('TES4', 0, [sub('HEDR', struct.pack('<fII', 1.0, nrec, next_id)), sub('CNAM', zstr('Aleshon')),
                           sub('SNAM', zstr('Weapon Vise: modify weapons by hand at a weapons workbench.', 'latin1')),
