@@ -59,6 +59,9 @@ namespace
     struct Settings
     {
         int gripButton{ 2 };            // OpenVR button id: 2 = grip
+        int triggerButton{ 33 };        // OpenVR button id: 33 = trigger
+        bool highlight{ true };         // glow the part a hand holds
+        bool haptics{ true };
         int weaponHand{ 0 };            // 0 = right, 1 = left
         int forwardAxis{ 1 };           // controller axis that points forward: 0 = X, 1 = Y, 2 = Z
         float viseRadius{ 20.0f };      // weapon hand this close to the vise may clamp
@@ -71,7 +74,7 @@ namespace
         float pullDistance{ 8.0f };     // hand moved this far pulls a part off
         float attachRadius{ 9.0f };     // part this close to its place snaps on
         float attachRadiusAny{ 6.0f };  // ...or this close to the weapon when its place is unknown
-        float weaponGrabRadius{ 14.0f };
+        float weaponGrabRadius{ 16.0f };
         float unclampHold{ 1.5f };
         float unclampStill{ 6.0f };     // hand must stay within this while holding
         float rackX{ 48.0f };           // loose parts are laid out on the bench top (workbench model space)
@@ -103,6 +106,9 @@ namespace
                 auto& s = g_settings;
                 if (key == "iGripButton") s.gripButton = static_cast<int>(value);
                 else if (key == "iWeaponHand") s.weaponHand = static_cast<int>(value);
+                else if (key == "iTriggerButton") s.triggerButton = static_cast<int>(value);
+                else if (key == "bHighlight") s.highlight = value != 0.0f;
+                else if (key == "bHaptics") s.haptics = value != 0.0f;
                 else if (key == "iForwardAxis") s.forwardAxis = std::clamp(static_cast<int>(value), 0, 2);
                 else if (key == "fViseRadius") s.viseRadius = value;
                 else if (key == "fViseX") s.viseX = value;
@@ -424,6 +430,9 @@ namespace
         RE::NiPoint3 point{};  // middle of the palm: what grabs
         bool grip{ false };
         bool previousGrip{ false };
+        bool trigger{ false };
+        bool previousTrigger{ false };
+        bool armed{ false };   // a pulled part has left its place: it may snap back on
         Clock::time_point gripSince{};
         bool clampSent{ false };
 
@@ -483,26 +492,44 @@ namespace
         logNote(message);
     }
 
-    bool gripHeld(int index) noexcept
+    vr::TrackedDeviceIndex_t controllerOf(int index) noexcept
     {
         if (!g_vr) {
-            return false;
+            return vr::k_unTrackedDeviceIndexInvalid;
         }
-        const auto device = g_vr->GetTrackedDeviceIndexForControllerRole(index == 0 ? vr::TrackedControllerRole_RightHand : vr::TrackedControllerRole_LeftHand);
+        return g_vr->GetTrackedDeviceIndexForControllerRole(index == 0 ? vr::TrackedControllerRole_RightHand : vr::TrackedControllerRole_LeftHand);
+    }
+
+    // Grip and trigger of one controller.
+    void readButtons(int index, bool& grip, bool& trigger) noexcept
+    {
+        grip = false;
+        trigger = false;
+        const auto device = controllerOf(index);
         if (device == vr::k_unTrackedDeviceIndexInvalid) {
-            return false;
+            return;
         }
         vr::VRControllerState_t state{};
         if (!g_vr->GetControllerState(device, &state, sizeof(state))) {
-            return false;
+            return;
         }
-        return (state.ulButtonPressed & vr::ButtonMaskFromId(static_cast<vr::EVRButtonId>(g_settings.gripButton))) != 0;
+        grip = (state.ulButtonPressed & vr::ButtonMaskFromId(static_cast<vr::EVRButtonId>(g_settings.gripButton))) != 0;
+        trigger = (state.ulButtonPressed & vr::ButtonMaskFromId(static_cast<vr::EVRButtonId>(g_settings.triggerButton))) != 0;
+    }
+
+    void buzz(int index, unsigned short microseconds) noexcept
+    {
+        const auto device = controllerOf(index);
+        if (g_settings.haptics && device != vr::k_unTrackedDeviceIndexInvalid) {
+            g_vr->TriggerHapticPulse(device, 0, microseconds);
+        }
     }
 
     bool readHand(int index) noexcept
     {
         auto& hand = g_hands_state[index];
         hand.previousGrip = hand.grip;
+        hand.previousTrigger = hand.trigger;
         hand.valid = false;
         const auto* frik = FRIKApiV2::inst;
         if (!frik || !frik->getTrackedHandTransform) {
@@ -529,7 +556,7 @@ namespace
             }
         }
         hand.valid = true;
-        hand.grip = gripHeld(index);
+        readButtons(index, hand.grip, hand.trigger);
         if (hand.grip && !hand.previousGrip) {
             hand.gripSince = Clock::now();
         }
@@ -710,6 +737,61 @@ namespace
         }
     }
 
+    // ------------------------------------------------------------ highlight
+    // The part a hand holds glows: its shaders get their own emissive colour for a while.
+
+    struct GlowEntry
+    {
+        RE::BSLightingShaderProperty* shader{ nullptr };
+        RE::NiColor* color{ nullptr };
+        float scale{ 0.0f };
+        bool ownEmit{ false };
+    };
+    std::array<std::vector<GlowEntry>, 2> g_glow;
+    RE::NiColor g_glowColor{ 0.35f, 0.75f, 1.0f };
+    RE::NiAVObject* g_glowWeapon3D{ nullptr };
+
+    void glowOff(int index) noexcept
+    {
+        for (auto& entry : g_glow[index]) {
+            if (!readable(entry.shader, sizeof(RE::BSLightingShaderProperty))) {
+                continue;
+            }
+            entry.shader->emitColor = entry.color;
+            entry.shader->emitColorScale = entry.scale;
+            if (!entry.ownEmit) {
+                entry.shader->flags.reset(RE::BSShaderProperty::EShaderPropertyFlag::kOwnEmit);
+            }
+        }
+        g_glow[index].clear();
+    }
+
+    void glowOn(int index, RE::NiAVObject* node) noexcept
+    {
+        glowOff(index);
+        if (!g_settings.highlight || !looksLikeObject(node)) {
+            return;
+        }
+        forEachNode(node, [index](RE::NiAVObject* object, int) {
+            auto* geometry = object->IsTriShape();
+            if (!geometry) {
+                return;
+            }
+            for (auto& property : geometry->GetRuntimeData().properties) {
+                auto* shader = RE::netimmerse_cast<RE::BSLightingShaderProperty*>(property.get());
+                if (!shader) {
+                    continue;
+                }
+                GlowEntry entry{ shader, shader->emitColor, shader->emitColorScale,
+                    shader->flags.all(RE::BSShaderProperty::EShaderPropertyFlag::kOwnEmit) };
+                g_glow[index].push_back(entry);
+                shader->emitColor = &g_glowColor;
+                shader->emitColorScale = 1.5f;
+                shader->flags.set(RE::BSShaderProperty::EShaderPropertyFlag::kOwnEmit);
+            }
+        });
+    }
+
     void startCarry(int index, std::uint32_t partId, const RE::NiTransform& partWorld) noexcept
     {
         auto& hand = g_hands_state[index];
@@ -785,8 +867,9 @@ namespace
                     logNote(text);
                 }
                 // Loose parts are physical objects: ROCK picks them up, not us.
+                // Grip on the weapon holds it; the part nearest the palm is the one a pull takes off.
+                const bool onWeapon = distance(hand.point, centerOf(weapon3D)) < g_settings.weaponGrabRadius;
                 float best = g_settings.grabRadius;
-                // 2) a part on the weapon
                 const Anchor* bestAnchor = nullptr;
                 for (const auto& anchor : g_anchors) {
                     const float d = distance(hand.point, anchor.center);
@@ -795,29 +878,45 @@ namespace
                         bestAnchor = &anchor;
                     }
                 }
-                if (bestAnchor) {
-                    hand.mode = Hand::Mode::Pull;
-                    hand.mod = bestAnchor->mod;
-                    hand.start = hand.point;
-                    hand.offset = relative(hand.frame, looksLikeObject(bestAnchor->node) ? bestAnchor->node->world : weapon3D->world);
+                if (!bestAnchor && !onWeapon) {
                     break;
                 }
-                // 3) the weapon itself, when no part is close (a near miss should not unclamp)
-                bool partClose = false;
-                for (const auto& anchor : g_anchors) {
-                    partClose = partClose || distance(hand.point, anchor.center) < g_settings.grabRadius * 1.6f;
-                }
-                if (!partClose && distance(hand.point, centerOf(weapon3D)) < g_settings.weaponGrabRadius) {
-                    hand.mode = Hand::Mode::Unclamp;
-                    hand.start = hand.point;
-                    hand.since = Clock::now();
+                hand.mode = Hand::Mode::Pull;
+                hand.start = hand.point;
+                hand.mod = bestAnchor ? bestAnchor->mod : 0;
+                hand.offset = relative(hand.frame, bestAnchor && looksLikeObject(bestAnchor->node) ? bestAnchor->node->world : weapon3D->world);
+                if (bestAnchor) {
+                    glowOn(index, bestAnchor->node);
+                    g_glowWeapon3D = weapon3D;
+                    if (const auto* info = partInfo(bestAnchor->mod)) {
+                        char text[160]{};
+                        std::snprintf(text, sizeof(text), "Держишь %s: потяни, чтобы снять. Курок: забрать оружие", slotName(info->slot));
+                        hud(text);
+                    }
+                    buzz(index, 1500);
+                } else {
+                    hud("Держишь оружие. Курок: забрать");
+                    buzz(index, 800);
                 }
                 break;
             }
         case Hand::Mode::Pull:
             if (!hand.grip) {
+                glowOff(index);
                 hand.mode = Hand::Mode::Idle;
-            } else if (distance(hand.point, hand.start) > g_settings.pullDistance) {
+            } else if (hand.trigger && !hand.previousTrigger) {
+                glowOff(index);
+                if (unclampAllowed()) {
+                    PendingCommand command;
+                    command.type = kUnclamp;
+                    pushCommand(command);
+                    buzz(index, 3000);
+                }
+                hand.mode = Hand::Mode::Done;
+            } else if (hand.mod && distance(hand.point, hand.start) > g_settings.pullDistance) {
+                glowOff(index);
+                buzz(index, 3000);
+                hand.armed = false;
                 PendingCommand command;
                 command.type = kRemove;
                 command.mod = hand.mod;
@@ -852,11 +951,17 @@ namespace
                 const RE::NiPoint3 here = centerOf(root);
                 bool snap = false;
                 if (info && targetFor(*info, weapon3D, target)) {
-                    snap = distance(here, target) < g_settings.attachRadius;
+                    const float d = distance(here, target);
+                    hand.armed = hand.armed || d > g_settings.attachRadius * 2.0f;
+                    snap = hand.armed && d < g_settings.attachRadius;
                 } else {
-                    snap = distance(here, centerOf(weapon3D)) < g_settings.attachRadiusAny + weapon3D->worldBound.fRadius * 0.5f;
+                    const float d = distance(here, centerOf(weapon3D));
+                    const float reach = g_settings.attachRadiusAny + weapon3D->worldBound.fRadius * 0.5f;
+                    hand.armed = hand.armed || d > reach * 2.0f;
+                    snap = hand.armed && d < reach;
                 }
                 if (snap) {
+                    buzz(index, 2500);
                     PendingCommand command;
                     command.type = kAttach;
                     command.mod = part.mod;
@@ -921,6 +1026,9 @@ namespace
                 }
                 g_mods = g_shared.mods;
                 g_weapon3D = nullptr;  // re-resolve
+                // the model may be rebuilt: never touch the shaders saved for the glow again
+                g_glow[0].clear();
+                g_glow[1].clear();
                 g_revisionTime = Clock::now();
                 g_shared.modelOutdated = false;
             }
@@ -1089,6 +1197,8 @@ namespace
             for (auto& hand : g_hands_state) {
                 hand.mode = Hand::Mode::Idle;
             }
+            g_glow[0].clear();
+            g_glow[1].clear();
             updateClampGesture();
             return;
         }
@@ -1099,6 +1209,8 @@ namespace
         }
         if (root != g_weapon3D) {
             g_weapon3D = root;
+            g_glow[0].clear();
+            g_glow[1].clear();
             if (g_settings.logTree && !g_treeLogged) {
                 g_treeLogged = true;
                 logTree(root);
