@@ -162,6 +162,8 @@ Event OnTimer(int aiTimerID)
 	endif
 EndEvent
 
+int Unloaded = 0
+
 Function Scan()
 	Actor player = Game.GetPlayer()
 	ObjectReference nearest = None
@@ -183,15 +185,29 @@ Function Scan()
 	if Clamped && !Busy
 		if Clamped.GetContainer() == player
 			; picked up the normal way (activated it)
+			WeaponVise.Notify(8)
 			Busy = true
 			Clamped = None
 			WeaponVise.SetWeapon(None, new ObjectMod[0])
+			ClearGhosts()
 			Busy = false
-		elseif !Clamped.Is3DLoaded() || player.GetDistance(Clamped) > 700.0
+		elseif player.GetDistance(Clamped) > 700.0
 			Busy = true
 			Unclamp(false)
 			WeaponVise.Notify(7)
 			Busy = false
+		elseif !Clamped.Is3DLoaded()
+			; the model can be away for a moment after a move: give it a few seconds
+			Unloaded += 1
+			WeaponVise.Notify(9)
+			if Unloaded >= 5
+				Busy = true
+				Unclamp(false)
+				WeaponVise.Notify(7)
+				Busy = false
+			endif
+		else
+			Unloaded = 0
 		endif
 	endif
 	if (Bench || Clamped) && !FastRunning
@@ -263,6 +279,7 @@ Function Clamp()
 	ref.SetAngle(0.0, 0.0, pose[3])
 	ref.SetPosition(pose[0], pose[1], pose[2])
 	ref.SetMotionType(2, true)
+	Unloaded = 0
 	Clamped = ref
 	ClampedBase = w
 	WeaponVise.SetWeapon(ref, ref.GetAllMods())

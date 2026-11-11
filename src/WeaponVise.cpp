@@ -472,6 +472,9 @@ namespace
         RE::NiAVObject* holdNode{ nullptr };
     };
     std::array<Hand, 2> g_hands_state{};
+    RE::NiPoint3 g_clampPoint{};      // where the last clamp asked the weapon to go
+    Clock::time_point g_clampAt{};
+    bool g_missing3DLogged{ false };
 
     struct LoosePart
     {
@@ -760,6 +763,8 @@ namespace
             command.type = kClamp;
             command.pose = poseOf(hand.point, headingOf(fingers(hand)));
             pushCommand(command);
+            g_clampPoint = hand.point;
+            g_clampAt = Clock::now();
             buzz(g_settings.weaponHand == 1 ? 1 : 0, 2000);
         }
     }
@@ -1377,12 +1382,27 @@ namespace
         auto* weaponRef = lookupRef(g_weapon);
         auto* root = weaponRef ? weaponRef->Get3D() : nullptr;
         if (!looksLikeObject(root)) {
+            if (!g_missing3DLogged) {
+                g_missing3DLogged = true;
+                logNote("Clamped weapon has no 3D yet");
+            }
             return;
         }
+        g_missing3DLogged = false;
         if (!g_weaponWorldSet) {
+            // wait until the script's SetPosition has reached the 3D, or the weapon would be pinned
+            // where it was dropped (in the hand) and look like it vanished
+            if (distance(root->world.translate, g_clampPoint) > 40.0f && seconds(g_clampAt) < 2.0f) {
+                return;
+            }
             g_weaponWorld = root->world;
             g_weaponWorld.scale = 1.0f;
             g_weaponWorldSet = true;
+            char message[160]{};
+            std::snprintf(message, sizeof(message), "Weapon pinned at (%.0f, %.0f, %.0f), %.0f from the clamp point",
+                g_weaponWorld.translate.x, g_weaponWorld.translate.y, g_weaponWorld.translate.z,
+                distance(g_weaponWorld.translate, g_clampPoint));
+            logNote(message);
         }
         // the weapon stays exactly where it was left (or follows the hand holding it)
         place3D(root, g_weaponWorld);
@@ -1597,12 +1617,13 @@ namespace
         case 1: hud("Сначала возьми оружие в руку"); break;
         case 2: hud("В тиски пока можно зажать только 10-мм пистолет"); break;
         case 3: hud("Не получилось положить оружие в тиски"); break;
-        case 4: hud("Оружие в тисках. Тяни детали грипом, подноси новые. Держи грип на оружии, чтобы забрать"); break;
+        case 4: hud("Оружие в тисках. Грип на детали и курок: снять. Поднеси деталь к месту и отпусти: поставить"); break;
         case 5: hud("Эта деталь сюда не подходит"); break;
         case 6: hud("Оружие снова в руке"); break;
         case 7: hud("Ты отошёл: оружие и детали вернулись в инвентарь"); break;
         default: break;
         }
+        logNote("Notify " + std::to_string(message));
     }
 
     bool registerNatives(RE::BSScript::IVirtualMachine* vm)
