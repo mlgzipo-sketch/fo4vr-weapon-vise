@@ -50,6 +50,39 @@ jobs:
         shell: pwsh
         run: cmake --build build --config Release
 
+      - name: Get Caprica (open-source Papyrus compiler)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v0.3.0 -R Orvid/Caprica -D caprica
+          Get-ChildItem caprica -Filter *.zip | ForEach-Object { Expand-Archive $_.FullName -DestinationPath caprica -Force }
+          Get-ChildItem caprica -Filter *.7z | ForEach-Object { 7z x $_.FullName -ocaprica -y | Out-Null }
+          $exe = Get-ChildItem caprica -Recurse -Filter Caprica.exe | Select-Object -First 1
+          if (-not $exe) { Get-ChildItem caprica -Recurse | Format-Table FullName; throw "Caprica.exe not found" }
+          "CAPRICA=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Compile scripts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package\Scripts | Out-Null
+          $out = (Resolve-Path package\Scripts).Path
+          New-Item -ItemType Directory -Force reloadstubs | Out-Null
+          Copy-Item stubs\*.psc reloadstubs\
+          Copy-Item reload\Scripts\Source\User\ManualReload.psc reloadstubs\
+          $stubs = (Resolve-Path reloadstubs).Path
+          Push-Location reload\Scripts\Source\User
+          foreach ($script in @("ManualReload.psc", "ManualReloadMain.psc")) {
+            & $env:CAPRICA --game fallout4 -i $stubs -o $out $script
+            if ($LASTEXITCODE -ne 0) { Pop-Location; throw "Caprica failed on $script" }
+          }
+          Pop-Location
+          foreach ($pex in @("ManualReload.pex", "ManualReloadMain.pex")) {
+            if (-not (Test-Path "package\Scripts\$pex")) { throw "no $pex produced" }
+          }
+          New-Item -ItemType Directory -Force package\Scripts\Source\User | Out-Null
+          Copy-Item reload\Scripts\Source\User\*.psc package\Scripts\Source\User
+
       - name: Package
         shell: pwsh
         run: |
@@ -57,6 +90,7 @@ jobs:
           New-Item -ItemType Directory -Force $plugins | Out-Null
           Copy-Item build\Release\ManualReload.dll $plugins
           Copy-Item reload\ManualReload.ini $plugins
+          python reload\tools\build_esp.py package\ManualReload.esp
           Compress-Archive -Path package\* -DestinationPath ManualReload.zip
 
       - name: Upload mod

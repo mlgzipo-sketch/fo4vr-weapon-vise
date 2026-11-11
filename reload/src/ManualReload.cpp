@@ -1,28 +1,43 @@
-// ManualReload: hand reloading for Fallout 4 VR (Into the Radius style).
+// ManualReload: hand reloading for Fallout 4 VR (Into the Radius style), 10mm pistol first.
 //
-// Build 0.0.1 is a probe. It answers the two questions the whole mod depends on:
-//   1. Can a plugin set the number of rounds loaded in the gun?
-//      (EquippedWeaponData::ammoCount of the player's equipped weapon)
-//   2. Can a plugin stop the game's own reload in VR?
-//      (Actor::ReloadWeapon, vtable slot 0xEF, patched on the player's vtable)
-// and it writes down the weapon's node tree (WeaponMagazine, WeaponBolt, ...).
+// What the probes (0.0.1, 0.0.2) proved:
+//   - the rounds in the gun are EquippedWeaponData::ammoCount and a plugin may set them;
+//   - VR refills the gun without calling the player's ReloadWeapon vfunc, so the game's
+//     reload is undone by putting the count back whenever it rises without us;
+//   - VR reports reloading as gunState 8 (the button press).
 //
-// Test in game: the reload button no longer refills the gun. Instead it toggles
-// "magazine out" (magazine hidden, only the chambered round left) and
-// "magazine in" (magazine shown, gun loaded from the inventory).
+// 0.1:
+//   - reload button with a magazine in and a round chambered (or an empty magazine): the
+//     magazine drops out of the gun as a real object that keeps its rounds;
+//   - grip with the free hand at the belt: a full magazine appears in the palm and ROCK
+//     catches it;
+//   - bring a magazine to the empty magazine well: a green ghost shows; let go and it
+//     snaps in;
+//   - reload button with a magazine in but nothing chambered: racks the slide (until the
+//     slide can be pulled by hand).
+//
+// The plugin watches hands and the gun; ManualReloadMain.psc does what needs the game's
+// records (spawning and deleting magazines, ghosts, sounds), polling PollCommand().
 #include "Runtime.h"
 
 #include <F4SE/F4SE.h>
 #include <RE/Fallout.h>
 
 #include "api/FRIKApiV2.h"
+#include "api/openvr.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fstream>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace
 {
@@ -36,11 +51,21 @@ namespace
 
     struct Settings
     {
-        bool blockReload{ true };
-        bool toggleMagazine{ true };
-        int  dumpDepth{ 12 };
-        // raw gunState the VR game reports while reloading (flat FO4 enum says 4, VR log shows 8)
-        int  reloadGunState{ 8 };
+        bool  blockReload{ true };
+        int   reloadGunState{ 8 };      // raw gunState of VR while reloading
+        int   dumpDepth{ 12 };
+        int   gunHand{ 0 };             // 0 = right hand holds the gun, 1 = left
+        int   gripButton{ 2 };          // OpenVR button id of the grip
+        bool  haptics{ true };
+        bool  messages{ true };
+        float beltLow{ 35.0f };         // belt zone: palm height above the feet, from..to (game units)
+        float beltHigh{ 95.0f };
+        float beltRadius{ 40.0f };      // ..and at most this far from the body sideways
+        float ghostRadius{ 14.0f };     // a magazine this close to the well shows the ghost
+        float snapRadius{ 4.0f };       // ..and this close goes in by itself
+        float handRadius{ 16.0f };      // a hand this close to a magazine is the one holding it
+        float looseLifetime{ 90.0f };   // seconds a dropped magazine stays before it is cleaned up
+        int   maxLoose{ 6 };
     };
     Settings g_settings;
 
@@ -59,21 +84,30 @@ namespace
                     key.pop_back();
                 }
                 const float value = std::strtof(line.c_str() + equals + 1, nullptr);
-                if (key == "bBlockReload") {
-                    g_settings.blockReload = value != 0.0f;
-                } else if (key == "bToggleMagazine") {
-                    g_settings.toggleMagazine = value != 0.0f;
-                } else if (key == "iReloadGunState") {
-                    g_settings.reloadGunState = static_cast<int>(value);
-                } else if (key == "iDumpDepth") {
-                    g_settings.dumpDepth = static_cast<int>(value);
-                }
+                auto& s = g_settings;
+                if (key == "bBlockReload") s.blockReload = value != 0.0f;
+                else if (key == "iReloadGunState") s.reloadGunState = static_cast<int>(value);
+                else if (key == "iDumpDepth") s.dumpDepth = static_cast<int>(value);
+                else if (key == "iGunHand") s.gunHand = value != 0.0f ? 1 : 0;
+                else if (key == "iGripButton") s.gripButton = static_cast<int>(value);
+                else if (key == "bHaptics") s.haptics = value != 0.0f;
+                else if (key == "bMessages") s.messages = value != 0.0f;
+                else if (key == "fBeltLow") s.beltLow = value;
+                else if (key == "fBeltHigh") s.beltHigh = value;
+                else if (key == "fBeltRadius") s.beltRadius = value;
+                else if (key == "fGhostRadius") s.ghostRadius = value;
+                else if (key == "fSnapRadius") s.snapRadius = value;
+                else if (key == "fHandRadius") s.handRadius = value;
+                else if (key == "fLooseLifetime") s.looseLifetime = value;
+                else if (key == "iMaxLoose") s.maxLoose = static_cast<int>(value);
             }
         } catch (...) {
         }
-        char message[160]{};
-        std::snprintf(message, sizeof(message), "Settings: bBlockReload=%d bToggleMagazine=%d iReloadGunState=%d iDumpDepth=%d",
-            g_settings.blockReload ? 1 : 0, g_settings.toggleMagazine ? 1 : 0, g_settings.reloadGunState, g_settings.dumpDepth);
+        char message[256]{};
+        std::snprintf(message, sizeof(message),
+            "Settings: bBlockReload=%d iReloadGunState=%d iGunHand=%d belt %.0f..%.0f r%.0f ghost %.0f snap %.0f",
+            g_settings.blockReload ? 1 : 0, g_settings.reloadGunState, g_settings.gunHand,
+            g_settings.beltLow, g_settings.beltHigh, g_settings.beltRadius, g_settings.ghostRadius, g_settings.snapRadius);
         logNote(message);
     }
 
@@ -279,123 +313,620 @@ namespace
         });
     }
 
+    // ------------------------------------------------------------ math
+
+    float distance(const RE::NiPoint3& a, const RE::NiPoint3& b) noexcept
+    {
+        const float dx = a.x - b.x;
+        const float dy = a.y - b.y;
+        const float dz = a.z - b.z;
+        return std::sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    // Transforms in the game's row convention: world = local * parent.
+    RE::NiTransform compose(const RE::NiTransform& parent, const RE::NiTransform& local) noexcept
+    {
+        RE::NiTransform world{};
+        world.rotate = local.rotate * parent.rotate;
+        world.translate = parent.translate + parent.rotate.Transpose() * local.translate * parent.scale;
+        world.scale = local.scale * parent.scale;
+        return world;
+    }
+
+    RE::NiTransform relative(const RE::NiTransform& parent, const RE::NiTransform& world) noexcept
+    {
+        const float scale = parent.scale > 0.0f ? parent.scale : 1.0f;
+        RE::NiTransform local{};
+        local.rotate = world.rotate * parent.rotate.Transpose();
+        local.translate = parent.rotate * (world.translate - parent.translate) * (1.0f / scale);
+        local.scale = world.scale / scale;
+        return local;
+    }
+
+    RE::NiTransform pointTransform(const RE::NiPoint3& point) noexcept
+    {
+        RE::NiTransform transform;
+        transform.translate = point;
+        return transform;
+    }
+
+    // A local axis in world space is a row of the rotation (world = R^T * v).
+    RE::NiPoint3 axisOf(const RE::NiTransform& t, int axis) noexcept
+    {
+        return { t.rotate.entry[axis][0], t.rotate.entry[axis][1], t.rotate.entry[axis][2] };
+    }
+
+    float headingOf(const RE::NiPoint3& direction) noexcept
+    {
+        return std::atan2(direction.x, direction.y) * 57.29578f;
+    }
+
+    // Places an object's 3D: root at `world`, children follow.
+    void place3D(RE::NiAVObject* root, const RE::NiTransform& world) noexcept
+    {
+        if (!looksLikeObject(root)) {
+            return;
+        }
+        const auto moveBound = [](RE::NiAVObject* object, const RE::NiTransform& before) {
+            auto& bound = object->worldBound;
+            if (bound.fRadius > 0.0f && bound.fRadius < 1000.0f) {
+                const auto local = relative(before, pointTransform(bound.center)).translate;
+                bound.center = compose(object->world, pointTransform(local)).translate;
+            }
+        };
+        auto* parent = root->parent;
+        if (looksLikeObject(parent)) {
+            root->local = relative(parent->world, world);
+        } else {
+            root->local = world;
+        }
+        const auto rootBefore = root->world;
+        root->world = world;
+        moveBound(root, rootBefore);
+        forEachNode(root, [&](RE::NiAVObject* object, int depth) {
+            if (depth == 0) {
+                return true;
+            }
+            auto* up = object->parent;
+            if (looksLikeObject(up)) {
+                const auto before = object->world;
+                object->world = compose(up->world, object->local);
+                moveBound(object, before);
+            }
+            return true;
+        });
+    }
+
+    // ------------------------------------------------------------ hands
+
+    vr::IVRSystem* g_vr{ nullptr };
+
+    struct Hand
+    {
+        bool           valid{ false };
+        RE::NiTransform frame{};
+        RE::NiPoint3   palm{};
+        bool           grip{ false };
+        bool           previousGrip{ false };
+    };
+    std::array<Hand, 2> g_hands;   // 0 right, 1 left
+
+    vr::TrackedDeviceIndex_t controllerOf(int index) noexcept
+    {
+        if (!g_vr) {
+            return vr::k_unTrackedDeviceIndexInvalid;
+        }
+        return g_vr->GetTrackedDeviceIndexForControllerRole(index == 0 ? vr::TrackedControllerRole_RightHand : vr::TrackedControllerRole_LeftHand);
+    }
+
+    void buzz(int index, unsigned short microseconds) noexcept
+    {
+        const auto device = controllerOf(index);
+        if (g_settings.haptics && device != vr::k_unTrackedDeviceIndexInvalid) {
+            g_vr->TriggerHapticPulse(device, 0, microseconds);
+        }
+    }
+
+    void readHand(int index) noexcept
+    {
+        auto& hand = g_hands[index];
+        hand.previousGrip = hand.grip;
+        hand.valid = false;
+        hand.grip = false;
+        const auto* frik = FRIKApiV2::inst;
+        if (!frik || !frik->getTrackedHandTransform) {
+            return;
+        }
+        const auto which = index == 0 ? FRIKApiV2::Hand::Right : FRIKApiV2::Hand::Left;
+        RE::NiTransform wand;
+        if (!frik->getTrackedHandTransform(which, FRIKApiV2::TrackedHandKind::Wand, &wand)) {
+            return;
+        }
+        hand.frame = wand;
+        hand.frame.scale = 1.0f;
+        hand.palm = wand.translate;
+        FRIKApiV2::ArmChainTransforms chain{};
+        chain.structSize = sizeof(chain);
+        if (frik->getArmChain && frik->getIndexFingerTipPosition && frik->getArmChain(which, &chain) && (chain.validMask & (1u << 6))) {
+            const auto tip = frik->getIndexFingerTipPosition(which);
+            const auto wrist = chain.hand.translate;
+            if (distance(tip, wrist) < 40.0f) {
+                hand.palm = (tip + wrist) * 0.5f;
+            }
+        }
+        hand.valid = true;
+        const auto device = controllerOf(index);
+        if (device != vr::k_unTrackedDeviceIndexInvalid) {
+            vr::VRControllerState_t state{};
+            if (g_vr->GetControllerState(device, &state, sizeof(state))) {
+                hand.grip = (state.ulButtonPressed & vr::ButtonMaskFromId(static_cast<vr::EVRButtonId>(g_settings.gripButton))) != 0;
+            }
+        }
+    }
+
+    void hud(const char* text) noexcept
+    {
+        if (g_settings.messages && text) {
+            RE::SendHUDMessage::ShowHUDMessage(text, nullptr, false, false);
+        }
+    }
+
+    RE::TESObjectREFR* lookupRef(std::uint32_t id) noexcept
+    {
+        if (!id) {
+            return nullptr;
+        }
+        auto* form = RE::TESForm::GetFormByID(id);
+        return form ? form->As<RE::TESObjectREFR>() : nullptr;
+    }
+
+    // ------------------------------------------------------------ talking to the script
+
+    enum Command : std::int32_t
+    {
+        kNone = 0,
+        kSpawn = 1,    // kind, pose, token: a magazine as a physical object
+        kDelete = 2,   // ref
+        kSound = 3,    // kind = sound index: 0 snap in, 1 drop out, 2 slide
+        kGhosts = 4,   // make the ghost models (once per save)
+    };
+
+    struct PendingCommand
+    {
+        std::int32_t type{ kNone };
+        std::int32_t kind{ 0 };
+        std::uint32_t ref{ 0 };
+        std::int32_t token{ 0 };
+        std::array<float, 4> pose{};
+    };
+
+    struct NewMag
+    {
+        std::uint32_t ref{ 0 };
+        std::int32_t  token{ 0 };
+    };
+
+    struct Shared
+    {
+        std::mutex lock;
+        std::deque<PendingCommand> commands;
+        PendingCommand current;
+        std::vector<NewMag> newMags;
+        std::vector<std::pair<std::uint32_t, std::int32_t>> newGhosts;   // ref, kind
+    } g_shared;
+
+    void pushCommand(const PendingCommand& command) noexcept
+    {
+        std::scoped_lock guard(g_shared.lock);
+        g_shared.commands.push_back(command);
+    }
+
     // ------------------------------------------------------------ state
+
+    constexpr std::uint32_t k10mmPistol = 0x00004822;   // Fallout4.esm
+    constexpr int kKinds = 2;                             // 0 standard magazine, 1 large
+
+    struct Loose
+    {
+        std::uint32_t     rounds{ 0 };
+        int               kind{ 0 };
+        Clock::time_point born{};
+        bool              fromBelt{ false };
+    };
+
+    struct Pending
+    {
+        std::uint32_t rounds{ 0 };
+        int           kind{ 0 };
+        bool          fromBelt{ false };
+    };
 
     struct State
     {
         RE::TESObjectWEAP* weapon{ nullptr };
+        bool               managed{ false };     // a gun this mod reloads
         std::uint32_t      lastAmmo{ 0xFFFFFFFF };
-        std::uint32_t      lastInventory{ 0xFFFFFFFF };
         std::uint32_t      lastGunState{ 0xFFFFFFFF };
-        bool               magazineOut{ false };
+        bool               magIn{ true };
+        bool               chamber{ false };
+        std::uint32_t      magRounds{ 0 };
+        int                kind{ 0 };
         bool               dumped{ false };
-        Clock::time_point  lastToggle{};
         Clock::time_point  equippedAt{};
+        Clock::time_point  lastBelt{};
+        RE::NiTransform    wellLocal{};          // P-Mag relative to the gun root
+        bool               wellKnown{ false };
+        bool               ghostsAsked{ false };
     };
     State g_state;
 
-    std::atomic<int> g_reloadCalls{ 0 };
-    std::atomic<int> g_reloadBlocked{ 0 };
-    std::atomic<bool> g_toggleRequested{ false };
+    std::unordered_map<std::uint32_t, Loose> g_loose;     // magazines lying around or in a hand
+    std::unordered_map<std::int32_t, Pending> g_pending;  // spawn token -> what it will be
+    std::int32_t g_nextToken{ 1 };
+    std::array<std::uint32_t, kKinds> g_ghostRef{};
+    std::array<RE::NiAVObject*, kKinds> g_ghostDetached{};
 
-    void toggleMagazine(RE::PlayerCharacter* player, const Gun& gun, const char* why) noexcept
+    std::uint32_t looseRounds() noexcept
     {
-        if (!g_settings.toggleMagazine || !gun.data) {
-            return;
+        std::uint32_t total = 0;
+        for (const auto& [ref, loose] : g_loose) {
+            total += loose.rounds;
         }
-        const auto now = Clock::now();
-        if (now - g_state.lastToggle < std::chrono::milliseconds(1500)) {
-            return;
+        for (const auto& [token, pending] : g_pending) {
+            total += pending.rounds;
         }
-        g_state.lastToggle = now;
-        auto* root = weaponRoot(player);
-        auto* magazine = findNamed(root, "WeaponMagazine");
-        const auto before = gun.data->ammoCount;
-        const auto inventory = inventoryCount(player, gun.data->ammo);
-        const auto capacity = capacityOf(gun);
-        if (!g_state.magazineOut) {
-            // magazine out: only the round in the chamber stays
-            gun.data->ammoCount = before > 0 ? 1u : 0u;
-            setCulled(magazine, true);
-            g_state.magazineOut = true;
-        } else {
-            const std::uint32_t chamber = before > 0 ? 1u : 0u;
-            std::uint32_t loaded = chamber + capacity;
-            if (loaded > inventory) {
-                loaded = inventory;
-            }
-            gun.data->ammoCount = loaded;
-            setCulled(magazine, false);
-            g_state.magazineOut = false;
-        }
-        char message[220]{};
-        std::snprintf(message, sizeof(message), "TOGGLE (%s): magazine %s, ammoCount %u -> %u (capacity %u, inventory %u), WeaponMagazine node %s",
-            why, g_state.magazineOut ? "OUT" : "IN", before, gun.data->ammoCount, capacity, inventory, magazine ? "found" : "NOT found");
+        return total;
+    }
+
+    void spawnMagazine(int kind, const RE::NiPoint3& at, float heading, std::uint32_t rounds, bool fromBelt) noexcept
+    {
+        const auto token = g_nextToken++;
+        g_pending[token] = Pending{ rounds, kind, fromBelt };
+        PendingCommand command;
+        command.type = kSpawn;
+        command.kind = kind;
+        command.token = token;
+        command.pose = { at.x, at.y, at.z, heading };
+        pushCommand(command);
+        char message[160]{};
+        std::snprintf(message, sizeof(message), "Spawn magazine kind %d with %u rounds (%s) at (%.0f, %.0f, %.0f)",
+            kind, rounds, fromBelt ? "belt" : "ejected", at.x, at.y, at.z);
         logNote(message);
     }
 
-    // ------------------------------------------------------------ reload hook
-
-    using ReloadWeapon_t = bool (*)(void*, void*, std::uintptr_t);
-    ReloadWeapon_t g_originalReload{ nullptr };
-
-    bool onReloadWeapon(void* actor, void* weaponInstance, std::uintptr_t equipIndex) noexcept
+    void deleteMagazine(std::uint32_t ref) noexcept
     {
-        auto* player = RE::PlayerCharacter::GetSingleton();
-        if (actor != player || !player) {
-            return g_originalReload(actor, weaponInstance, equipIndex);
+        PendingCommand command;
+        command.type = kDelete;
+        command.ref = ref;
+        pushCommand(command);
+        g_loose.erase(ref);
+    }
+
+    void playSound(int index) noexcept
+    {
+        PendingCommand command;
+        command.type = kSound;
+        command.kind = index;
+        pushCommand(command);
+    }
+
+    // ------------------------------------------------------------ the script's side
+
+    std::int32_t PollCommand(std::monostate)
+    {
+        std::scoped_lock guard(g_shared.lock);
+        if (g_shared.commands.empty()) {
+            g_shared.current = {};
+            return 0;
         }
-        ++g_reloadCalls;
-        // Sanity check that slot 0xEF really is ReloadWeapon: its first argument is
-        // a weapon instance whose object is the gun the player holds.
-        const auto gun = equippedGun(player);
-        bool matches = false;
-        if (weaponInstance && readable(weaponInstance, sizeof(RE::BGSObjectInstance))) {
-            matches = gun.weapon && static_cast<RE::BGSObjectInstance*>(weaponInstance)->object == gun.weapon;
+        g_shared.current = g_shared.commands.front();
+        g_shared.commands.pop_front();
+        return g_shared.current.type;
+    }
+
+    std::int32_t CommandKind(std::monostate)
+    {
+        std::scoped_lock guard(g_shared.lock);
+        return g_shared.current.kind;
+    }
+
+    std::int32_t CommandRefID(std::monostate)
+    {
+        std::scoped_lock guard(g_shared.lock);
+        return static_cast<std::int32_t>(g_shared.current.ref);
+    }
+
+    std::int32_t CommandToken(std::monostate)
+    {
+        std::scoped_lock guard(g_shared.lock);
+        return g_shared.current.token;
+    }
+
+    std::vector<float> CommandPose(std::monostate)
+    {
+        std::scoped_lock guard(g_shared.lock);
+        return { g_shared.current.pose.begin(), g_shared.current.pose.end() };
+    }
+
+    void AddMag(std::monostate, RE::TESObjectREFR* ref, std::int32_t token)
+    {
+        if (!ref) {
+            return;
         }
-        char message[200]{};
-        std::snprintf(message, sizeof(message), "ReloadWeapon called on the player: weapon %s, ammoCount %u, %s",
-            matches ? "matches the held gun" : "DOES NOT match (wrong slot?)",
-            gun.data ? gun.data->ammoCount : 0u,
-            (matches && g_settings.blockReload) ? "BLOCKED" : "passed to the game");
-        logNote(message);
-        if (matches && g_settings.blockReload) {
-            ++g_reloadBlocked;
-            g_toggleRequested = true;
+        std::scoped_lock guard(g_shared.lock);
+        g_shared.newMags.push_back(NewMag{ ref->GetFormID(), token });
+    }
+
+    void AddGhost(std::monostate, RE::TESObjectREFR* ref, std::int32_t kind)
+    {
+        if (!ref || kind < 0 || kind >= kKinds) {
+            return;
+        }
+        std::scoped_lock guard(g_shared.lock);
+        g_shared.newGhosts.emplace_back(ref->GetFormID(), kind);
+    }
+
+    void Notify(std::monostate, std::int32_t message)
+    {
+        char text[96]{};
+        std::snprintf(text, sizeof(text), "Script: %d", message);
+        logNote(text);
+    }
+
+    bool registerNatives(RE::BSScript::IVirtualMachine* vm)
+    {
+        if (!vm) {
             return false;
         }
-        return g_originalReload(actor, weaponInstance, equipIndex);
-    }
-
-    void installReloadHook(RE::PlayerCharacter* player) noexcept
-    {
-        static bool done = false;
-        if (done || !player) {
-            return;
-        }
-        done = true;
-        constexpr std::size_t slot = 0xEF;
-        auto* vtable = *reinterpret_cast<std::uintptr_t**>(player);
-        auto* entry = vtable + slot;
-        if (!readable(entry, sizeof(std::uintptr_t))) {
-            logWarning("Player vtable not readable; reload hook not installed");
-            return;
-        }
-        std::uint32_t oldProtect = 0;
-        if (!REX::W32::VirtualProtect(entry, sizeof(std::uintptr_t), 0x40u /* PAGE_EXECUTE_READWRITE */, &oldProtect)) {
-            logWarning("VirtualProtect failed; reload hook not installed");
-            return;
-        }
-        g_originalReload = reinterpret_cast<ReloadWeapon_t>(*entry);
-        *entry = reinterpret_cast<std::uintptr_t>(&onReloadWeapon);
-        REX::W32::VirtualProtect(entry, sizeof(std::uintptr_t), oldProtect, &oldProtect);
-        char message[160]{};
-        std::snprintf(message, sizeof(message), "Reload hook installed on player vtable slot 0x%zX (original at exe+0x%llX)", slot,
-            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(g_originalReload) - REL::Module::get().base()));
-        logNote(message);
+        constexpr auto kScript = "ManualReload";
+        vm->BindNativeMethod(kScript, "PollCommand", PollCommand, true);
+        vm->BindNativeMethod(kScript, "CommandKind", CommandKind, true);
+        vm->BindNativeMethod(kScript, "CommandRefID", CommandRefID, true);
+        vm->BindNativeMethod(kScript, "CommandToken", CommandToken, true);
+        vm->BindNativeMethod(kScript, "CommandPose", CommandPose, true);
+        vm->BindNativeMethod(kScript, "AddMag", AddMag, true);
+        vm->BindNativeMethod(kScript, "AddGhost", AddGhost, true);
+        vm->BindNativeMethod(kScript, "Notify", Notify, true);
+        logNote("Papyrus functions of script ManualReload registered");
+        return true;
     }
 
     // ------------------------------------------------------------ frame
+
+    void takeScriptNews() noexcept
+    {
+        std::vector<NewMag> mags;
+        std::vector<std::pair<std::uint32_t, std::int32_t>> ghosts;
+        {
+            std::scoped_lock guard(g_shared.lock);
+            mags.swap(g_shared.newMags);
+            ghosts.swap(g_shared.newGhosts);
+        }
+        for (const auto& mag : mags) {
+            const auto it = g_pending.find(mag.token);
+            Loose loose;
+            loose.born = Clock::now();
+            if (it != g_pending.end()) {
+                loose.rounds = it->second.rounds;
+                loose.kind = it->second.kind;
+                loose.fromBelt = it->second.fromBelt;
+                g_pending.erase(it);
+            }
+            g_loose[mag.ref] = loose;
+            char message[120]{};
+            std::snprintf(message, sizeof(message), "Magazine %08X is out: %u rounds", mag.ref, loose.rounds);
+            logNote(message);
+        }
+        for (const auto& [ref, kind] : ghosts) {
+            g_ghostRef[kind] = ref;
+            g_ghostDetached[kind] = nullptr;
+            char message[96]{};
+            std::snprintf(message, sizeof(message), "Ghost %d is %08X", kind, ref);
+            logNote(message);
+        }
+    }
+
+    void showGhost(int wanted, const RE::NiTransform& world) noexcept
+    {
+        for (int kind = 0; kind < kKinds; ++kind) {
+            auto* ref = lookupRef(g_ghostRef[kind]);
+            auto* root = ref ? ref->Get3D() : nullptr;
+            if (!looksLikeObject(root)) {
+                continue;
+            }
+            if (g_ghostDetached[kind] != root) {
+                g_ghostDetached[kind] = root;
+                ref->DetachHavok(root);
+            }
+            if (kind != wanted) {
+                setCulled(root, true);
+                continue;
+            }
+            setCulled(root, false);
+            auto at = world;
+            at.scale = 1.0f;
+            place3D(root, at);
+        }
+    }
+
+    void setAmmo(const Gun& gun, std::uint32_t value) noexcept
+    {
+        gun.data->ammoCount = value;
+        g_state.lastAmmo = value;
+    }
+
+    void ejectMagazine(const Gun& gun, RE::NiAVObject* root) noexcept
+    {
+        g_state.magIn = false;
+        const auto rounds = g_state.magRounds;
+        g_state.magRounds = 0;
+        setAmmo(gun, g_state.chamber ? 1u : 0u);
+        if (g_state.wellKnown && looksLikeObject(root)) {
+            const auto well = compose(root->world, g_state.wellLocal);
+            spawnMagazine(g_state.kind, well.translate, headingOf(axisOf(root->world, 1)), rounds, false);
+        }
+        playSound(1);
+        buzz(g_settings.gunHand, 1500);
+        char message[120]{};
+        std::snprintf(message, sizeof(message), "EJECT: magazine with %u rounds out, chamber %s", rounds, g_state.chamber ? "loaded" : "empty");
+        logNote(message);
+    }
+
+    void insertMagazine(const Gun& gun, std::uint32_t ref, const Loose& loose) noexcept
+    {
+        g_state.magIn = true;
+        g_state.magRounds = loose.rounds;
+        setAmmo(gun, (g_state.chamber ? 1u : 0u) + g_state.magRounds);
+        deleteMagazine(ref);
+        playSound(0);
+        buzz(0, 2500);
+        buzz(1, 2500);
+        char message[120]{};
+        std::snprintf(message, sizeof(message), "INSERT: magazine %08X with %u rounds, ammoCount now %u", ref, g_state.magRounds, gun.data->ammoCount);
+        logNote(message);
+        if (!g_state.chamber) {
+            hud(g_state.magRounds > 0 ? "Магазин вставлен. Патронник пуст: нажми перезарядку, чтобы передёрнуть затвор" : "Магазин пустой");
+        }
+    }
+
+    void rackSlide(const Gun& gun) noexcept
+    {
+        if (g_state.magIn && g_state.magRounds > 0) {
+            g_state.magRounds -= 1;
+            g_state.chamber = true;
+        }
+        setAmmo(gun, (g_state.chamber ? 1u : 0u) + (g_state.magIn ? g_state.magRounds : 0u));
+        playSound(2);
+        buzz(1 - g_settings.gunHand, 1200);
+        char message[120]{};
+        std::snprintf(message, sizeof(message), "RACK: chamber %s, magazine %u", g_state.chamber ? "loaded" : "empty", g_state.magRounds);
+        logNote(message);
+    }
+
+    void looseMagazines(const Gun* gun, RE::NiAVObject* root, std::uint32_t inventory) noexcept
+    {
+        const auto now = Clock::now();
+        const bool wellOpen = gun && !g_state.magIn && g_state.wellKnown && looksLikeObject(root);
+        RE::NiTransform well{};
+        if (wellOpen) {
+            well = compose(root->world, g_state.wellLocal);
+        }
+        int ghost = -1;
+        std::uint32_t toInsert = 0;
+        std::vector<std::uint32_t> gone;
+        // oldest first beyond the limit
+        std::uint32_t oldest = 0;
+        auto oldestBorn = now;
+        for (auto& [id, loose] : g_loose) {
+            auto* ref = lookupRef(id);
+            auto* mag3D = ref ? ref->Get3D() : nullptr;
+            if (!ref || ref->IsDeleted()) {
+                gone.push_back(id);
+                continue;
+            }
+            if (!looksLikeObject(mag3D)) {
+                continue;
+            }
+            const auto at = mag3D->world.translate;
+            float handDistance = 1e9f;
+            int nearHand = -1;
+            for (int i = 0; i < 2; ++i) {
+                if (g_hands[i].valid) {
+                    const float d = distance(at, g_hands[i].palm);
+                    if (d < handDistance) {
+                        handDistance = d;
+                        nearHand = i;
+                    }
+                }
+            }
+            const bool inHand = nearHand >= 0 && handDistance < g_settings.handRadius && g_hands[nearHand].grip;
+            const bool letGo = nearHand >= 0 && handDistance < g_settings.handRadius && g_hands[nearHand].previousGrip && !g_hands[nearHand].grip;
+            if (wellOpen && loose.kind == g_state.kind && !toInsert) {
+                const float d = distance(at, well.translate);
+                if (d < g_settings.ghostRadius && (inHand || letGo)) {
+                    ghost = loose.kind;
+                }
+                if ((d < g_settings.ghostRadius && letGo) || (d < g_settings.snapRadius && !inHand)) {
+                    toInsert = id;
+                }
+            }
+            const float age = std::chrono::duration<float>(now - loose.born).count();
+            const bool nearPlayer = handDistance < 60.0f;
+            if (age > g_settings.looseLifetime && !nearPlayer) {
+                gone.push_back(id);
+                PendingCommand command;
+                command.type = kDelete;
+                command.ref = id;
+                pushCommand(command);
+                continue;
+            }
+            if (!nearPlayer && loose.born < oldestBorn) {
+                oldestBorn = loose.born;
+                oldest = id;
+            }
+        }
+        for (const auto id : gone) {
+            g_loose.erase(id);
+        }
+        if (oldest && static_cast<int>(g_loose.size()) > g_settings.maxLoose) {
+            deleteMagazine(oldest);
+        }
+        if (toInsert && gun) {
+            const auto loose = g_loose[toInsert];
+            insertMagazine(*gun, toInsert, loose);
+            ghost = -1;
+        }
+        showGhost(ghost, well);
+        (void)inventory;
+    }
+
+    void beltGrab(const Gun& gun, RE::PlayerCharacter* player, std::uint32_t inventory) noexcept
+    {
+        const int index = 1 - g_settings.gunHand;
+        const auto& hand = g_hands[index];
+        if (!hand.valid || !hand.grip || hand.previousGrip) {
+            return;
+        }
+        const auto feet = player->GetPosition();
+        const float height = hand.palm.z - feet.z;
+        const float dx = hand.palm.x - feet.x;
+        const float dy = hand.palm.y - feet.y;
+        const float side = std::sqrt(dx * dx + dy * dy);
+        char message[160]{};
+        std::snprintf(message, sizeof(message), "Grip of the free hand: %.0f above the feet, %.0f to the side", height, side);
+        logInfo(message);
+        if (height < g_settings.beltLow || height > g_settings.beltHigh || side > g_settings.beltRadius) {
+            return;
+        }
+        // a hand already on a magazine takes that one, not a new one
+        for (const auto& [id, loose] : g_loose) {
+            auto* ref = lookupRef(id);
+            auto* mag3D = ref ? ref->Get3D() : nullptr;
+            if (looksLikeObject(mag3D) && distance(mag3D->world.translate, hand.palm) < g_settings.handRadius) {
+                return;
+            }
+        }
+        const auto now = Clock::now();
+        if (now - g_state.lastBelt < std::chrono::milliseconds(800)) {
+            return;
+        }
+        g_state.lastBelt = now;
+        const auto used = gun.data->ammoCount + looseRounds();
+        const auto available = inventory > used ? inventory - used : 0u;
+        if (available == 0) {
+            hud("Патронов для магазина нет");
+            buzz(index, 400);
+            return;
+        }
+        auto capacity = capacityOf(gun);
+        if (capacity == 0) {
+            capacity = 12;
+        }
+        const auto rounds = available < capacity ? available : capacity;
+        spawnMagazine(g_state.kind, hand.palm, headingOf(axisOf(hand.frame, 0)), rounds, true);
+        buzz(index, 900);
+    }
 
     void update() noexcept
     {
@@ -403,73 +934,122 @@ namespace
         if (!player || !player->Get3D()) {
             return;
         }
-        installReloadHook(player);
-        const auto gun = equippedGun(player);
-        const auto now = Clock::now();
+        takeScriptNews();
+        readHand(0);
+        readHand(1);
 
-        if (gun.weapon != g_state.weapon) {
-            g_state.weapon = gun.weapon;
-            g_state.dumped = false;
-            g_state.magazineOut = false;
-            g_state.equippedAt = now;
-            g_state.lastAmmo = 0xFFFFFFFF;
-            char message[200]{};
-            std::snprintf(message, sizeof(message), "Equipped weapon %08X, ammo %08X, capacity %u",
-                gun.weapon ? gun.weapon->GetFormID() : 0u,
-                (gun.data && gun.data->ammo) ? gun.data->ammo->GetFormID() : 0u,
-                capacityOf(gun));
-            logNote(message);
-        }
-        if (!gun.weapon || !gun.data) {
-            return;
-        }
-
-        // the 3D appears a moment after equipping
-        if (!g_state.dumped && now - g_state.equippedAt > std::chrono::seconds(2)) {
-            g_state.dumped = true;
-            if (auto* root = weaponRoot(player)) {
-                logNote("Weapon node tree:");
-                dumpTree(root);
-            } else {
-                logNote("No WeaponMagazine node found on the player (first or third person)");
+        // ghosts: made once, then kept near the player (a far reference does not draw)
+        {
+            static Clock::time_point lastCheck{};
+            const auto checkNow = Clock::now();
+            bool ask = !g_state.ghostsAsked;
+            if (!ask && checkNow - lastCheck > std::chrono::seconds(5)) {
+                lastCheck = checkNow;
+                const auto feet = player->GetPosition();
+                for (int kind = 0; kind < kKinds; ++kind) {
+                    auto* ref = lookupRef(g_ghostRef[kind]);
+                    if (!ref || !looksLikeObject(ref->Get3D()) || distance(ref->GetPosition(), feet) > 300.0f) {
+                        ask = true;
+                    }
+                }
+            }
+            if (ask) {
+                g_state.ghostsAsked = true;
+                lastCheck = checkNow;
+                PendingCommand command;
+                command.type = kGhosts;
+                pushCommand(command);
             }
         }
 
+        const auto gun = equippedGun(player);
+        const auto now = Clock::now();
+        if (gun.weapon != g_state.weapon) {
+            g_state.weapon = gun.weapon;
+            g_state.managed = gun.weapon && gun.data && gun.weapon->GetFormID() == k10mmPistol;
+            g_state.dumped = false;
+            g_state.equippedAt = now;
+            g_state.wellKnown = false;
+            g_state.lastAmmo = 0xFFFFFFFF;
+            g_state.lastGunState = 0xFFFFFFFF;
+            g_state.magIn = true;
+            const auto total = gun.data ? gun.data->ammoCount : 0u;
+            g_state.chamber = total > 0;
+            g_state.magRounds = total > 0 ? total - 1 : 0;
+            g_state.kind = capacityOf(gun) > 12 ? 1 : 0;
+            char message[200]{};
+            std::snprintf(message, sizeof(message), "Equipped weapon %08X, capacity %u, rounds %u: %s",
+                gun.weapon ? gun.weapon->GetFormID() : 0u, capacityOf(gun), total,
+                g_state.managed ? "reloaded by hand" : "not handled (only the 10mm pistol for now)");
+            logNote(message);
+        }
+
+        auto* root = g_state.managed ? weaponRoot(player) : nullptr;
+        const auto inventory = (gun.data && gun.data->ammo) ? inventoryCount(player, gun.data->ammo) : 0u;
+        if (!g_state.managed) {
+            looseMagazines(nullptr, nullptr, 0);
+            return;
+        }
+
+        if (!g_state.dumped && now - g_state.equippedAt > std::chrono::seconds(2) && root) {
+            g_state.dumped = true;
+            logNote("Weapon node tree:");
+            dumpTree(root);
+        }
+
+        auto* magazine = findNamed(root, "WeaponMagazine");
+        if (g_state.magIn) {
+            setCulled(magazine, false);
+            auto* well = findNamed(root, "P-Mag");
+            if (looksLikeObject(well) && looksLikeObject(root)) {
+                g_state.wellLocal = relative(root->world, well->world);
+                g_state.wellKnown = true;
+            }
+        } else {
+            setCulled(magazine, true);
+        }
+
+        // the rounds: shots take them, the game's own refills are undone
         auto ammo = gun.data->ammoCount;
-        const auto inventory = inventoryCount(player, gun.data->ammo);
+        if (g_state.lastAmmo != 0xFFFFFFFF) {
+            if (ammo > g_state.lastAmmo && g_settings.blockReload) {
+                char message[120]{};
+                std::snprintf(message, sizeof(message), "Game refill %u -> %u reverted", g_state.lastAmmo, ammo);
+                logNote(message);
+                ammo = g_state.lastAmmo;
+                gun.data->ammoCount = ammo;
+            } else if (ammo < g_state.lastAmmo) {
+                g_state.chamber = ammo > 0;
+                if (g_state.magIn) {
+                    g_state.magRounds = ammo > 0 ? ammo - 1 : 0;
+                }
+                char message[120]{};
+                std::snprintf(message, sizeof(message), "Shot: %u left (chamber %d, magazine %u)", ammo, g_state.chamber ? 1 : 0, g_state.magRounds);
+                logInfo(message);
+            }
+        }
+        g_state.lastAmmo = ammo;
+
+        // the reload button
         const auto gunState = static_cast<std::uint32_t>(player->gunState);
         const auto reloading = static_cast<std::uint32_t>(g_settings.reloadGunState);
-        if (ammo != g_state.lastAmmo || inventory != g_state.lastInventory || gunState != g_state.lastGunState) {
-            char message[160]{};
-            std::snprintf(message, sizeof(message), "ammoCount %u, ammo in inventory %u, gunState %u%s",
-                ammo, inventory, gunState, gunState == reloading ? " (reloading)" : "");
-            logInfo(message);
-        }
-        // VR refills the gun without going through the player's ReloadWeapon vfunc,
-        // so any rise of the count that we did not make is the game's reload: undo it.
-        if (g_settings.blockReload && g_state.lastAmmo != 0xFFFFFFFF && ammo > g_state.lastAmmo) {
-            char message[120]{};
-            std::snprintf(message, sizeof(message), "Game refill %u -> %u reverted", g_state.lastAmmo, ammo);
-            logNote(message);
-            gun.data->ammoCount = g_state.lastAmmo;
-            ammo = g_state.lastAmmo;
-        }
-        const bool reloadStarted = gunState == reloading && g_state.lastGunState != reloading && g_state.lastGunState != 0xFFFFFFFF;
-        g_state.lastInventory = inventory;
+        const bool pressed = gunState == reloading && g_state.lastGunState != reloading && g_state.lastGunState != 0xFFFFFFFF;
         g_state.lastGunState = gunState;
+        if (pressed && g_settings.blockReload) {
+            if (g_state.magIn) {
+                if (!g_state.chamber && g_state.magRounds > 0) {
+                    rackSlide(gun);
+                } else {
+                    ejectMagazine(gun, root);
+                    setCulled(magazine, true);
+                }
+            } else {
+                hud("Магазина нет: возьми новый с пояса (грип свободной рукой у пояса)");
+            }
+        }
 
-        if (reloadStarted && g_settings.blockReload) {
-            logNote("Reload animation started (gunState = reloading)");
-            toggleMagazine(player, gun, "reload button");
-        }
-        if (g_toggleRequested.exchange(false)) {
-            toggleMagazine(player, gun, "ReloadWeapon");
-        }
-        g_state.lastAmmo = gun.data->ammoCount;
-        if (g_state.magazineOut) {
-            // the game may redraw the gun; keep the magazine hidden
-            setCulled(findNamed(weaponRoot(player), "WeaponMagazine"), true);
-        }
+        beltGrab(gun, player, inventory);
+        looseMagazines(&gun, root, inventory);
     }
 
     void FRIK_CALL onFrikFrame(std::uint32_t, void*) noexcept
@@ -503,6 +1083,20 @@ namespace
                 logNote(message);
             }
         }
+        if (!g_vr) {
+            using GetInterface_t = void* (*)(const char*, vr::EVRInitError*);
+            const auto module = REX::W32::GetModuleHandleW(L"openvr_api.dll");
+            const auto get = module ? reinterpret_cast<GetInterface_t>(REX::W32::GetProcAddress(module, "VR_GetGenericInterface")) : nullptr;
+            vr::EVRInitError error = vr::VRInitError_None;
+            g_vr = get ? static_cast<vr::IVRSystem*>(get(vr::IVRSystem_Version, &error)) : nullptr;
+            logNote(g_vr ? "OpenVR ready" : "OpenVR not found: buttons cannot be read");
+        }
+        // a loaded save: magazines and ghosts of the last session are gone or unknown
+        g_loose.clear();
+        g_pending.clear();
+        g_ghostRef = {};
+        g_ghostDetached = {};
+        g_state = State{};
         logNote("ManualReload ready (build " MANUALRELOAD_BUILD ")");
     }
 }
@@ -522,5 +1116,9 @@ namespace manualreload::runtime
     void onLoad() noexcept
     {
         loadSettings();
+        const auto* papyrus = F4SE::GetPapyrusInterface();
+        if (!papyrus || !papyrus->Register(registerNatives)) {
+            logWarning("Could not register Papyrus functions; magazines cannot be spawned");
+        }
     }
 }
