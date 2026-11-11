@@ -378,7 +378,7 @@ namespace
             return;
         }
         std::uint32_t oldProtect = 0;
-        if (!REX::W32::VirtualProtect(entry, sizeof(std::uintptr_t), REX::W32::PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        if (!REX::W32::VirtualProtect(entry, sizeof(std::uintptr_t), 0x40u /* PAGE_EXECUTE_READWRITE */, &oldProtect)) {
             logWarning("VirtualProtect failed; reload hook not installed");
             return;
         }
