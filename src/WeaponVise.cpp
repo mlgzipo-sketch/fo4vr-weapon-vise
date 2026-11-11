@@ -756,7 +756,14 @@ namespace
     {
         auto* player = RE::PlayerCharacter::GetSingleton();
         auto& hand = g_hands_state[g_settings.weaponHand == 1 ? 1 : 0];
-        if (!player || !hand.valid || !player->GetWeaponMagicDrawn() || !inViseArea(hand.point)) {
+        if (!player || !hand.valid || !inViseArea(hand.point)) {
+            return;
+        }
+        // ROCK drops the weapon on the same release, so "drawn" may already be gone on that frame
+        static Clock::time_point drawnAt{};
+        if (player->GetWeaponMagicDrawn()) {
+            drawnAt = Clock::now();
+        } else if (seconds(drawnAt) > 0.5f) {
             return;
         }
         if (seconds(g_lastHint) > 20.0f) {
@@ -1650,6 +1657,7 @@ namespace
         case 5: hud("Эта деталь сюда не подходит"); break;
         case 6: hud("Оружие снова в руке"); break;
         case 7: hud("Ты отошёл: оружие и детали вернулись в инвентарь"); break;
+        case 10: break;  // took the weapon ROCK dropped
         default: break;
         }
         logNote("Notify " + std::to_string(message));

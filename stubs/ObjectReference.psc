@@ -6,6 +6,7 @@ Function Disable(bool abFadeOut = false) native
 ObjectReference Function DropObject(Form akObject, int aiCount = 1) native
 Function Enable(bool abFadeIn = false) native
 ObjectReference[] Function FindAllReferencesWithKeyword(Form akKeywordOrList, float afRadius) native
+ObjectReference[] Function FindAllReferencesOfType(Form arObjectOrList, float afRadius) native
 float Function GetDistance(ObjectReference akOther) native
 int Function GetItemCount(Form akItem = None) native
 ObjectReference Function GetContainer() native

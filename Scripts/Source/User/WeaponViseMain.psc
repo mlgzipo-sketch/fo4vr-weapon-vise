@@ -252,27 +252,63 @@ bool Function WaitFor3D(ObjectReference ref)
 	return ref && ref.Is3DLoaded()
 EndFunction
 
+; A weapon of ours lying loose near the clamp point (ROCK drops the weapon when grip is released).
+ObjectReference Function FindDroppedWeapon(float[] pose)
+	ObjectReference[] found = Game.GetPlayer().FindAllReferencesOfType(WV_Weapons, 300.0)
+	ObjectReference best = None
+	float bestDistance = 3600.0 ; 60 units, squared
+	int i = 0
+	while i < found.Length
+		ObjectReference r = found[i]
+		if r && !r.GetContainer() && !r.IsDisabled() && r != Clamped
+			float dx = r.GetPositionX() - pose[0]
+			float dy = r.GetPositionY() - pose[1]
+			float dz = r.GetPositionZ() - pose[2]
+			float d = dx * dx + dy * dy + dz * dz
+			if d < bestDistance
+				bestDistance = d
+				best = r
+			endif
+		endif
+		i += 1
+	endwhile
+	return best
+EndFunction
+
 Function Clamp()
 	if Clamped
 		return
 	endif
 	Actor player = Game.GetPlayer()
-	Weapon w = player.GetEquippedWeapon()
-	if !w
-		WeaponVise.Notify(1)
-		return
-	endif
-	if WV_Weapons.Find(w) < 0
-		WeaponVise.Notify(2)
-		return
-	endif
 	float[] pose = WeaponVise.CommandPose()
-	player.UnequipItem(w, false, true)
-	ObjectReference ref = player.DropObject(w, 1)
-	if !ref
-		WeaponVise.Notify(3)
-		player.EquipItem(w, false, true)
-		return
+	Weapon w = player.GetEquippedWeapon()
+	ObjectReference ref = None
+	if !w || WV_Weapons.Find(w) < 0
+		; ROCK may have just dropped it: give the drop a moment, then take it from the world
+		int tries = 0
+		while !ref && tries < 10
+			Utility.Wait(0.05)
+			ref = FindDroppedWeapon(pose)
+			tries += 1
+		endwhile
+		if !ref
+			if !w
+				WeaponVise.Notify(1)
+			else
+				WeaponVise.Notify(2)
+			endif
+			return
+		endif
+		w = ref.GetBaseObject() as Weapon
+		WeaponVise.Notify(10)
+	else
+		player.UnequipItem(w, false, true)
+		ref = player.DropObject(w, 1)
+		if !ref
+			WeaponVise.Notify(3)
+			player.EquipItem(w, false, true)
+			return
+		endif
 	endif
 	WaitFor3D(ref)
 	ref.SetMotionType(2, true)
