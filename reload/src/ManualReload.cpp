@@ -33,6 +33,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -77,6 +78,7 @@ namespace
         bool  buttonRack{ false };      // reload button racks the slide when the chamber is empty
         float slideGrabRadius{ 12.0f };  // the free hand this close to the slide takes it
         float rackTravel{ 5.0f };       // how far the slide goes back
+        std::string rackSound;          // editor ID of the sound descriptor played on racking (empty: found by itself)
         float holdRotX{ 0.0f };         // magazine in the hand: turns in the hand bone's frame (degrees)
         float holdRotY{ 0.0f };
         float holdRotZ{ 0.0f };
@@ -114,6 +116,13 @@ namespace
                 }
                 const float value = std::strtof(line.c_str() + equals + 1, nullptr);
                 auto& s = g_settings;
+                if (key == "sRackSound") {
+                    auto text = line.substr(equals + 1);
+                    const auto first = text.find_first_not_of(" \t");
+                    const auto last = text.find_last_not_of(" \t\r;");
+                    s.rackSound = first == std::string::npos ? std::string{} : text.substr(first, last - first + 1);
+                    continue;
+                }
                 if (key == "bBlockReload") s.blockReload = value != 0.0f;
                 else if (key == "iReloadGunState") s.reloadGunState = static_cast<int>(value);
                 else if (key == "iIdleGunState") s.idleGunState = static_cast<int>(value);
@@ -666,6 +675,20 @@ namespace
         RE::NiPoint3   fingers{};       // wrist -> index tip, normalized
     };
     std::array<Hand, 2> g_hands;   // 0 right, 1 left
+    // when each button of each hand last went down and came up (to tell a tap of reload from a hold)
+    std::array<std::array<std::chrono::steady_clock::time_point, 64>, 2> g_buttonDown{};
+    std::array<std::array<std::chrono::steady_clock::time_point, 64>, 2> g_buttonUp{};
+    std::array<std::uint64_t, 2> g_lastButtons{};
+
+    // Buttons that are not the reload button: grip, trigger and the analog axes.
+    std::uint64_t axisAndGripBits(int gripButton, int triggerButton) noexcept
+    {
+        std::uint64_t mask = (1ull << gripButton) | (1ull << triggerButton);
+        for (int bit = 32; bit <= 36; ++bit) {
+            mask |= 1ull << bit;
+        }
+        return mask;
+    }
 
     // ------------------------------------------------------------ ROCK
     // ROCK holds the hands. Through its API (ROCKAPI_QueryInterfaceV1) the free hand is kept off the gun's
@@ -1018,6 +1041,7 @@ namespace
         int                guidedHand{ 1 };
         float              guidedStart{ 0.0f };    // offset when it was caught
         float              guidedHandStart{ 0.0f };   // the hand's place along the well then
+        std::uint32_t      guidedRef{ 0 };         // the loose magazine still in the hand (hidden) while the gun's own is shown
         RE::NiTransform    magnetFrom{};           // where the caught magazine was in the hand
         Clock::time_point  magnetStart{};
         // the gun's magazine node relative to where a loose magazine sits when seated
@@ -1094,6 +1118,92 @@ namespace
         command.ref = ref;
         pushCommand(command);
         g_loose.erase(ref);
+    }
+
+    // ------------------------------------------------------------ the rack sound
+    // MR_SndSlide (a SOUN of our plugin) plays whatever descriptor it points to; once, the best
+    // slide/charge descriptor of the game is put there. The descriptor's place inside a SOUN is found
+    // on MR_SndDrop, which points to ItemPickUpMetal1Small (Fallout4.esm 0196B0).
+    bool g_rackSoundTried{ false };
+
+    void setupRackSound(const Gun& gun) noexcept
+    {
+        if (g_rackSoundTried) {
+            return;
+        }
+        g_rackSoundTried = true;
+        auto* data = RE::TESDataHandler::GetSingleton();
+        auto* drop = data ? data->LookupForm(0x806, "ManualReload.esp") : nullptr;
+        auto* slide = data ? data->LookupForm(0x807, "ManualReload.esp") : nullptr;
+        auto* known = RE::TESForm::GetFormByID(0x0196B0);
+        if (!drop || !slide || !known) {
+            logNote("Rack sound: our sound forms were not found, the old sound stays");
+            return;
+        }
+        std::size_t offset = 0;
+        for (std::size_t at = 0x20; at <= 0x100; at += 8) {
+            if (readable(reinterpret_cast<const std::byte*>(drop) + at, 8) &&
+                *reinterpret_cast<RE::TESForm* const*>(reinterpret_cast<const std::byte*>(drop) + at) == known) {
+                offset = at;
+                break;
+            }
+        }
+        if (!offset) {
+            logNote("Rack sound: the descriptor's place in a SOUN was not found, the old sound stays");
+            return;
+        }
+
+        // every descriptor whose name speaks of a slide, a bolt or charging: logged, the best one used
+        RE::BGSSoundDescriptorForm* best = nullptr;
+        int bestScore = 0;
+        std::string list;
+        const auto lower = [](std::string text) {
+            for (auto& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return text;
+        };
+        const auto wanted = lower(g_settings.rackSound);
+        auto& forms = data->GetFormArray<RE::BGSSoundDescriptorForm>();
+        int named = 0;
+        for (auto* form : forms) {
+            if (!form) continue;
+            const char* id = form->GetFormEditorID();
+            if (!id || !*id) continue;
+            ++named;
+            const auto name = lower(id);
+            int score = 0;
+            if (!wanted.empty()) {
+                score = name == wanted ? 1000 : 0;
+            } else {
+                const bool pistol = name.find("10mm") != std::string::npos;
+                const bool slideWord = name.find("slide") != std::string::npos || name.find("charg") != std::string::npos ||
+                                       name.find("bolt") != std::string::npos || name.find("rack") != std::string::npos;
+                if (slideWord && name.find("wpn") != std::string::npos) {
+                    score = 10 + (pistol ? 50 : 0) + (name.find("pistol") != std::string::npos ? 10 : 0) +
+                            (name.find("reload") != std::string::npos ? 5 : 0) + (name.find("fwd") != std::string::npos || name.find("forward") != std::string::npos || name.find("release") != std::string::npos ? 3 : 0);
+                }
+            }
+            if (score > 0 && list.size() < 1500) {
+                list += id;
+                list += ' ';
+            }
+            if (score > bestScore) {
+                bestScore = score;
+                best = form;
+            }
+        }
+        if (!best && gun.instance && readable(gun.instance, sizeof(RE::TESObjectWEAP::InstanceData))) {
+            best = gun.instance->equipSound;   // the gun's own handling sound is still better than a tin can
+        }
+        char message[200]{};
+        std::snprintf(message, sizeof(message), "Rack sound: %d named descriptors, SOUN descriptor at +0x%zX, picked %s (%08X)",
+            named, offset, best && best->GetFormEditorID() ? best->GetFormEditorID() : "-", best ? best->GetFormID() : 0u);
+        logNote(message);
+        if (!list.empty()) {
+            logNote("Rack sound candidates: " + list);
+        }
+        if (best) {
+            *reinterpret_cast<RE::BGSSoundDescriptorForm**>(reinterpret_cast<std::byte*>(slide) + offset) = best;
+        }
     }
 
     void playSound(int index) noexcept
@@ -1346,7 +1456,18 @@ namespace
         g_state.outRounds = g_state.magRounds;
         g_state.magRounds = 0;
         g_state.magIn = false;
-        g_state.heldMask = g_hands[g_settings.gunHand].buttons & ~vr::ButtonMaskFromId(static_cast<vr::EVRButtonId>(g_settings.gripButton));
+        // the reload button: held now (not grip, trigger or an axis) = a hold; already let go = a tap, it drops at once
+        const int gh = g_settings.gunHand;
+        const auto skip = axisAndGripBits(g_settings.gripButton, g_settings.triggerButton);
+        g_state.heldMask = g_hands[gh].buttons & ~skip;
+        if (!g_state.heldMask) {
+            for (int bit = 0; bit < 64; ++bit) {
+                if (!(skip & (1ull << bit)) && now - g_buttonUp[gh][bit] < std::chrono::milliseconds(700)) {
+                    logInfo("Reload was a tap (button already up)");
+                    break;
+                }
+            }
+        }
         setAmmo(gun, g_state.chamber ? 1u : 0u);
         buzz(g_settings.gunHand, 900);
         g_state.freezeUntil = now + std::chrono::milliseconds(static_cast<int>(g_settings.freezeSeconds * 1000.0f));
@@ -1527,7 +1648,7 @@ namespace
         g_state.offset = std::clamp(along, 0.0f, g_settings.dropDistance);
         g_state.guidedStart = g_state.offset;
         g_state.guidedHandStart = alongWell(root, g_hands[hand].frame.translate);
-        deleteMagazine(ref);
+        g_state.guidedRef = ref;   // ROCK keeps holding it (hidden), so the hand does not take the gun meanwhile
         buzz(hand, 600);
         char message[140]{};
         std::snprintf(message, sizeof(message), "CAUGHT: magazine %08X with %u rounds, %.1f out of the well", ref, loose.rounds, g_state.offset);
@@ -1540,14 +1661,49 @@ namespace
     void guideMagazine(const Gun& gun, RE::NiAVObject* root) noexcept
     {
         const auto& hand = g_hands[g_state.guidedHand];
+        auto* held = g_state.guidedRef ? lookupRef(g_state.guidedRef) : nullptr;
+        auto* held3D = held ? held->Get3D() : nullptr;
+        if (looksLikeObject(held3D)) {
+            setCulled(held3D, true);
+        }
+        const auto seat = [&](const char* how) {
+            g_state.magIn = true;
+            g_state.magRounds = g_state.guidedRounds;
+            g_state.guidedRounds = 0;
+            if (g_state.guidedRef) {
+                deleteMagazine(g_state.guidedRef);
+                g_state.guidedRef = 0;
+            }
+            syncAmmo(gun);
+            seated();
+            char message[120]{};
+            std::snprintf(message, sizeof(message), "INSERT: %s, %u rounds, ammoCount %u", how, g_state.magRounds, gun.data->ammoCount);
+            logNote(message);
+        };
+        // out of the well and in the hand again: the hidden one is shown, or a new one is made there
+        const auto backToHand = [&](const char* how) {
+            const auto rounds = g_state.guidedRounds;
+            g_state.guidedRounds = 0;
+            g_state.phase = kOut;
+            g_state.offset = 0.0f;
+            if (g_state.guidedRef && looksLikeObject(held3D)) {
+                setCulled(held3D, false);
+                g_loose[g_state.guidedRef].rounds = rounds;
+                g_loose[g_state.guidedRef].awayFromWell = false;
+            } else {
+                if (g_state.guidedRef) {
+                    deleteMagazine(g_state.guidedRef);
+                }
+                handOver(hand, rounds);
+            }
+            g_state.guidedRef = 0;
+            logNote(how);
+        };
         if (!looksLikeObject(root) || !hand.valid || !hand.grip) {
             if (g_state.offset < 1.5f) {
-                g_state.magIn = true;
-                g_state.magRounds = g_state.guidedRounds;
-                g_state.guidedRounds = 0;
-                syncAmmo(gun);
-                seated();
-                logNote("INSERT: let go at the top, the magazine clicks in");
+                seat("let go at the top, it clicks in");
+            } else if (g_state.guidedRef && looksLikeObject(held3D)) {
+                backToHand("Let go below the well: the magazine falls from the hand");
             } else {
                 g_state.outRounds = g_state.guidedRounds;   // let go in the well: it slides out and falls
                 g_state.guidedRounds = 0;
@@ -1559,26 +1715,13 @@ namespace
         float side = 0.0f;
         const float handAlong = alongWell(root, hand.frame.translate, &side);
         const float wanted = g_state.guidedStart + (handAlong - g_state.guidedHandStart);
-        if (wanted > g_state.guidedStart + 4.0f || wanted > g_settings.dropDistance + 2.0f) {
-            // pulled back out: it is in the hand again
-            const auto rounds = g_state.guidedRounds;
-            g_state.guidedRounds = 0;
-            g_state.phase = kOut;
-            g_state.offset = 0.0f;
-            handOver(hand, rounds);
-            logNote("The magazine was pulled back out of the well");
+        if (wanted > std::max(g_settings.dropDistance, g_state.guidedStart + 3.0f) || side > g_settings.wellSide * 3.0f) {
+            backToHand("The magazine is out of the well, in the hand");
             return;
         }
         g_state.offset = std::clamp(wanted, 0.0f, g_settings.dropDistance);
         if (g_state.offset <= 0.15f) {
-            g_state.magIn = true;
-            g_state.magRounds = g_state.guidedRounds;
-            g_state.guidedRounds = 0;
-            syncAmmo(gun);
-            seated();
-            char message[120]{};
-            std::snprintf(message, sizeof(message), "INSERT: pushed home, %u rounds, ammoCount %u", g_state.magRounds, gun.data->ammoCount);
-            logNote(message);
+            seat("pushed home");
         }
     }
 
@@ -1749,7 +1892,7 @@ namespace
             return;
         }
         g_state.lastBelt = now;
-        const auto used = gun.data->ammoCount + g_state.outRounds + (g_state.phase == kGuided ? g_state.guidedRounds : 0u) + looseRounds();
+        const auto used = gun.data->ammoCount + g_state.outRounds + (g_state.phase == kGuided && !g_loose.contains(g_state.guidedRef) ? g_state.guidedRounds : 0u) + looseRounds();
         const auto available = inventory > used ? inventory - used : 0u;
         if (available == 0) {
             hud("Патронов для магазина нет");
@@ -1956,6 +2099,24 @@ namespace
         takeScriptNews();
         readHand(0);
         readHand(1);
+        for (int i = 0; i < 2; ++i) {
+            const auto now0 = Clock::now();
+            const auto changed = g_hands[i].buttons ^ g_lastButtons[i];
+            for (int bit = 0; bit < 64; ++bit) {
+                if (changed & (1ull << bit)) {
+                    if (g_hands[i].buttons & (1ull << bit)) {
+                        g_buttonDown[i][bit] = now0;
+                    } else {
+                        g_buttonUp[i][bit] = now0;
+                    }
+                    char message[96]{};
+                    std::snprintf(message, sizeof(message), "Button %d of the %s hand %s", bit, i == 0 ? "right" : "left",
+                        (g_hands[i].buttons & (1ull << bit)) ? "down" : "up");
+                    logInfo(message);
+                }
+            }
+            g_lastButtons[i] = g_hands[i].buttons;
+        }
         {
             std::array<bool, 2> wanted{};
             for (const auto& [token, pending] : g_pending) {
@@ -2012,6 +2173,9 @@ namespace
             // a magazine on its way out when the gun was put away keeps its rounds on the ground... or here: back to the pouch
             g_state.weapon = gun.weapon;
             g_state.managed = gun.weapon && gun.data && gun.weapon->GetFormID() == k10mmPistol;
+            if (g_state.managed) {
+                setupRackSound(gun);
+            }
             g_state.dumped = false;
             g_state.equippedAt = now;
             g_state.wellKnown = false;
@@ -2159,8 +2323,18 @@ namespace
                 const bool held = g_state.heldMask != 0 && (gunHand.buttons & g_state.heldMask) != 0;
                 const auto& spare = g_hands[1 - g_settings.gunHand];
                 if (spare.valid && spare.grip && !spare.previousGrip && looksLikeObject(magazine) && looksLikeObject(root) &&
-                    distance(spare.palm, magazineGrabPoint(root)) < g_settings.handRadius) {
-                    finishEject(root, magazine, &spare);
+                    distance(spare.frame.translate, magazineGrabPoint(root)) < g_settings.handRadius) {
+                    // taken by the free hand: it comes out along the well as the hand pulls
+                    g_state.phase = kGuided;
+                    g_state.guidedRounds = g_state.outRounds;
+                    g_state.outRounds = 0;
+                    g_state.guidedHand = 1 - g_settings.gunHand;
+                    g_state.guidedRef = 0;
+                    g_state.guidedStart = g_state.offset;
+                    g_state.guidedHandStart = alongWell(root, spare.frame.translate);
+                    g_state.magnetStart = Clock::time_point{};
+                    buzz(1 - g_settings.gunHand, 900);
+                    logNote("TAKEN: the free hand pulls the magazine out");
                 } else if (!held) {
                     g_state.phase = kSlidingOut;
                 }
