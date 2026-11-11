@@ -13,7 +13,7 @@ Records:
 Plain .esp, form version 131, master Fallout4.esm; works in Fallout 4 VR.
 Also writes WeaponVise_parts.csv for the plugin (same rows as data/parts.csv).
 """
-import csv, os, shutil, struct, sys
+import csv, json, os, shutil, struct, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = sys.argv[1] if len(sys.argv) > 1 else 'WeaponVise.esp'
@@ -40,6 +40,11 @@ def record(tag, formid, subs, flags=0):
 def group(tag, records):
     body = b''.join(records)
     return b'GRUP' + struct.pack('<I4sIIHH', 24 + len(body), tag.encode(), 0, 0, 0, 0) + body
+# Every record keeps its FormID forever (saves hold references by id): data/formids.json maps
+# EditorID -> id. New records get the next free id and are written back; commit the file.
+FORMIDS_PATH = os.path.join(ROOT, 'data', 'formids.json')
+FORMIDS = {k: int(v, 16) for k, v in json.load(open(FORMIDS_PATH)).items()} if os.path.exists(FORMIDS_PATH) else {}
+next_id = max([next_id] + [v + 1 for v in FORMIDS.values()])
 def new_id():
     global next_id
     fid = OWN | next_id
@@ -48,15 +53,22 @@ def new_id():
 
 recs, ids = {}, {}
 def add(tag, edid, subs):
-    fid = (OWN | PINNED[edid]) if edid in PINNED else new_id()
+    if edid in PINNED:
+        fid = OWN | PINNED[edid]
+    elif edid in FORMIDS:
+        fid = OWN | FORMIDS[edid]
+    else:
+        fid = new_id()
+        FORMIDS[edid] = fid & 0xFFFFFF
     ids[edid] = fid
     recs.setdefault(tag, []).append(record(tag, fid, [sub('EDID', zstr(edid))] + subs))
     return fid
 
 rows = list(csv.DictReader(open(os.path.join(ROOT, 'data', 'parts.csv'), newline='')))
 for r in rows:
-    for k in ('omod', 'weapon', 'loose', 'fallback'):
+    for k in ('omod', 'loose', 'fallback'):
         r[k] = int(r[k], 16)
+    r['weapons'] = [int(x, 16) for x in r['weapon'].split(';') if x]
 
 WORKBENCH_KEYWORD = 0x0017B3A2   # AnimFurnWorkbenchWeapons (on workbenchWeaponsA/B)
 
@@ -109,7 +121,7 @@ flst('WV_PartItems', part_items)
 flst('WV_LooseMods', [r['loose'] for r in parts])
 flst('WV_Ghosts', ghosts)
 flst('WV_Sounds', sounds)
-flst('WV_Weapons', sorted({r['weapon'] for r in rows}))
+flst('WV_Weapons', sorted({w for r in parts for w in r['weapons']}))
 
 # Hidden box: other copies of a pistol wait here while the one from the vise is equipped.
 # Added last so the ids of everything above stay the same.
@@ -146,4 +158,5 @@ shutil.copyfile(os.path.join(ROOT, 'data', 'parts.csv'),
                 os.path.join(os.path.dirname(os.path.abspath(OUT)), 'F4SE', 'Plugins', 'WeaponVise_parts.csv')
                 if os.path.isdir(os.path.join(os.path.dirname(os.path.abspath(OUT)), 'F4SE', 'Plugins'))
                 else os.path.join(os.path.dirname(os.path.abspath(OUT)), 'WeaponVise_parts.csv'))
+json.dump({k: '%06X' % v for k, v in sorted(FORMIDS.items(), key=lambda x: x[1])}, open(FORMIDS_PATH, 'w'), indent=1)
 print('wrote', OUT, nrec, 'records,', len(parts), 'parts')
