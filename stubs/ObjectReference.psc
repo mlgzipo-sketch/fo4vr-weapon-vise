@@ -14,6 +14,7 @@ Cell Function GetParentCell() native
 bool Function Is3DLoaded() native
 bool Function IsDeleted() native
 ObjectReference Function PlaceAtMe(Form akFormToPlace, int aiCount = 1, bool abForcePersist = false, bool abInitiallyDisabled = false, bool abDeleteWhenAble = true) native
+Function MoveTo(ObjectReference akTarget, float afXOffset = 0.0, float afYOffset = 0.0, float afZOffset = 0.0, bool abMatchRotation = true) native
 Function RemoveItem(Form akItemToRemove, int aiCount = 1, bool abSilent = false, ObjectReference akOtherContainer = None) native
 Function RemoveMod(ObjectMod akMod) native
 Function SetAngle(float afXAngle, float afYAngle, float afZAngle) native

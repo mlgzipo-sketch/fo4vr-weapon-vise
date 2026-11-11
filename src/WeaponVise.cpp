@@ -277,6 +277,7 @@ namespace
     {
         std::mutex lock;
         std::uint32_t bench{ 0 };
+        std::uint32_t frame{ 0 };   // the zone frame model
         std::uint32_t weapon{ 0 };
         std::vector<std::uint32_t> mods;
         std::uint64_t revision{ 0 };
@@ -1400,6 +1401,51 @@ namespace
         }
     }
 
+    // The zone frame: corner brackets around the spot above the vise, shown while a weapon is near it.
+    void updateFrame() noexcept
+    {
+        std::uint32_t id;
+        {
+            std::scoped_lock guard(g_shared.lock);
+            id = g_shared.frame;
+        }
+        auto* ref = id ? lookupRef(id) : nullptr;
+        auto* root = ref ? ref->Get3D() : nullptr;
+        if (!looksLikeObject(root)) {
+            return;
+        }
+        RE::NiPoint3 center;
+        RE::NiTransform bench;
+        const bool known = viseArea(center) && benchFrame(lookupRef(g_bench), bench);
+        bool show = false;
+        bool inside = false;
+        if (known) {
+            const auto& hand = g_hands_state[g_settings.weaponHand == 1 ? 1 : 0];
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (!g_weapon) {
+                // a weapon in hand coming close
+                show = player && player->GetWeaponMagicDrawn() && hand.valid && distance(hand.point, center) < g_settings.zoneRadius * 3.0f;
+                inside = show && inViseArea(hand.point);
+            } else if (g_weaponHeldBy >= 0) {
+                // the clamped weapon is being carried
+                show = true;
+                inside = inViseArea(g_weaponWorld.translate);
+            }
+        }
+        setCulled(root, !show);
+        if (!show) {
+            return;
+        }
+        RE::NiTransform world{};
+        world.rotate = bench.rotate;
+        world.translate = center;
+        world.scale = 1.0f;
+        place3D(root, world);
+        if (auto* fade = root->IsFadeNode()) {
+            fade->GetFadeNodeRuntimeData().currentFade = inside ? 1.0f : 0.35f;
+        }
+    }
+
     void update() noexcept
     {
         readHand(0);
@@ -1413,6 +1459,7 @@ namespace
                 hand.hover = 0;
             }
             updateClampGesture();
+            updateFrame();
             return;
         }
         auto* weaponRef = lookupRef(g_weapon);
@@ -1480,6 +1527,7 @@ namespace
         updateHeldParts(root);
         updateSnaps();
         applyGhosts();
+        updateFrame();
     }
 
     // ------------------------------------------------------------ Papyrus natives
@@ -1487,6 +1535,12 @@ namespace
     std::uint32_t idOf(const RE::TESForm* form) noexcept
     {
         return form ? form->GetFormID() : 0;
+    }
+
+    void SetFrame(std::monostate, RE::TESObjectREFR* frame)
+    {
+        std::scoped_lock guard(g_shared.lock);
+        g_shared.frame = idOf(frame);
     }
 
     void SetWorkbench(std::monostate, RE::TESObjectREFR* bench)
@@ -1683,6 +1737,7 @@ namespace
         vm->BindNativeMethod(kScript, "FallbackFor", FallbackFor, true);
         vm->BindNativeMethod(kScript, "IsFreeMod", IsFreeMod, true);
         vm->BindNativeMethod(kScript, "AddGhost", AddGhost, true);
+        vm->BindNativeMethod(kScript, "SetFrame", SetFrame, true);
         logNote("Papyrus functions of script WeaponVise registered");
         return true;
     }

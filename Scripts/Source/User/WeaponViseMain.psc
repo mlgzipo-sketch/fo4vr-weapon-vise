@@ -10,6 +10,7 @@ FormList Property WV_Weapons Auto Const       ; weapons that can be clamped
 FormList Property WV_LooseMods Auto Const     ; the game's loose mod item of each mod (same order)
 FormList Property WV_Ghosts Auto Const        ; outline model of each mod's part (same order)
 FormList Property WV_Sounds Auto Const        ; focus, focus red, snap, pick up
+Static Property ZoneFrame Auto Const            ; corner brackets above the vise
 EffectShader Property OutlineAttach Auto Const
 EffectShader Property OutlineRemove Auto Const
 
@@ -63,6 +64,7 @@ EndFunction
 Event Actor.OnPlayerLoadGame(Actor akSender)
 	Setup()
 	WeaponVise.SetWorkbench(Bench)
+	PlaceFrame()
 	if Clamped
 		WeaponVise.SetWeapon(Clamped, Clamped.GetAllMods())
 	endif
@@ -164,6 +166,22 @@ EndEvent
 
 int Unloaded = 0
 
+ObjectReference FrameRef
+
+; The zone frame waits at the bench; the plugin shows it, places it and hides it.
+Function PlaceFrame()
+	if !Bench || !ZoneFrame
+		return
+	endif
+	if !FrameRef
+		FrameRef = Bench.PlaceAtMe(ZoneFrame, 1, true, false, false)
+	else
+		FrameRef.MoveTo(Bench)
+	endif
+	WaitFor3D(FrameRef)
+	WeaponVise.SetFrame(FrameRef)
+EndFunction
+
 Function Scan()
 	Actor player = Game.GetPlayer()
 	ObjectReference nearest = None
@@ -181,6 +199,7 @@ Function Scan()
 	if nearest != Bench
 		Bench = nearest
 		WeaponVise.SetWorkbench(Bench)
+		PlaceFrame()
 	endif
 	if Clamped && !Busy
 		if Clamped.GetContainer() == player

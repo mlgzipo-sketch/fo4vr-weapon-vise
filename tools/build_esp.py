@@ -72,6 +72,9 @@ for r in parts:
         sub('MODL', zstr(r['model'], 'latin1')),
     ]))
 
+# Glowing corner brackets above the vise: the spot where a released weapon stays (tools/build_frame_nif.py).
+add('STAT', 'WV_ZoneFrame', [sub('OBND', b'\0' * 12), sub('MODL', zstr('WeaponVise\\ZoneFrame.nif', 'latin1'))])
+
 # HologramShaunFXS (Fallout4.esm 00183AFB): no fill (black zero-alpha texture), a glowing edge.
 HOLOGRAM_DNAM = bytes.fromhex(
     '050000000200000007000000000000000000803e0000003f0000803f0000803e000000000000803f00000000000000000000003f73bed7000ad7233c0000a0410000803fcdcccc3e0000803e0000003f3333b33ecdcccc3e0200000000000000000020410000000000007f4300000000ffffff00ffffff00040000803f0000004000000040000000000000803f00002041088003000000803fcdcc4c3f')
@@ -107,6 +110,7 @@ props = {
     'WV_Mods': ids['WV_Mods'], 'WV_PartItems': ids['WV_PartItems'], 'WV_Weapons': ids['WV_Weapons'],
     'WV_LooseMods': ids['WV_LooseMods'],
     'WV_Ghosts': ids['WV_Ghosts'], 'WV_Sounds': ids['WV_Sounds'],
+    'ZoneFrame': ids['WV_ZoneFrame'],
     'OutlineAttach': ids['WV_OutlineAttach'], 'OutlineRemove': ids['WV_OutlineRemove'],
 }
 vmad = struct.pack('<hhH', 6, 2, 1) + wstr('WeaponViseMain') + b'\0' + struct.pack('<H', len(props))
