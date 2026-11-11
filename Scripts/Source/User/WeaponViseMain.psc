@@ -305,7 +305,7 @@ ObjectReference Function FindDroppedWeapon(float[] pose)
 	int i = 0
 	while i < found.Length
 		ObjectReference r = found[i]
-		if r && !r.GetContainer() && !r.IsDisabled() && r != Clamped
+		if r && !r.GetContainer() && !r.IsDisabled() && r.Is3DLoaded() && r != Clamped
 			float dx = r.GetPositionX() - pose[0]
 			float dy = r.GetPositionY() - pose[1]
 			float dz = r.GetPositionZ() - pose[2]
@@ -440,11 +440,13 @@ Function AttachPart(ObjectReference part, ObjectMod m)
 	int b = 0
 	while b < before.Length
 		ObjectMod old = before[b]
-		if old && old != m && after.Find(old) < 0
+		; a stock filler part (put on when the real one came off) just vanishes:
+		; spawning it was the "duplicated barrel"
+		if old && old != m && after.Find(old) < 0 && !WeaponVise.IsFreeMod(old)
 			int j = WV_Mods.Find(old)
 			if j >= 0 && Parts.Length < MaxParts
 				SpawnPart(j, WeaponVise.CommandPose(), false)
-			elseif !WeaponVise.IsFreeMod(old) && old.GetLooseMod()
+			elseif old.GetLooseMod()
 				player.AddItem(old.GetLooseMod(), 1, true)
 			endif
 		endif
@@ -504,7 +506,12 @@ Function ShowGhost(ObjectMod m, int color)
 		if i < 0
 			return
 		endif
-		ObjectReference ghost = Game.GetPlayer().PlaceAtMe(WV_Ghosts.GetAt(i), 1, false, false, false)
+		; made at the weapon: a model far from where its reference is may be culled by the renderer
+		ObjectReference at = Clamped
+		if !at
+			at = Game.GetPlayer()
+		endif
+		ObjectReference ghost = at.PlaceAtMe(WV_Ghosts.GetAt(i), 1, false, false, false)
 		if !ghost
 			return
 		endif
@@ -518,6 +525,9 @@ Function ShowGhost(ObjectMod m, int color)
 	ObjectReference g = Ghosts[k]
 	if GhostColors[k] == color
 		return
+	endif
+	if color != 0 && Clamped && g.GetDistance(Clamped) > 30.0
+		g.MoveTo(Clamped)
 	endif
 	if GhostColors[k] == 1
 		OutlineRemove.Stop(g)
