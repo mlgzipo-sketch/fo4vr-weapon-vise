@@ -830,6 +830,81 @@ namespace
         }
     }
 
+    vr::TrackedDeviceIndex_t controllerOf(int index) noexcept
+    {
+        if (!g_vr) {
+            return vr::k_unTrackedDeviceIndexInvalid;
+        }
+        return g_vr->GetTrackedDeviceIndexForControllerRole(index == 0 ? vr::TrackedControllerRole_RightHand : vr::TrackedControllerRole_LeftHand);
+    }
+
+    void buzz(int index, unsigned short microseconds) noexcept
+    {
+        const auto device = controllerOf(index);
+        if (g_settings.haptics && device != vr::k_unTrackedDeviceIndexInvalid) {
+            g_vr->TriggerHapticPulse(device, 0, microseconds);
+        }
+    }
+
+    void readHand(int index) noexcept
+    {
+        auto& hand = g_hands[index];
+        hand.previousGrip = hand.grip;
+        hand.valid = false;
+        hand.grip = false;
+        hand.buttons = 0;
+        const auto* frik = FRIKApiV2::inst;
+        if (!frik || !frik->getTrackedHandTransform) {
+            return;
+        }
+        const auto which = index == 0 ? FRIKApiV2::Hand::Right : FRIKApiV2::Hand::Left;
+        RE::NiTransform wand;
+        if (!frik->getTrackedHandTransform(which, FRIKApiV2::TrackedHandKind::Wand, &wand)) {
+            return;
+        }
+        hand.frame = wand;
+        hand.frame.scale = 1.0f;
+        hand.palm = wand.translate;
+        hand.bone = wand.rotate;
+        FRIKApiV2::ArmChainTransforms chain{};
+        chain.structSize = sizeof(chain);
+        if (frik->getArmChain && frik->getIndexFingerTipPosition && frik->getArmChain(which, &chain) && (chain.validMask & (1u << 6))) {
+            const auto tip = frik->getIndexFingerTipPosition(which);
+            const auto wrist = chain.hand.translate;
+            const float length = distance(tip, wrist);
+            if (length < 40.0f && length > 0.1f) {
+                hand.palm = (tip + wrist) * 0.5f;
+                hand.bone = chain.hand.rotate;
+                hand.fingers = (tip - wrist) * (1.0f / length);
+            }
+        }
+        hand.valid = true;
+        const auto device = controllerOf(index);
+        if (device != vr::k_unTrackedDeviceIndexInvalid) {
+            vr::VRControllerState_t state{};
+            if (g_vr->GetControllerState(device, &state, sizeof(state))) {
+                hand.buttons = state.ulButtonPressed;
+                hand.grip = (state.ulButtonPressed & vr::ButtonMaskFromId(static_cast<vr::EVRButtonId>(g_settings.gripButton))) != 0;
+            }
+        }
+    }
+
+    void hud(const char* text) noexcept
+    {
+        if (g_settings.messages && text) {
+            RE::SendHUDMessage::ShowHUDMessage(text, nullptr, false, false);
+        }
+    }
+
+    RE::TESObjectREFR* lookupRef(std::uint32_t id) noexcept
+    {
+        if (!id) {
+            return nullptr;
+        }
+        auto* form = RE::TESForm::GetFormByID(id);
+        return form ? form->As<RE::TESObjectREFR>() : nullptr;
+    }
+
     // ------------------------------------------------------------ talking to the script
 
     enum Command : std::int32_t
