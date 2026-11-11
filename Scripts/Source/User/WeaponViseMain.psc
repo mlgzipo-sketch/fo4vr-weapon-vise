@@ -22,6 +22,7 @@ int Property CmdDrop = 5 AutoReadOnly
 int Property CmdMove = 6 AutoReadOnly
 int Property CmdGhost = 7 AutoReadOnly
 int Property CmdSound = 8 AutoReadOnly
+int Property CmdFramePose = 9 AutoReadOnly
 int Property TimerScan = 1 AutoReadOnly
 int Property TimerFast = 2 AutoReadOnly
 int Property MaxParts = 120 AutoReadOnly
@@ -273,6 +274,12 @@ Function Handle()
 			ShowGhost(WeaponVise.CommandMod(), WeaponVise.CommandPose()[0] as int)
 		elseif cmd == CmdSound
 			PlaySound(WeaponVise.CommandPose()[0] as int)
+		elseif cmd == CmdFramePose
+			if FrameRef
+				float[] fp = WeaponVise.CommandPose()
+				FrameRef.SetAngle(0.0, 0.0, fp[3])
+				FrameRef.SetPosition(fp[0], fp[1], fp[2])
+			endif
 		endif
 		cmd = WeaponVise.PollCommand()
 	endwhile

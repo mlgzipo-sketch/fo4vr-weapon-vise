@@ -263,6 +263,7 @@ namespace
         kMove = 6,
         kGhost = 7,
         kSound = 8,
+        kFramePose = 9,
     };
 
     struct PendingCommand
@@ -278,6 +279,7 @@ namespace
         std::mutex lock;
         std::uint32_t bench{ 0 };
         std::uint32_t frame{ 0 };   // the zone frame model
+        std::uint32_t frameGen{ 0 }; // bumped each time the script (re)places it
         std::uint32_t weapon{ 0 };
         std::vector<std::uint32_t> mods;
         std::uint64_t revision{ 0 };
@@ -422,20 +424,32 @@ namespace
         if (!looksLikeObject(root)) {
             return;
         }
+        // the bound moves with the object, or the renderer keeps culling it at its old place
+        const auto moveBound = [](RE::NiAVObject* object, const RE::NiTransform& before) {
+            auto& bound = object->worldBound;
+            if (bound.fRadius > 0.0f && bound.fRadius < 1000.0f) {
+                const auto local = relative(before, pointTransform(bound.center)).translate;
+                bound.center = compose(object->world, pointTransform(local)).translate;
+            }
+        };
         auto* parent = root->parent;
         if (looksLikeObject(parent)) {
             root->local = relative(parent->world, world);
         } else {
             root->local = world;
         }
+        const auto rootBefore = root->world;
         root->world = world;
-        forEachNode(root, [](RE::NiAVObject* object, int depth) {
+        moveBound(root, rootBefore);
+        forEachNode(root, [&](RE::NiAVObject* object, int depth) {
             if (depth == 0) {
                 return;
             }
             auto* parent = object->parent;
             if (looksLikeObject(parent)) {
+                const auto before = object->world;
                 object->world = compose(parent->world, object->local);
+                moveBound(object, before);
             }
         });
     }
@@ -1437,9 +1451,11 @@ namespace
     void updateFrame() noexcept
     {
         std::uint32_t id;
+        std::uint32_t gen;
         {
             std::scoped_lock guard(g_shared.lock);
             id = g_shared.frame;
+            gen = g_shared.frameGen;
         }
         auto* ref = id ? lookupRef(id) : nullptr;
         auto* root = ref ? ref->Get3D() : nullptr;
@@ -1468,6 +1484,16 @@ namespace
                 show = true;
                 inside = inViseArea(g_weaponWorld.translate);
             }
+        }
+        // the reference itself goes to the zone once, so the game knows where the frame is
+        static std::uint64_t placedFor = 0;
+        const std::uint64_t key = ((static_cast<std::uint64_t>(id) << 32) | g_bench) ^ (static_cast<std::uint64_t>(gen) << 48);
+        if (known && placedFor != key) {
+            placedFor = key;
+            PendingCommand command;
+            command.type = kFramePose;
+            command.pose = poseOf(center, headingOf({ bench.rotate.entry[1][0], bench.rotate.entry[1][1], bench.rotate.entry[1][2] }));
+            pushCommand(command);
         }
         setCulled(root, !show);
         if (!show) {
@@ -1597,6 +1623,7 @@ namespace
     {
         std::scoped_lock guard(g_shared.lock);
         g_shared.frame = idOf(frame);
+        ++g_shared.frameGen;
     }
 
     void SetWorkbench(std::monostate, RE::TESObjectREFR* bench)
