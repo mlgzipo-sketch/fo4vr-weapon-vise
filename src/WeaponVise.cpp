@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -1570,6 +1571,10 @@ namespace
         g_slotMemoryLoaded = true;
         try {
             std::ifstream file(kSlotFile);
+            std::string version;
+            if (!(file >> version) || version != "v2") {
+                return;  // none yet, or 0.10.1's (could hold a magazine learned at P-Receiver)
+            }
             std::string base, slot;
             while (file >> base >> slot) {
                 RE::NiTransform t{};
@@ -1593,6 +1598,7 @@ namespace
     {
         try {
             std::ofstream file(kSlotFile, std::ios::trunc);
+            file << "v2\n";
             for (const auto& [key, t] : g_slotMemory) {
                 file << key;
                 for (int r = 0; r < 3; ++r) {
@@ -1604,6 +1610,26 @@ namespace
             }
         } catch (...) {
         }
+    }
+
+    // The attach point must be the slot's own: P-Mag for ap_gun_Mag, P-Grip for ap_gun_Grip...
+    bool attachPointMatches(const PartInfo& info, RE::NiAVObject* point) noexcept
+    {
+        const auto at = info.slot.find("ap_gun_");
+        if (at == std::string::npos || !point) {
+            return true;
+        }
+        const std::string want = "p-" + info.slot.substr(at + 7);
+        std::string have = nodeName(point);
+        if (have.size() != want.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < have.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(have[i])) != std::tolower(static_cast<unsigned char>(want[i]))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     void resolveSlots(RE::NiAVObject* root) noexcept
@@ -1619,6 +1645,11 @@ namespace
                 continue;
             }
             auto* point = attachPointOf(anchor.node);
+            if (!attachPointMatches(*info, point)) {
+                // e.g. a magazine just taken off: its node is still there but the climb found
+                // P-Receiver; learning that would put the ghost in the middle of the weapon
+                continue;
+            }
             const auto frame = relative(root->world, point->world);
             g_slotFrames[info->slot] = frame;
             if (baseId) {
