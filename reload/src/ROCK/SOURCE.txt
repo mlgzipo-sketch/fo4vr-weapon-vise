@@ -1,0 +1,1 @@
+Headers from the RPS SDK (github.com/brunocatani/RPS_SDK, commit df02e89, SDK/ROCK/include/ROCK), unchanged.

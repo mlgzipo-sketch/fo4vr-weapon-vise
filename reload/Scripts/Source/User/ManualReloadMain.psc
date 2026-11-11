@@ -15,6 +15,7 @@ int Property TimerPoll = 1 AutoReadOnly
 
 ObjectReference[] Ghosts
 bool Busy
+int Ticks
 
 bool Function Ready()
 	return MR_Mags && MR_Ghosts && MR_Sounds
@@ -40,6 +41,11 @@ Event OnTimer(int aiTimerID)
 	if !Busy
 		Busy = true
 		Handle()
+		Ticks += 1
+		if Ticks >= 10
+			Ticks = 0
+			Tidy()
+		endif
 		Busy = false
 	endif
 	StartTimer(0.1, TimerPoll)
@@ -127,6 +133,16 @@ Function MakeGhosts()
 		endif
 		i += 1
 	endwhile
+EndFunction
+
+; A magazine put away over the shoulder lands in the inventory as an item. Its rounds are already back
+; with the ammo you carry, so the item itself is taken away again.
+Function Tidy()
+	Actor player = Game.GetPlayer()
+	int n = player.GetItemCount(MR_Mags)
+	if n > 0
+		player.RemoveItem(MR_Mags, n, true)
+	endif
 EndFunction
 
 Function PlaySound(int index)
