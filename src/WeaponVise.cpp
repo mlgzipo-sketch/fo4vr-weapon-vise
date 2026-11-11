@@ -69,6 +69,7 @@ namespace
         float viseX{ 33.0f };           // the vise in the workbench model's space
         float viseY{ 26.0f };
         float viseZ{ 68.0f };
+        float tableZ{ 61.0f };   // bench top, where parts without physics are laid
         float viseLift{ 9.0f };         // the clamped weapon sits this far above the vise point
         float clampHold{ 0.5f };        // seconds of grip to clamp
         float grabRadius{ 10.0f };       // hand this close to a part grabs it
@@ -139,6 +140,7 @@ namespace
                 else if (key == "fZoneLift") s.zoneLift = value;
                 else if (key == "fZoneRadius") s.zoneRadius = value;
                 else if (key == "fPreviewRadius") s.previewRadius = value;
+                else if (key == "fTableZ") s.tableZ = value;
                 else if (key == "fSnapTime") s.snapTime = value;
                 else if (key == "fGhostFade") s.ghostFade = value;
                 else if (key == "fHeldRadius") s.heldRadius = value;
@@ -503,6 +505,8 @@ namespace
         bool placed{ false };       // home holds where the player left it
         RE::NiTransform home{};
         int carriedBy{ -1 };
+        RE::NiAVObject* detached{ nullptr };   // 3D we took out of physics while carrying
+        int collision{ -1 };        // -1 not checked yet; 0: the model has no physics (ROCK can not hold it)
         bool previewing{ false };   // ghost shown while a gripping hand holds it near its place
         Clock::time_point previewSince{};
     };
@@ -739,6 +743,17 @@ namespace
             return true;
         }
         return false;
+    }
+
+    bool hasCollision(RE::NiAVObject* root) noexcept
+    {
+        bool found = false;
+        forEachNode(root, [&](RE::NiAVObject* object, int) {
+            if (object->collisionObject) {
+                found = true;
+            }
+        });
+        return found;
     }
 
     RE::NiPoint3 benchPoint(const RE::NiTransform& bench, float x, float y, float z) noexcept
@@ -1132,6 +1147,36 @@ namespace
                 if (!pressed) {
                     break;
                 }
+                if (!hover && !hand.select) {
+                    // a loose part with no physics (the ported barrel): ROCK can not take it, we carry it
+                    std::uint32_t best = 0;
+                    RE::NiAVObject* bestRoot = nullptr;
+                    float bestDistance = g_settings.grabRadius * 1.5f;
+                    for (auto& [id, part] : g_parts) {
+                        auto* ref = lookupRef(id);
+                        auto* root = ref ? ref->Get3D() : nullptr;
+                        if (part.carriedBy != -1 || part.collision != 0 || !looksLikeObject(root)) {
+                            continue;
+                        }
+                        const float d = distance(hand.point, centerOf(root));
+                        if (d < bestDistance) {
+                            bestDistance = d;
+                            best = id;
+                            bestRoot = root;
+                        }
+                    }
+                    if (best) {
+                        hand.part = best;
+                        hand.offset = relative(hand.frame, bestRoot->world);
+                        hand.armed = true;
+                        hand.carried3D = bestRoot;
+                        hand.mode = Hand::Mode::Carry;
+                        g_parts[best].carriedBy = index;
+                        buzz(index, 1500);
+                        soundCue(3);
+                        break;
+                    }
+                }
                 const float toWeapon = distance(hand.point, centerOf(weapon3D));
                 const auto* touched = nearestAnchor(hand.point, g_settings.grabRadius);
                 if (g_settings.logGrab) {
@@ -1255,7 +1300,10 @@ namespace
                 if (hand.carried3D != root) {
                     // no collision while carried: a keyframed part pushes the player away
                     hand.carried3D = root;
-                    ref->DetachHavok(root);
+                    if (part.collision != 0) {
+                        part.detached = root;
+                        ref->DetachHavok(root);
+                    }
                 }
                 const auto world = compose(hand.frame, hand.offset);
                 place3D(root, world);
@@ -1279,6 +1327,13 @@ namespace
                         command.type = kDrop;
                         command.part = hand.part;
                         command.pose = poseOf(world.translate, 0.0f);
+                        RE::NiTransform benchWorld;
+                        RE::NiPoint3 center;
+                        if (part.collision == 0 && viseArea(center) && benchFrame(lookupRef(g_bench), benchWorld)
+                            && distance(world.translate, center) < 90.0f) {
+                            // it can not fall by itself: lay it on the table under the hand
+                            command.pose[2] = benchPoint(benchWorld, 0.0f, 0.0f, g_settings.tableZ).z;
+                        }
                         pushCommand(command);
                         part.carriedBy = -1;
                     }
@@ -1303,6 +1358,12 @@ namespace
             }
             auto* ref = lookupRef(id);
             auto* root = ref ? ref->Get3D() : nullptr;
+            if (looksLikeObject(root) && root != part.detached && part.collision < 0) {
+                part.collision = hasCollision(root) ? 1 : 0;
+                if (g_settings.logGrab) {
+                    logNote("Part " + std::to_string(id) + (part.collision ? " has physics" : " has NO physics: the mod carries it"));
+                }
+            }
             if (!looksLikeObject(root) || distance(root->world.translate, centerOf(weapon3D)) > 60.0f) {
                 continue;
             }
@@ -1428,6 +1489,9 @@ namespace
                     const auto center = compose(world, pointTransform(localCenter)).translate;
                     world.translate = world.translate + (hand.point - center);
                     hand.offset = relative(hand.frame, world);
+                }
+                if (g_parts[id].collision < 0) {
+                    g_parts[id].collision = hasCollision(root) ? 1 : 0;
                 }
                 hand.mode = Hand::Mode::Carry;
                 hand.carried3D = nullptr;
