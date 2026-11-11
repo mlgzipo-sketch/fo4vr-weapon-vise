@@ -862,6 +862,27 @@ namespace
                 }
             }
         }
+        // log what happens to each wished ghost once per change (to see why one would not show)
+        static std::unordered_map<std::uint32_t, int> logged;
+        for (const auto& [mod, wish] : g_ghostWish) {
+            const auto it = g_ghosts.find(mod);
+            auto* ref = it != g_ghosts.end() ? lookupRef(it->second.ref) : nullptr;
+            auto* root = ref ? ref->Get3D() : nullptr;
+            const int state = !ref ? 1 : !looksLikeObject(root) ? 2 : 3;
+            if (logged[mod] != state * 10 + wish.color) {
+                logged[mod] = state * 10 + wish.color;
+                char text[200]{};
+                std::snprintf(text, sizeof(text), "Ghost %08X colour %d: %s at (%.0f, %.0f, %.0f)", mod, wish.color,
+                    state == 1 ? "no ghost reference yet" : state == 2 ? "ghost has no 3D" : "shown",
+                    wish.world.translate.x, wish.world.translate.y, wish.world.translate.z);
+                logNote(text);
+            }
+        }
+        for (auto& [mod, state] : logged) {
+            if (!g_ghostWish.contains(mod)) {
+                state = 0;
+            }
+        }
         // models: placed here every frame, hidden when not wanted
         for (auto& [mod, ghost] : g_ghosts) {
             auto* ref = lookupRef(ghost.ref);
@@ -879,7 +900,11 @@ namespace
                 continue;
             }
             setCulled(root, false);
-            place3D(root, wish->second.world);
+            auto world = wish->second.world;
+            if (wish->second.color == 1) {
+                world.scale = 1.06f;   // around the real part, not inside it
+            }
+            place3D(root, world);
             if (auto* fade = root->IsFadeNode()) {
                 fade->GetFadeNodeRuntimeData().currentFade = wish->second.color == 2 ? g_settings.ghostFade : 1.0f;
             }
@@ -927,6 +952,8 @@ namespace
     bool unclampAllowed() noexcept
     {
         std::unordered_set<std::string> filled;
+        // the player may take the weapon in any state: no magazine is their own business
+        return true;
         for (const auto omod : g_mods) {
             if (const auto* info = partInfo(omod)) {
                 filled.insert(info->slot);
@@ -1756,8 +1783,10 @@ namespace
     void AddGhost(std::monostate, RE::TESObjectREFR* ghost, Mod* mod)
     {
         if (!ghost || !mod) {
+            logNote("AddGhost: no reference or mod");
             return;
         }
+        logNote("AddGhost " + std::to_string(ghost->GetFormID()) + " for mod " + std::to_string(mod->GetFormID()));
         std::scoped_lock guard(g_shared.lock);
         g_shared.newGhosts.emplace_back(ghost->GetFormID(), mod->GetFormID());
     }
