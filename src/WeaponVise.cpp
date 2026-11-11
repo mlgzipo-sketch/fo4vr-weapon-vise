@@ -778,7 +778,7 @@ namespace
                 return;
             }
             for (auto& property : geometry->GetRuntimeData().properties) {
-                auto* shader = RE::netimmerse_cast<RE::BSLightingShaderProperty*>(property.get());
+                auto* shader = ::netimmerse_cast<RE::BSLightingShaderProperty*>(property.get());
                 if (!shader) {
                     continue;
                 }
