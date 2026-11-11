@@ -29,15 +29,34 @@ IDS = {'MRF_Mag10mm': 0x800, 'MRF_Mag10mmLarge': 0x801, 'MRF_SndIn': 0x802, 'MRF
        'MRF_SndSlideBack': 0x804, 'MRF_SndSlideHome': 0x805, 'MRF_SndPutAway': 0x806,
        'MRF_Mags': 0x807, 'MRF_Sounds': 0x808, 'MRF_Quest': 0x809,
        'MRF_DescIn': 0x80A, 'MRF_DescOut': 0x80B, 'MRF_DescSlideBack': 0x80C, 'MRF_DescSlideHome': 0x80D,
-       'MRF_Round': 0x80E}
+       'MRF_Round': 0x80E,
+       'MRF_MagARStraight': 0x80F, 'MRF_MagARDrum': 0x810, 'MRF_MagCombatRifle': 0x811, 'MRF_MagCombatRifleLarge': 0x812,
+       'MRF_MagSMG': 0x813, 'MRF_MagSMGDrum': 0x814, 'MRF_MagDeliverer': 0x815, 'MRF_MagDelivererLarge': 0x816,
+       'MRF_MagPipeShort': 0x817, 'MRF_MagPipe': 0x818, 'MRF_MagPipeDrum': 0x819,
+       'MRF_MagCombatShotgunSmall': 0x81A, 'MRF_MagCombatShotgun': 0x81B, 'MRF_MagCombatShotgunDrum': 0x81C}
 recs = {}
 def add(tag, edid, subs):
     fid = OWN | IDS[edid]
     recs.setdefault(tag, []).append(record(tag, fid, [sub('EDID', zstr(edid))] + subs))
     return fid
 
+# The order is the magazine kind the plugin sends (kMagModels in ManualReload.cpp); never reorder, add at the end.
 MODELS = [('10mm', 'Weapons\\10mmPistol\\10mmMag01.nif', '10mm Magazine'),
-          ('10mmLarge', 'Weapons\\10mmPistol\\10mmMagLarge.nif', '10mm Large Magazine')]
+          ('10mmLarge', 'Weapons\\10mmPistol\\10mmMagLarge.nif', '10mm Large Magazine'),
+          ('ARStraight', 'Weapons\\MachineGun\\MGMagStraight.nif', 'Assault Rifle Magazine'),
+          ('ARDrum', 'Weapons\\MachineGun\\MGMagDrum.nif', 'Assault Rifle Drum Magazine'),
+          ('CombatRifle', 'Weapons\\CombatShotgun\\CombatRifleMagMedium.nif', 'Combat Rifle Magazine'),
+          ('CombatRifleLarge', 'Weapons\\CombatShotgun\\CombatRifleMagLarge.nif', 'Combat Rifle Large Magazine'),
+          ('SMG', 'Weapons\\CombatShotgun\\TGunDrumMagSmall.nif', 'Submachine Gun Magazine'),
+          ('SMGDrum', 'Weapons\\CombatShotgun\\TGunDrumMag.nif', 'Submachine Gun Drum Magazine'),
+          ('Deliverer', 'Weapons\\CovertSidearm\\CovertSidearmMagazine.nif', 'Deliverer Magazine'),
+          ('DelivererLarge', 'Weapons\\CovertSidearm\\CovertSidearmMagazineLarge.nif', 'Deliverer Large Magazine'),
+          ('PipeShort', 'Weapons\\HandMade\\Magazines\\45StraightMagShort.nif', 'Pipe Gun Magazine'),
+          ('Pipe', 'Weapons\\HandMade\\Magazines\\45StraightMag.nif', 'Pipe Gun Large Magazine'),
+          ('PipeDrum', 'weapons\\handmade\\magazines\\PipeRifleDrumMag.nif', 'Pipe Gun Drum Magazine'),
+          ('CombatShotgunSmall', 'Weapons\\CombatShotgun\\CombatShotgunSmallMag.nif', 'Combat Shotgun Magazine'),
+          ('CombatShotgun', 'Weapons\\CombatShotgun\\CombatShotgunMediumMag.nif', 'Combat Shotgun Large Magazine'),
+          ('CombatShotgunDrum', 'Weapons\\CombatShotgun\\DrumMag.nif', 'Combat Shotgun Drum Magazine')]
 mags = [add('MISC', 'MRF_Mag' + k, [sub('OBND', b'\0' * 12), sub('FULL', zstr(name)), sub('MODL', zstr(model)),
                                     sub('DATA', struct.pack('<If', 0, 0.0))]) for k, model, name in MODELS]
 

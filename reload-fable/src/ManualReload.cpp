@@ -25,6 +25,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -114,6 +115,7 @@ namespace
         float handRadius{ 16.0f };
         float looseLifetime{ 90.0f };
         int   maxLoose{ 6 };
+        bool  allGuns{ true };          // every gun with a magazine of group 1, not only the 10mm pistol
         bool  nativeSound{ true };      // sounds played by the plugin (the script's Sound objects are not heard)
         int   soundFlags{ 16 };
         bool  showRound{ true };        // a cartridge is seen in the chamber / on top of the magazine while the slide is open
@@ -149,7 +151,7 @@ namespace
             { "iHoldFlip", 1, &s.holdFlip }, { "fFingerCurl", 2, &s.fingerCurl }, { "fFreezeSeconds", 2, &s.freezeSeconds },
             { "fSlideGrabRadius", 2, &s.slideGrabRadius }, { "fRackTravel", 2, &s.rackTravel }, { "fSlideLockAt", 2, &s.slideLockAt },
             { "fHandRadius", 2, &s.handRadius }, { "fLooseLifetime", 2, &s.looseLifetime }, { "iMaxLoose", 1, &s.maxLoose },
-            { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
+            { "bAllGuns", 0, &s.allGuns }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
             { "fChamberForward", 2, &s.chamberForward }, { "fRoundUp", 2, &s.roundUp }, { "fRoundRotX", 2, &s.roundRotX },
             { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale },
         };
@@ -342,6 +344,51 @@ namespace
             }
         }
         return total;
+    }
+
+    // The magazine the equipped gun wears: its magazine mod's model, looked up in kMagModels (-1: none of ours).
+    int magazineKindOf(RE::PlayerCharacter* player, const RE::TESForm* weapon, std::string& model) noexcept
+    {
+        auto* list = player ? player->inventoryList : nullptr;
+        if (!weapon || !list || !readable(list, sizeof(RE::BGSInventoryList))) {
+            return -1;
+        }
+        for (auto& item : list->data) {
+            if (item.object != weapon) {
+                continue;
+            }
+            for (auto* stack = item.stackData.get(); stack; stack = stack->nextStack.get()) {
+                if (!stack->IsEquipped()) {
+                    continue;
+                }
+                auto* extra = stack->extra.get();
+                auto* instance = extra ? static_cast<RE::BGSObjectInstanceExtra*>(extra->GetByType(RE::EXTRA_DATA_TYPE::kObjectInstance)) : nullptr;
+                if (!instance || !instance->values) {
+                    continue;
+                }
+                for (const auto& entry : instance->GetIndexData()) {
+                    auto* form = RE::TESForm::GetFormByID(entry.objectID);
+                    if (!form || form->GetFormType() != RE::ENUM_FORM_ID::kOMOD) {
+                        continue;
+                    }
+                    auto* mod = static_cast<RE::BGSMod::Attachment::Mod*>(form);
+                    const char* path = static_cast<RE::TESModel&>(static_cast<RE::BGSModelMaterialSwap&>(*mod)).GetModel();
+                    if (!path || !*path) {
+                        continue;
+                    }
+                    std::string name = path;
+                    for (auto& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    if (name.rfind("meshes\\", 0) == 0) name = name.substr(7);
+                    for (std::size_t i = 0; i < kMagModels.size(); ++i) {
+                        if (name == kMagModels[i]) {
+                            model = path;
+                            return static_cast<int>(i);
+                        }
+                    }
+                }
+            }
+        }
+        return -1;
     }
 
     std::uint32_t capacityOf(const Gun& gun) noexcept
@@ -1092,6 +1139,20 @@ namespace
     // ------------------------------------------------------------ state
 
     constexpr std::uint32_t k10mmPistol = 0x00004822;   // Fallout4.esm
+
+    // Guns with a detachable magazine and a slide / bolt / charging handle (group 1). A gun is handled when the
+    // magazine mod it wears has one of these models; the index is the magazine's kind (MRF_Mags order in the ESP).
+    constexpr std::array<const char*, 16> kMagModels{
+        "weapons\\10mmpistol\\10mmmag01.nif", "weapons\\10mmpistol\\10mmmaglarge.nif",
+        "weapons\\machinegun\\mgmagstraight.nif", "weapons\\machinegun\\mgmagdrum.nif",
+        "weapons\\combatshotgun\\combatriflemagmedium.nif", "weapons\\combatshotgun\\combatriflemaglarge.nif",
+        "weapons\\combatshotgun\\tgundrummagsmall.nif", "weapons\\combatshotgun\\tgundrummag.nif",
+        "weapons\\covertsidearm\\covertsidearmmagazine.nif", "weapons\\covertsidearm\\covertsidearmmagazinelarge.nif",
+        "weapons\\handmade\\magazines\\45straightmagshort.nif", "weapons\\handmade\\magazines\\45straightmag.nif",
+        "weapons\\handmade\\magazines\\piperifledrummag.nif",
+        "weapons\\combatshotgun\\combatshotgunsmallmag.nif", "weapons\\combatshotgun\\combatshotgunmediummag.nif",
+        "weapons\\combatshotgun\\drummag.nif",
+    };
     constexpr float kGravity = 686.0f;                   // game units per second squared
 
     enum Place : int
@@ -1133,6 +1194,7 @@ namespace
         std::uint32_t      lastAmmo{ 0xFFFFFFFF };
         std::uint32_t      lastGunState{ 0xFFFFFFFF };
         bool               chamber{ false };
+        bool               hasBolt{ true };               // the model has a WeaponBolt node
         int                kind{ 0 };
         bool               dumped{ false };
         Clock::time_point  equippedAt{};
@@ -1681,6 +1743,11 @@ namespace
         if (g_settings.regripAfterSeat) {
             griphook::setOwned(false);   // the grip is seen again: the hand may take the pistol now
         }
+        if (!st.chamber && !st.hasBolt && st.rounds > 0) {
+            st.rounds -= 1;   // no slide / bolt found on this model: the magazine feeds the chamber by itself
+            st.chamber = true;
+            syncAmmo(gun);
+        }
         if (!st.chamber) {
             hud(st.rounds > 0 ? "Магазин вставлен. Патронник пуст: передёрни затвор" : "Магазин пустой");
         }
@@ -1996,14 +2063,17 @@ namespace
             st.weapon = gun.weapon;
             dropRound();
             g_round.modelReady = false;
-            st.managed = gun.weapon && gun.data && gun.weapon->GetFormID() == k10mmPistol;
+            std::string magModel;
+            const int kind = gun.weapon && gun.data ? magazineKindOf(player, gun.weapon, magModel) : -1;
+            const bool pistol10 = gun.weapon && gun.data && gun.weapon->GetFormID() == k10mmPistol;
+            st.managed = gun.weapon && gun.data && (pistol10 || (kind >= 0 && g_settings.allGuns));
             st.equippedAt = now;
             const auto total = gun.data ? gun.data->ammoCount : 0u;
             st.chamber = total > 0;
             st.rounds = total > 0 ? total - 1 : 0;
-            st.kind = capacityOf(gun) > 12 ? 1 : 0;
-            note("Equipped weapon %08X, capacity %u, rounds %u: %s", gun.weapon ? gun.weapon->GetFormID() : 0u, capacityOf(gun), total,
-                st.managed ? "reloaded by hand" : "not handled (only the 10mm pistol for now)");
+            st.kind = kind >= 0 ? kind : (capacityOf(gun) > 12 ? 1 : 0);
+            note("Equipped weapon %08X, capacity %u, rounds %u, magazine '%s' (kind %d): %s", gun.weapon ? gun.weapon->GetFormID() : 0u,
+                capacityOf(gun), total, magModel.c_str(), kind, st.managed ? "reloaded by hand" : "not handled (no magazine of group 1)");
         }
 
         auto* root = st.managed ? weaponRoot(player) : nullptr;
@@ -2045,6 +2115,10 @@ namespace
         }
         auto* magazine = parts[0];
         auto* bolt = parts[1];
+        if (st.hasBolt != looksLikeObject(bolt)) {
+            st.hasBolt = looksLikeObject(bolt);
+            note("Slide / bolt node: %s", st.hasBolt ? "found" : "none (rounds are chambered by the magazine)");
+        }
         // an empty gun: the game would play its own reload by itself; the parts stay put (the slide stays open)
         const bool frozen = g_settings.blockReload && (gunState == reloading || now < st.freezeUntil || pressed || st.slideLocked || st.lastAmmo == 0);
         const bool quiet = !frozen && st.place == kSeated && st.s <= 0.0f && gunState == static_cast<std::uint32_t>(g_settings.idleGunState) &&
