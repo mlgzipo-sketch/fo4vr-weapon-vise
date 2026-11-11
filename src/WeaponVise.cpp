@@ -499,6 +499,8 @@ namespace
     RE::NiPoint3 g_clampPoint{};      // where the last clamp asked the weapon to go
     Clock::time_point g_clampAt{};
     bool g_missing3DLogged{ false };
+    bool g_missing3DForgot{ false };
+    Clock::time_point g_missing3DAt{};
     bool g_clampFeedback{ false };   // a weapon was just clamped: buzz and click once
 
     struct LoosePart
@@ -1405,6 +1407,8 @@ namespace
                     g_slotPlaces.clear();
                     g_slotFrames.clear();
                     g_requiredAtClamp.clear();
+                    g_missing3DLogged = false;
+                    g_missing3DForgot = false;
                     g_weaponWorldSet = false;
                     g_weaponHeldBy = -1;
                     for (const auto omod : g_shared.mods) {
@@ -1545,15 +1549,98 @@ namespace
         }
     }
 
+    // Where a slot sits on each kind of weapon, remembered across clamps and game restarts:
+    // a weapon clamped with its grip or magazine already off still takes them back.
+    std::unordered_map<std::string, RE::NiTransform> g_slotMemory;
+    bool g_slotMemoryLoaded{ false };
+    constexpr const char* kSlotFile = "Data/F4SE/Plugins/WeaponVise_slots.txt";
+
+    std::string slotKey(std::uint32_t base, const std::string& slot)
+    {
+        char text[16]{};
+        std::snprintf(text, sizeof(text), "%08X", base);
+        return std::string(text) + " " + slot;
+    }
+
+    void loadSlotMemory() noexcept
+    {
+        if (g_slotMemoryLoaded) {
+            return;
+        }
+        g_slotMemoryLoaded = true;
+        try {
+            std::ifstream file(kSlotFile);
+            std::string base, slot;
+            while (file >> base >> slot) {
+                RE::NiTransform t{};
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 3; ++c) {
+                        file >> t.rotate.entry[r][c];
+                    }
+                }
+                file >> t.translate.x >> t.translate.y >> t.translate.z;
+                t.scale = 1.0f;
+                if (!file) {
+                    break;
+                }
+                g_slotMemory[base + " " + slot] = t;
+            }
+        } catch (...) {
+        }
+    }
+
+    void saveSlotMemory() noexcept
+    {
+        try {
+            std::ofstream file(kSlotFile, std::ios::trunc);
+            for (const auto& [key, t] : g_slotMemory) {
+                file << key;
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 3; ++c) {
+                        file << ' ' << t.rotate.entry[r][c];
+                    }
+                }
+                file << ' ' << t.translate.x << ' ' << t.translate.y << ' ' << t.translate.z << '\n';
+            }
+        } catch (...) {
+        }
+    }
+
     void resolveSlots(RE::NiAVObject* root) noexcept
     {
+        loadSlotMemory();
+        auto* ref = lookupRef(g_weapon);
+        auto* base = ref ? ref->GetObjectReference() : nullptr;
+        const std::uint32_t baseId = base ? base->GetFormID() : 0;
+        bool changed = false;
         for (const auto& anchor : g_anchors) {
             const auto* info = partInfo(anchor.mod);
             if (!info) {
                 continue;
             }
             auto* point = attachPointOf(anchor.node);
-            g_slotFrames[info->slot] = relative(root->world, point->world);
+            const auto frame = relative(root->world, point->world);
+            g_slotFrames[info->slot] = frame;
+            if (baseId) {
+                auto& kept = g_slotMemory[slotKey(baseId, info->slot)];
+                if (distance(kept.translate, frame.translate) > 0.2f || kept.scale == 0.0f) {
+                    kept = frame;
+                    kept.scale = 1.0f;
+                    changed = true;
+                }
+            }
+        }
+        // slots of parts that are off this weapon now: from the same kind of weapon seen before
+        if (baseId) {
+            const auto prefix = slotKey(baseId, "");
+            for (const auto& [key, frame] : g_slotMemory) {
+                if (key.rfind(prefix, 0) == 0) {
+                    g_slotFrames.try_emplace(key.substr(prefix.size()), frame);
+                }
+            }
+        }
+        if (changed) {
+            saveSlotMemory();
         }
     }
 
@@ -1640,11 +1727,19 @@ namespace
         if (!looksLikeObject(root)) {
             if (!g_missing3DLogged) {
                 g_missing3DLogged = true;
+                g_missing3DAt = Clock::now();
                 logNote("Clamped weapon has no 3D yet");
+            } else if (!g_missing3DForgot && seconds(g_missing3DAt) > 3.0f) {
+                // gone from the world (in a backpack, another cell, an old save): let it go,
+                // or the vise would wait for it forever and nothing else would work
+                g_missing3DForgot = true;
+                logNote("Clamped weapon still has no 3D: the vise lets it go");
+                PendingCommand command; command.type = kUnclamp; command.mod = 3; pushCommand(command);
             }
             return;
         }
         g_missing3DLogged = false;
+        g_missing3DForgot = false;
         if (g_clampFeedback) {
             g_clampFeedback = false;
             buzz(0, 2000);

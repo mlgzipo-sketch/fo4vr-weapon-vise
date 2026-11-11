@@ -67,6 +67,9 @@ Event Actor.OnPlayerLoadGame(Actor akSender)
 	Setup()
 	WeaponVise.SetWorkbench(Bench)
 	PlaceFrame()
+	if Clamped && (Clamped.IsDeleted() || Clamped.GetContainer())
+		Clamped = None   ; the clamped weapon went into a backpack: the vise is free
+	endif
 	if Clamped
 		WeaponVise.SetWeapon(Clamped, Clamped.GetAllMods())
 	endif
@@ -262,8 +265,11 @@ Function Handle()
 		if cmd == CmdClamp
 			Clamp()
 		elseif cmd == CmdUnclamp
-			if WeaponVise.CommandFlag() == 2
+			int flag = WeaponVise.CommandFlag()
+			if flag == 2
 				ReleaseToHand()
+			elseif flag == 3
+				ForgetClamped()
 			else
 				Unclamp(true)
 			endif
@@ -592,6 +598,13 @@ Function ReleaseToHand()
 		WaitFor3D(ref)
 		ref.SetMotionType(1, true)
 	endif
+EndFunction
+
+; The clamped weapon is gone from the world (no 3D for a while): the vise lets it go, and it stays where it is.
+Function ForgetClamped()
+	Clamped = None
+	WeaponVise.SetWeapon(None, new ObjectMod[0])
+	ClearGhosts()
 EndFunction
 
 Function Unclamp(bool equip)
