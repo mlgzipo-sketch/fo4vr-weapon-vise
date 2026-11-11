@@ -91,6 +91,10 @@ Function Spawn(int kind, float[] pose, int token)
 		ManualReload.Notify(1)
 		return
 	endif
+	float[] fresh = ManualReload.FreshPose(token)
+	if fresh && fresh.Length == 6
+		pose = fresh
+	endif
 	mag.SetPosition(pose[0], pose[1], pose[2])
 	mag.SetAngle(pose[3], pose[4], pose[5])
 	mag.Enable()

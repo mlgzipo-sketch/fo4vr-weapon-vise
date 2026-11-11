@@ -944,6 +944,10 @@ namespace
         PendingCommand current;
         std::vector<NewMag> newMags;
         std::vector<std::pair<std::uint32_t, std::int32_t>> newGhosts;   // ref, kind
+        // a magazine for a hand is placed where that hand is when the script gets to it, not where it was
+        std::unordered_map<std::int32_t, int> tokenHand;
+        std::array<std::array<float, 6>, 2> freshPose{};
+        std::array<bool, 2> freshValid{};
     } g_shared;
 
     void pushCommand(const PendingCommand& command) noexcept
@@ -1066,6 +1070,10 @@ namespace
     {
         const auto token = g_nextToken++;
         g_pending[token] = Pending{ rounds, kind, fromBelt, rotation, hand };
+        if (hand >= 0) {
+            std::scoped_lock guard(g_shared.lock);
+            g_shared.tokenHand[token] = hand;
+        }
         const auto angles = anglesFor(rotation);
         PendingCommand command;
         command.type = kSpawn;
@@ -1134,6 +1142,17 @@ namespace
         return { g_shared.current.pose.begin(), g_shared.current.pose.end() };
     }
 
+    std::vector<float> FreshPose(std::monostate, std::int32_t token)
+    {
+        std::scoped_lock guard(g_shared.lock);
+        const auto it = g_shared.tokenHand.find(token);
+        if (it == g_shared.tokenHand.end() || it->second < 0 || it->second > 1 || !g_shared.freshValid[it->second]) {
+            return {};
+        }
+        const auto& pose = g_shared.freshPose[it->second];
+        return { pose.begin(), pose.end() };
+    }
+
     void AddMag(std::monostate, RE::TESObjectREFR* ref, std::int32_t token)
     {
         if (!ref) {
@@ -1171,6 +1190,7 @@ namespace
         vm->BindNativeMethod(kScript, "CommandToken", CommandToken, true);
         vm->BindNativeMethod(kScript, "CommandPose", CommandPose, true);
         vm->BindNativeMethod(kScript, "AddMag", AddMag, true);
+        vm->BindNativeMethod(kScript, "FreshPose", FreshPose, true);
         vm->BindNativeMethod(kScript, "AddGhost", AddGhost, true);
         vm->BindNativeMethod(kScript, "Notify", Notify, true);
         logNote("Papyrus functions of script ManualReload registered");
@@ -1210,6 +1230,10 @@ namespace
                     logNote(message);
                 }
                 g_pending.erase(it);
+            }
+            {
+                std::scoped_lock guard(g_shared.lock);
+                g_shared.tokenHand.erase(mag.token);
             }
             g_loose[mag.ref] = loose;
             char message[120]{};
@@ -1738,6 +1762,13 @@ namespace
         }
         const auto rounds = available < capacity ? available : capacity;
         spawnInHand(hand, rounds, true);
+        if (g_state.phase == kOut) {
+            // the gun's own (empty) magazine node stands in for it until the real one comes
+            g_state.phantomToken = g_nextToken - 1;
+            g_state.phantomHand = index;
+            g_state.phantomRounds = rounds;
+            g_state.phantomSince = Clock::now();
+        }
         buzz(index, 900);
     }
 
@@ -1925,6 +1956,29 @@ namespace
         takeScriptNews();
         readHand(0);
         readHand(1);
+        {
+            std::array<bool, 2> wanted{};
+            for (const auto& [token, pending] : g_pending) {
+                if (pending.hand == 0 || pending.hand == 1) {
+                    wanted[pending.hand] = true;
+                }
+            }
+            for (int i = 0; i < 2; ++i) {
+                std::array<float, 6> pose{};
+                bool valid = false;
+                if (wanted[i] && g_hands[i].valid) {
+                    const auto held = heldPose(g_hands[i]);
+                    const auto angles = anglesFor(held.rotate);
+                    pose = { held.translate.x, held.translate.y, held.translate.z, angles[0], angles[1], angles[2] };
+                    valid = true;
+                }
+                std::scoped_lock guard(g_shared.lock);
+                g_shared.freshValid[i] = valid;
+                if (valid) {
+                    g_shared.freshPose[i] = pose;
+                }
+            }
+        }
         const auto now = Clock::now();
         float dt = g_state.lastFrame == Clock::time_point{} ? 0.011f : std::chrono::duration<float>(now - g_state.lastFrame).count();
         g_state.lastFrame = now;
