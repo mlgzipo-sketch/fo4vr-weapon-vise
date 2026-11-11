@@ -28,7 +28,8 @@ def group(tag, records):
 IDS = {'MRF_Mag10mm': 0x800, 'MRF_Mag10mmLarge': 0x801, 'MRF_SndIn': 0x802, 'MRF_SndOut': 0x803,
        'MRF_SndSlideBack': 0x804, 'MRF_SndSlideHome': 0x805, 'MRF_SndPutAway': 0x806,
        'MRF_Mags': 0x807, 'MRF_Sounds': 0x808, 'MRF_Quest': 0x809,
-       'MRF_DescIn': 0x80A, 'MRF_DescOut': 0x80B, 'MRF_DescSlideBack': 0x80C, 'MRF_DescSlideHome': 0x80D}
+       'MRF_DescIn': 0x80A, 'MRF_DescOut': 0x80B, 'MRF_DescSlideBack': 0x80C, 'MRF_DescSlideHome': 0x80D,
+       'MRF_Round': 0x80E}
 recs = {}
 def add(tag, edid, subs):
     fid = OWN | IDS[edid]
@@ -56,6 +57,9 @@ SOUNDS = [('MRF_SndIn', sndr('MRF_DescIn', 'MagIn')), ('MRF_SndOut', sndr('MRF_D
           ('MRF_SndSlideHome', sndr('MRF_DescSlideHome', 'BoltClose')), ('MRF_SndPutAway', 0x0196B0)]
 sounds = [add('SOUN', e, [sub('OBND', b'\0' * 12), sub('SDSC', struct.pack('<I', s))]) for e, s in SOUNDS]
 
+# The round drawn in the chamber / on the magazine: the plugin sets its model from the gun's ammo before making it.
+round_stat = add('STAT', 'MRF_Round', [sub('OBND', b'\0' * 12), sub('MODL', zstr('Weapons\\10mmPistol\\10mmMag01.nif'))])
+
 def flst(edid, forms):
     return add('FLST', edid, [sub('LNAM', struct.pack('<I', f)) for f in forms])
 flst_mags = flst('MRF_Mags', mags)
@@ -63,14 +67,14 @@ flst_sounds = flst('MRF_Sounds', sounds)
 
 def wstr(s): b = s.encode('latin1'); return struct.pack('<H', len(b)) + b
 def prop_obj(name, formid): return wstr(name) + bytes([1, 1]) + struct.pack('<HhI', 0, -1, formid)
-props = {'MRF_Mags': flst_mags, 'MRF_Sounds': flst_sounds}
+props = {'MRF_Mags': flst_mags, 'MRF_Sounds': flst_sounds, 'MRF_Round': round_stat}
 vmad = struct.pack('<hhH', 6, 2, 1) + wstr('ManualReloadFMain') + b'\0' + struct.pack('<H', len(props))
 vmad += b''.join(prop_obj(k, v) for k, v in props.items())
 add('QUST', 'MRF_Quest', [sub('VMAD', vmad), sub('FULL', zstr('Manual Reload F')),
                           sub('DNAM', bytes.fromhex('110000000000000000000000')), sub('NEXT', b''),
                           sub('ANAM', struct.pack('<I', 0))])
 
-ORDER = ['SNDR', 'SOUN', 'MISC', 'QUST', 'FLST']
+ORDER = ['SNDR', 'SOUN', 'STAT', 'MISC', 'QUST', 'FLST']
 nrec = sum(len(recs[t]) for t in ORDER)
 tes4 = record('TES4', 0, [sub('HEDR', struct.pack('<fII', 1.0, nrec, max(IDS.values()) + 1)), sub('CNAM', zstr('Aleshon')),
                           sub('SNAM', zstr('Manual Reload F: reload guns by hand in VR.')),

@@ -4,10 +4,13 @@ this script only turns a dropped magazine into a real object, removes old ones a
 
 FormList Property MRF_Mags Auto Const      ; magazine items by kind: 0 standard, 1 large
 FormList Property MRF_Sounds Auto Const    ; 0 magazine in, 1 magazine out, 2 slide back, 3 slide home, 4 put away
+Static Property MRF_Round Auto Const       ; the cartridge drawn in the chamber / on the magazine (model set by the plugin)
 
 int Property CmdSpawn = 1 AutoReadOnly
 int Property CmdDelete = 2 AutoReadOnly
 int Property CmdSound = 3 AutoReadOnly
+int Property CmdRound = 4 AutoReadOnly
+int Property RoundToken = -7 AutoReadOnly
 int Property TimerPoll = 1 AutoReadOnly
 
 bool Busy
@@ -51,6 +54,8 @@ Function Handle()
 			endif
 		elseif cmd == CmdSound
 			PlaySound(ManualReloadF.CommandKind())
+		elseif cmd == CmdRound
+			MakeRound()
 		endif
 		n += 1
 		cmd = ManualReloadF.PollCommand()
@@ -85,6 +90,20 @@ Function Spawn(int kind, float[] pose, int token)
 	endif
 	mag.SetMotionType(1, true)   ; a normal physical object: it lies on the ground, ROCK can hold it
 	ManualReloadF.AddMag(mag, token)
+EndFunction
+
+; The round seen through the open slide: the plugin moves its 3D, the object only has to exist.
+Function MakeRound()
+	if !MRF_Round
+		ManualReloadF.Notify(2)
+		return
+	endif
+	ObjectReference r = Game.GetPlayer().PlaceAtMe(MRF_Round, 1, true, false, false)
+	if r
+		ManualReloadF.AddMag(r, RoundToken)
+	else
+		ManualReloadF.Notify(3)
+	endif
 EndFunction
 
 ; A magazine put away over the shoulder through ROCK lands in the inventory as an item. Its rounds are

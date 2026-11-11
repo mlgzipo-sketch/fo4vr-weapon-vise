@@ -114,6 +114,16 @@ namespace
         float handRadius{ 16.0f };
         float looseLifetime{ 90.0f };
         int   maxLoose{ 6 };
+        bool  showRound{ true };        // a cartridge is seen in the chamber / on top of the magazine while the slide is open
+        float roundOpenAt{ 0.3f };      // ..once the slide is back this part of its travel
+        float chamberUp{ 0.9f };        // the chambered round: from the magazine's top this much up..
+        float chamberForward{ 0.9f };   // ..and this much forward (gun units)
+        float roundUp{ 0.0f };          // the top round of the magazine: moved this much up from the magazine's top
+        float roundRotX{ 0.0f };        // turns of the round model in the gun's frame (degrees)
+        float roundRotY{ 0.0f };
+        float roundRotZ{ 0.0f };
+        float roundScale{ 1.0f };
+        std::string roundModel;         // the model of the drawn round (empty: the gun's ammo casing)
     };
     Settings g_settings;
 
@@ -137,6 +147,9 @@ namespace
             { "iHoldFlip", 1, &s.holdFlip }, { "fFingerCurl", 2, &s.fingerCurl }, { "fFreezeSeconds", 2, &s.freezeSeconds },
             { "fSlideGrabRadius", 2, &s.slideGrabRadius }, { "fRackTravel", 2, &s.rackTravel }, { "fSlideLockAt", 2, &s.slideLockAt },
             { "fHandRadius", 2, &s.handRadius }, { "fLooseLifetime", 2, &s.looseLifetime }, { "iMaxLoose", 1, &s.maxLoose },
+            { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
+            { "fChamberForward", 2, &s.chamberForward }, { "fRoundUp", 2, &s.roundUp }, { "fRoundRotX", 2, &s.roundRotX },
+            { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale },
         };
         try {
             std::ifstream file("Data/F4SE/Plugins/ManualReloadF.ini");
@@ -151,6 +164,13 @@ namespace
                     key.pop_back();
                 }
                 const float value = std::strtof(line.c_str() + equals + 1, nullptr);
+                if (key == "sRoundModel") {
+                    auto text = line.substr(equals + 1);
+                    const auto first = text.find_first_not_of(" \t");
+                    const auto last = text.find_last_not_of(" \t\r");
+                    s.roundModel = first == std::string::npos ? std::string{} : text.substr(first, last - first + 1);
+                    continue;
+                }
                 for (const auto& entry : entries) {
                     if (key == entry.key) {
                         if (entry.type == 0) *static_cast<bool*>(entry.value) = value != 0.0f;
@@ -910,6 +930,7 @@ namespace
         kSpawn = 1,    // kind, pose, token: a magazine as a physical object
         kDelete = 2,   // ref
         kSound = 3,    // kind = sound index: 0 magazine in, 1 magazine out, 2 slide back, 3 slide home, 4 put away
+        kRound = 4,    // the drawn cartridge (a static object; the script answers with AddMag(ref, kRoundToken))
     };
 
     struct PendingCommand
@@ -1347,6 +1368,168 @@ namespace
         g_loose.erase(ref);
     }
 
+    // ------------------------------------------------------------ the round seen through the open slide
+    // A static object of this plugin (MRF_Round) whose model is set from the gun's ammo (its casing) before it is
+    // made. The plugin draws its 3D every frame: in the chamber while one is loaded, else on top of the magazine
+    // while it has rounds, and hidden when the slide is closed or there is nothing to see.
+    constexpr std::int32_t kRoundToken = -7;
+    constexpr RE::TESFormID kRoundForm = 0x80E;
+
+    struct RoundState
+    {
+        std::uint32_t      ref{ 0 };
+        bool               asked{ false };
+        Clock::time_point  askedAt{};
+        Clock::time_point  missingSince{};
+        bool               missing{ false };
+        RE::TESAmmo*       modelFor{ nullptr };
+        bool               modelReady{ false };
+        bool               logged{ false };
+    };
+    RoundState g_round;
+
+    void hideRound() noexcept
+    {
+        if (g_round.ref) {
+            if (auto* ref = lookupRef(g_round.ref); ref && looksLikeObject(ref->Get3D())) {
+                setCulled(ref->Get3D(), true);
+            }
+        }
+    }
+
+    void takeRound(std::uint32_t ref) noexcept
+    {
+        if (g_round.ref && g_round.ref != ref) {
+            PendingCommand command;
+            command.type = kDelete;
+            command.ref = g_round.ref;
+            pushCommand(command);
+        }
+        g_round.ref = ref;
+        g_round.asked = false;
+        g_round.missing = false;
+        note("Round: object %08X is here", ref);
+    }
+
+    void dropRound() noexcept
+    {
+        if (g_round.ref) {
+            PendingCommand command;
+            command.type = kDelete;
+            command.ref = g_round.ref;
+            pushCommand(command);
+        }
+        g_round.ref = 0;
+        g_round.asked = false;
+    }
+
+    // The model of the drawn round: sRoundModel, else the casing of the gun's ammo, else its world model.
+    bool prepareRoundModel(const Gun& gun) noexcept
+    {
+        auto* ammo = gun.instance && readable(gun.instance, sizeof(RE::TESObjectWEAP::InstanceData)) ? gun.instance->ammo : nullptr;
+        if (g_round.modelReady && g_round.modelFor == ammo) {
+            return true;
+        }
+        g_round.modelFor = ammo;
+        g_round.modelReady = false;
+        auto* data = RE::TESDataHandler::GetSingleton();
+        auto* form = data ? data->LookupForm(kRoundForm, "ManualReloadF.esp") : nullptr;
+        auto* stat = form ? form->As<RE::TESObjectSTAT>() : nullptr;
+        if (!stat) {
+            note("Round: MRF_Round (%03X) was not found in ManualReloadF.esp", kRoundForm);
+            return false;
+        }
+        std::string casing;
+        std::string world;
+        if (ammo && readable(ammo, sizeof(RE::TESAmmo))) {
+            if (const char* m = ammo->shellCasing.GetModel(); m && *m) casing = m;
+            if (const char* m = static_cast<RE::TESModel&>(static_cast<RE::BGSModelMaterialSwap&>(*ammo)).GetModel(); m && *m) world = m;
+        }
+        std::string model = !g_settings.roundModel.empty() ? g_settings.roundModel : !casing.empty() ? casing : world;
+        note("Round: ammo %08X casing '%s', world model '%s' -> using '%s'", ammo ? ammo->GetFormID() : 0u, casing.c_str(), world.c_str(), model.c_str());
+        if (model.empty()) {
+            return false;
+        }
+        static_cast<RE::TESModel&>(static_cast<RE::BGSModelMaterialSwap&>(*stat)).SetModel(model.c_str());
+        g_round.modelReady = true;
+        if (g_round.ref) {
+            dropRound();   // made with another model: make it again
+        }
+        return true;
+    }
+
+    void drawRound(const Gun& gun, RE::NiAVObject* root) noexcept
+    {
+        auto& st = g_state;
+        if (!g_settings.showRound || !looksLikeObject(root) || !st.railKnown) {
+            if (g_round.ref) {
+                if (auto* ref = lookupRef(g_round.ref); ref && looksLikeObject(ref->Get3D())) {
+                    setCulled(ref->Get3D(), true);
+                }
+            }
+            return;
+        }
+        const bool open = st.slideLocked || st.rackPull >= g_settings.rackTravel * std::clamp(g_settings.roundOpenAt, 0.05f, 1.0f);
+        const bool inChamber = st.chamber && !st.rackCycled;
+        const bool onMagazine = !inChamber && st.place == kSeated && st.rounds > 0;
+        const bool visible = open && (inChamber || onMagazine);
+
+        if (!g_round.ref) {
+            const auto now = Clock::now();
+            if (!g_round.asked || now - g_round.askedAt > std::chrono::seconds(5)) {
+                if (prepareRoundModel(gun)) {
+                    PendingCommand command;
+                    command.type = kRound;
+                    pushCommand(command);
+                    g_round.asked = true;
+                    g_round.askedAt = now;
+                }
+            }
+            return;
+        }
+        auto* ref = lookupRef(g_round.ref);
+        auto* model = ref ? ref->Get3D() : nullptr;
+        if (!looksLikeObject(model)) {
+            const auto now = Clock::now();
+            if (!g_round.missing) {
+                g_round.missing = true;
+                g_round.missingSince = now;
+            } else if (now - g_round.missingSince > std::chrono::seconds(3)) {
+                note("Round: object %08X has no 3D, made again", g_round.ref);
+                dropRound();
+                g_round.missing = false;
+            }
+            return;
+        }
+        g_round.missing = false;
+        if (!visible) {
+            setCulled(model, true);
+            return;
+        }
+        // the magazine's top in the gun's frame, then up / forward to the chamber
+        const float scale = gunScale(root);
+        auto top = compose(root->world, st.magRest);
+        const auto up = axisOf(top, 2);
+        RE::NiPoint3 at = top.translate + up * ((st.topAt + g_settings.roundUp) * top.scale);
+        if (inChamber) {
+            at += axisOf(root->world, 2) * (g_settings.chamberUp * scale) + axisOf(root->world, 1) * (g_settings.chamberForward * scale);
+        }
+        const float d = 0.01745329f;
+        Mat turn = axisRotation(0, g_settings.roundRotX * d);
+        turn = mul(turn, axisRotation(1, g_settings.roundRotY * d));
+        turn = mul(turn, axisRotation(2, g_settings.roundRotZ * d));
+        RE::NiTransform pose = identityTransform();
+        pose.rotate = fromMat(mul(turn, toMat(root->world.rotate)));
+        pose.translate = at;
+        pose.scale = scale * (g_settings.roundScale > 0.0f ? g_settings.roundScale : 1.0f);
+        setCulled(model, false);
+        placeNode(model, pose);
+        if (!g_round.logged) {
+            g_round.logged = true;
+            note("Round: drawn %s, bound radius %.2f", inChamber ? "in the chamber" : "on the magazine", model->worldBound.fRadius);
+        }
+    }
+
     void takeScriptNews() noexcept
     {
         std::vector<NewMag> mags;
@@ -1355,6 +1538,10 @@ namespace
             mags.swap(g_shared.newMags);
         }
         for (const auto& mag : mags) {
+            if (mag.token == kRoundToken) {
+                takeRound(mag.ref);
+                continue;
+            }
             Loose loose;
             loose.born = Clock::now();
             if (const auto it = g_pending.find(mag.token); it != g_pending.end()) {
@@ -1768,6 +1955,8 @@ namespace
             st = State{};
             st.lastFrame = now;
             st.weapon = gun.weapon;
+            dropRound();
+            g_round.modelReady = false;
             st.managed = gun.weapon && gun.data && gun.weapon->GetFormID() == k10mmPistol;
             st.equippedAt = now;
             const auto total = gun.data ? gun.data->ammoCount : 0u;
@@ -1787,6 +1976,7 @@ namespace
                 griphook::setArmed(false);
             }
             looseMagazines(nullptr, nullptr);
+            hideRound();
             return;
         }
 
@@ -2110,6 +2300,7 @@ namespace
             refreshSubtree(bolt, RE::NiPoint3{});
         }
         rackByHand(gun, root, bolt, dt);
+        drawRound(gun, root);
 
         // the free hand stays on what it holds: the magazine in the well, or the slide
         if (st.racking && looksLikeObject(bolt) && free.valid) {
