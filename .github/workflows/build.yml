@@ -4,6 +4,9 @@ on:
   push:
     branches-ignore:
       - 'dist/**'
+    paths-ignore:
+      - 'rig/**'
+      - '.github/workflows/rig.yml'
   pull_request:
   workflow_dispatch:
 

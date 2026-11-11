@@ -1,0 +1,36 @@
+Scriptname ObjectReference extends Form Native
+Function AddItem(Form akItemToAdd, int aiCount = 1, bool abSilent = false) native
+bool Function AttachMod(ObjectMod akMod, int aiAttachIndex = 0) native
+Function Delete() native
+Function Disable(bool abFadeOut = false) native
+ObjectReference Function DropObject(Form akObject, int aiCount = 1) native
+Function Enable(bool abFadeIn = false) native
+ObjectReference[] Function FindAllReferencesWithKeyword(Form akKeywordOrList, float afRadius) native
+ObjectReference[] Function FindAllReferencesOfType(Form arObjectOrList, float afRadius) native
+float Function GetDistance(ObjectReference akOther) native
+int Function GetItemCount(Form akItem = None) native
+ObjectReference Function GetContainer() native
+Cell Function GetParentCell() native
+bool Function Is3DLoaded() native
+bool Function IsDeleted() native
+ObjectReference Function PlaceAtMe(Form akFormToPlace, int aiCount = 1, bool abForcePersist = false, bool abInitiallyDisabled = false, bool abDeleteWhenAble = true) native
+Function MoveTo(ObjectReference akTarget, float afXOffset = 0.0, float afYOffset = 0.0, float afZOffset = 0.0, bool abMatchRotation = true) native
+Function RemoveAllItems(ObjectReference akTransferTo = None, bool abKeepOwnership = false) native
+Function RemoveItem(Form akItemToRemove, int aiCount = 1, bool abSilent = false, ObjectReference akOtherContainer = None) native
+Function RemoveMod(ObjectMod akMod) native
+Function SetAngle(float afXAngle, float afYAngle, float afZAngle) native
+Function SetMotionType(int aeMotionType, bool abAllowActivate = true) native
+Function SetPosition(float afX, float afY, float afZ) native
+ObjectMod[] Function GetAllMods() native
+Event OnItemAdded(Form akBaseItem, int aiItemCount, ObjectReference akItemReference, ObjectReference akSourceContainer)
+EndEvent
+float Function GetPositionX() native
+float Function GetPositionY() native
+float Function GetPositionZ() native
+bool Function IsDisabled() native
+Form Function GetBaseObject() native
+Event OnItemRemoved(Form akBaseItem, int aiItemCount, ObjectReference akItemReference, ObjectReference akDestContainer)
+EndEvent
+float Function GetAngleZ() native
+Event OnContainerChanged(ObjectReference akNewContainer, ObjectReference akOldContainer)
+EndEvent
