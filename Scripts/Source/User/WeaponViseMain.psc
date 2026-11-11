@@ -8,12 +8,19 @@ FormList Property WV_Mods Auto Const          ; mods that are physical parts
 FormList Property WV_PartItems Auto Const     ; the part item of each mod (same order)
 FormList Property WV_Weapons Auto Const       ; weapons that can be clamped
 FormList Property WV_LooseMods Auto Const     ; the game's loose mod item of each mod (same order)
+FormList Property WV_Ghosts Auto Const        ; outline model of each mod's part (same order)
+FormList Property WV_Sounds Auto Const        ; focus, focus red, snap, pick up
+EffectShader Property OutlineAttach Auto Const
+EffectShader Property OutlineRemove Auto Const
 
 int Property CmdClamp = 1 AutoReadOnly
 int Property CmdUnclamp = 2 AutoReadOnly
 int Property CmdRemove = 3 AutoReadOnly
 int Property CmdAttach = 4 AutoReadOnly
 int Property CmdDrop = 5 AutoReadOnly
+int Property CmdMove = 6 AutoReadOnly
+int Property CmdGhost = 7 AutoReadOnly
+int Property CmdSound = 8 AutoReadOnly
 int Property TimerScan = 1 AutoReadOnly
 int Property TimerFast = 2 AutoReadOnly
 int Property MaxParts = 120 AutoReadOnly
@@ -26,6 +33,9 @@ ObjectMod[] PartMods
 bool FastRunning
 bool Busy
 int SkipPartPickups   ; part items we put into the inventory ourselves (attaching)
+ObjectReference[] Ghosts
+ObjectMod[] GhostMods
+int[] GhostColors      ; 0 none, 1 remove (red), 2 attach (green)
 
 Event OnInit()
 	Setup()
@@ -61,6 +71,7 @@ Event Actor.OnPlayerLoadGame(Actor akSender)
 		WeaponVise.AddPart(Parts[i], PartMods[i], false)
 		i += 1
 	endwhile
+	ClearGhosts()
 EndEvent
 
 ; A part picked up (by hand or by activating it) becomes the game's loose mod,
@@ -202,6 +213,12 @@ Function Handle()
 			AttachPart(WeaponVise.CommandPart(), WeaponVise.CommandMod())
 		elseif cmd == CmdDrop
 			DropPart(WeaponVise.CommandPart())
+		elseif cmd == CmdMove
+			MoveWeapon()
+		elseif cmd == CmdGhost
+			ShowGhost(WeaponVise.CommandMod(), WeaponVise.CommandPose()[0] as int)
+		elseif cmd == CmdSound
+			PlaySound(WeaponVise.CommandPose()[0] as int)
 		endif
 		cmd = WeaponVise.PollCommand()
 	endwhile
@@ -345,6 +362,82 @@ Function Reload3D()
 	WeaponVise.SetWeapon(Clamped, Clamped.GetAllMods())
 EndFunction
 
+; The weapon was moved by hand inside the vise area: keep the reference there too.
+Function MoveWeapon()
+	if Clamped
+		float[] pose = WeaponVise.CommandPose()
+		Clamped.SetAngle(0.0, 0.0, pose[3])
+		Clamped.SetPosition(pose[0], pose[1], pose[2])
+	endif
+EndFunction
+
+Function PlaySound(int index)
+	if index >= 0 && index < WV_Sounds.GetSize()
+		Sound s = WV_Sounds.GetAt(index) as Sound
+		if s
+			s.Play(Game.GetPlayer())
+		endif
+	endif
+EndFunction
+
+; Outlines: one ghost model per mod, made on first use; the plugin places and hides it.
+Function ShowGhost(ObjectMod m, int color)
+	if !Ghosts
+		Ghosts = new ObjectReference[0]
+		GhostMods = new ObjectMod[0]
+		GhostColors = new int[0]
+	endif
+	int k = GhostMods.Find(m)
+	if k < 0
+		if color == 0
+			return
+		endif
+		int i = WV_Mods.Find(m)
+		if i < 0
+			return
+		endif
+		ObjectReference ghost = Game.GetPlayer().PlaceAtMe(WV_Ghosts.GetAt(i), 1, false, false, false)
+		if !ghost
+			return
+		endif
+		WaitFor3D(ghost)
+		Ghosts.Add(ghost)
+		GhostMods.Add(m)
+		GhostColors.Add(0)
+		k = Ghosts.Length - 1
+		WeaponVise.AddGhost(ghost, m)
+	endif
+	ObjectReference g = Ghosts[k]
+	if GhostColors[k] == color
+		return
+	endif
+	if GhostColors[k] == 1
+		OutlineRemove.Stop(g)
+	elseif GhostColors[k] == 2
+		OutlineAttach.Stop(g)
+	endif
+	if color == 1
+		OutlineRemove.Play(g, -1.0)
+	elseif color == 2
+		OutlineAttach.Play(g, -1.0)
+	endif
+	GhostColors[k] = color
+EndFunction
+
+Function ClearGhosts()
+	int i = 0
+	while Ghosts && i < Ghosts.Length
+		if Ghosts[i]
+			Ghosts[i].Disable()
+			Ghosts[i].Delete()
+		endif
+		i += 1
+	endwhile
+	Ghosts = new ObjectReference[0]
+	GhostMods = new ObjectMod[0]
+	GhostColors = new int[0]
+EndFunction
+
 Function Unclamp(bool equip)
 	Actor player = Game.GetPlayer()
 	ObjectReference ref = Clamped
@@ -358,4 +451,5 @@ Function Unclamp(bool equip)
 			WeaponVise.Notify(6)
 		endif
 	endif
+	ClearGhosts()
 EndFunction

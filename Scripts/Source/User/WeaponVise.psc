@@ -5,6 +5,8 @@ Function SetWorkbench(ObjectReference akBench) global native
 Function SetWeapon(ObjectReference akWeapon, ObjectMod[] akMods) global native
 Function AddPart(ObjectReference akPart, ObjectMod akMod, bool abInHand) global native
 Function ForgetPart(ObjectReference akPart) global native
+; An outline model of this mod's part, placed and shown by the plugin.
+Function AddGhost(ObjectReference akGhost, ObjectMod akMod) global native
 int Function PollCommand() global native
 ObjectMod Function CommandMod() global native
 ObjectReference Function CommandPart() global native

@@ -82,6 +82,12 @@ namespace
         float rackZ{ 61.0f };
         float rackStep{ 6.0f };
         int rackPerRow{ 6 };
+        float zoneLift{ 16.0f };        // the weapon hangs in a ball this high above the vise point...
+        float zoneRadius{ 18.0f };      // ...of this radius
+        float previewRadius{ 12.0f };   // a carried part this close to its place shows the ghost
+        float snapTime{ 0.15f };        // seconds of the snap-on animation
+        float ghostFade{ 0.5f };        // how see-through the attach ghost is
+        float heldRadius{ 15.0f };      // a part held by ROCK this close to its place previews
         bool logGrab{ true };           // log what each grip press near the weapon found
         bool refresh3D{ false };         // reload the weapon's 3D when it does not show a change
         bool logTree{ true };
@@ -128,6 +134,12 @@ namespace
                 else if (key == "fRackZ") s.rackZ = value;
                 else if (key == "fRackStep") s.rackStep = value;
                 else if (key == "iRackPerRow") s.rackPerRow = (std::max)(1, static_cast<int>(value));
+                else if (key == "fZoneLift") s.zoneLift = value;
+                else if (key == "fZoneRadius") s.zoneRadius = value;
+                else if (key == "fPreviewRadius") s.previewRadius = value;
+                else if (key == "fSnapTime") s.snapTime = value;
+                else if (key == "fGhostFade") s.ghostFade = value;
+                else if (key == "fHeldRadius") s.heldRadius = value;
                 else if (key == "bLogGrab") s.logGrab = value != 0.0f;
                 else if (key == "bRefresh3D") s.refresh3D = value != 0.0f;
                 else if (key == "bLogTree") s.logTree = value != 0.0f;
@@ -246,6 +258,9 @@ namespace
         kRemove = 3,
         kAttach = 4,
         kDrop = 5,
+        kMove = 6,
+        kGhost = 7,
+        kSound = 8,
     };
 
     struct PendingCommand
@@ -266,6 +281,7 @@ namespace
         std::vector<std::pair<std::uint32_t, std::uint32_t>> newParts;  // part ref, mod (to frame)
         std::vector<std::uint32_t> inHandParts;                          // spawned for a pull
         std::vector<std::uint32_t> forgottenParts;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> newGhosts;  // ghost ref, mod
         std::deque<PendingCommand> commands;
         PendingCommand current;
         std::array<float, 4> weaponPose{};  // where the weapon was clamped
@@ -443,6 +459,8 @@ namespace
             Await,     // pulled off; waiting for the script to spawn the part
             Carry,     // carrying a loose part
             Unclamp,   // holding the weapon body
+            HoldPart,  // gripping a part on the weapon: trigger takes it off
+            HoldWeapon, // gripping the weapon body: it follows the hand
             Done,      // this press already did something; wait for release
         } mode{ Mode::Idle };
         std::uint32_t mod{ 0 };
@@ -450,6 +468,8 @@ namespace
         RE::NiPoint3 start{};
         RE::NiTransform offset{};  // part relative to the hand
         Clock::time_point since{};
+        RE::NiAVObject* hidden{ nullptr };   // real part node hidden under the red ghost
+        RE::NiAVObject* holdNode{ nullptr };
     };
     std::array<Hand, 2> g_hands_state{};
 
@@ -697,120 +717,183 @@ namespace
         return compose(bench, pointTransform({ x, y, z })).translate;
     }
 
+    // The vise area: a sphere above the vise where a weapon let go of stays in the air.
+    bool viseArea(RE::NiPoint3& center) noexcept
+    {
+        RE::NiTransform benchWorld;
+        if (!benchFrame(lookupRef(g_bench), benchWorld)) {
+            return false;
+        }
+        center = benchPoint(benchWorld, g_settings.viseX, g_settings.viseY, g_settings.viseZ + g_settings.zoneLift);
+        return true;
+    }
+
+    bool inViseArea(const RE::NiPoint3& point) noexcept
+    {
+        RE::NiPoint3 center;
+        return viseArea(center) && distance(point, center) < g_settings.zoneRadius;
+    }
+
+    void soundCue(int index) noexcept
+    {
+        PendingCommand command;
+        command.type = kSound;
+        command.pose = { static_cast<float>(index), 0.0f, 0.0f, 0.0f };
+        pushCommand(command);
+    }
+
+    // Weapon in hand, let go of in the vise area: it stays there.
     void updateClampGesture() noexcept
     {
         auto* player = RE::PlayerCharacter::GetSingleton();
-        auto* bench = lookupRef(g_bench);
         auto& hand = g_hands_state[g_settings.weaponHand == 1 ? 1 : 0];
-        RE::NiTransform benchWorld;
-        if (!player || !bench || !hand.valid || !benchFrame(bench, benchWorld)) {
-            hand.clampSent = false;
-            return;
-        }
-        const auto vise = benchPoint(benchWorld, g_settings.viseX, g_settings.viseY, g_settings.viseZ);
-        const bool atVise = distance(hand.point, vise) < g_settings.viseRadius;
-        if (!atVise || !player->GetWeaponMagicDrawn()) {
-            hand.clampSent = false;
+        if (!player || !hand.valid || !player->GetWeaponMagicDrawn() || !inViseArea(hand.point)) {
             return;
         }
         if (seconds(g_lastHint) > 20.0f) {
             g_lastHint = Clock::now();
-            hud("Тиски: держи грип, чтобы зажать оружие");
+            hud("Тиски: отпусти грип, чтобы оставить оружие здесь");
         }
-        if (!hand.grip) {
-            hand.clampSent = false;
-            return;
-        }
-        if (!hand.clampSent && seconds(hand.gripSince) >= g_settings.clampHold) {
-            hand.clampSent = true;
+        const bool released = hand.previousGrip && !hand.grip;
+        if (released && seconds(hand.gripSince) >= 0.15f) {
             PendingCommand command;
             command.type = kClamp;
-            const RE::NiPoint3 at{ vise.x, vise.y, vise.z + g_settings.viseLift };
-            command.pose = poseOf(at, headingOf(fingers(hand)));
-            {
-                std::scoped_lock guard(g_shared.lock);
-                g_shared.weaponPose = command.pose;
-                g_shared.benchWorld = benchWorld;
-                g_shared.benchKnown = true;
-            }
+            command.pose = poseOf(hand.point, headingOf(fingers(hand)));
             pushCommand(command);
+            buzz(g_settings.weaponHand == 1 ? 1 : 0, 2000);
         }
     }
 
-    // ------------------------------------------------------------ highlight
-    // The part a hand holds glows: its shaders get their own emissive colour for a while.
+    // ------------------------------------------------------------ outlines
 
-    struct GlowEntry
+    struct Ghost
     {
-        RE::BSLightingShaderProperty* shader{ nullptr };
-        RE::NiColor* color{ nullptr };
-        float scale{ 0.0f };
-        bool ownEmit{ false };
+        std::uint32_t ref{ 0 };
+        RE::NiAVObject* detached{ nullptr };
     };
-    std::array<std::vector<GlowEntry>, 2> g_glow;
-    RE::NiColor g_glowColor{ 0.35f, 0.75f, 1.0f };
-    RE::NiAVObject* g_glowWeapon3D{ nullptr };
+    std::unordered_map<std::uint32_t, Ghost> g_ghosts;     // by mod
+    std::unordered_map<std::uint32_t, int> g_ghostColor;   // colour last asked of the script, by mod
 
-    void glowOff(int index) noexcept
+    struct GhostWish
     {
-        for (auto& entry : g_glow[index]) {
-            if (!readable(entry.shader, sizeof(RE::BSLightingShaderProperty))) {
-                continue;
-            }
-            entry.shader->emitColor = entry.color;
-            entry.shader->emitColorScale = entry.scale;
-            if (!entry.ownEmit) {
-                entry.shader->flags.reset(RE::BSShaderProperty::EShaderPropertyFlag::kOwnEmit);
-            }
-        }
-        g_glow[index].clear();
+        int color{ 0 };  // 1 remove (red), 2 attach (green)
+        RE::NiTransform world{};
+    };
+    std::unordered_map<std::uint32_t, GhostWish> g_ghostWish;  // this frame
+
+    void wishGhost(std::uint32_t mod, int color, const RE::NiTransform& world) noexcept
+    {
+        g_ghostWish[mod] = GhostWish{ color, world };
     }
 
-    void glowOn(int index, RE::NiAVObject* node) noexcept
+    bool ghostShowing(std::uint32_t mod) noexcept
     {
-        glowOff(index);
-        if (!g_settings.highlight || !looksLikeObject(node)) {
-            return;
-        }
-        forEachNode(node, [index](RE::NiAVObject* object, int) {
-            auto* geometry = object->IsTriShape();
-            if (!geometry) {
-                return;
-            }
-            for (auto& property : geometry->GetRuntimeData().properties) {
-                auto* shader = ::netimmerse_cast<RE::BSLightingShaderProperty*>(property.get());
-                if (!shader) {
-                    continue;
-                }
-                GlowEntry entry{ shader, shader->emitColor, shader->emitColorScale,
-                    shader->flags.all(RE::BSShaderProperty::EShaderPropertyFlag::kOwnEmit) };
-                g_glow[index].push_back(entry);
-                shader->emitColor = &g_glowColor;
-                shader->emitColorScale = 1.5f;
-                shader->flags.set(RE::BSShaderProperty::EShaderPropertyFlag::kOwnEmit);
-            }
-        });
-    }
-
-    void startCarry(int index, std::uint32_t partId, const RE::NiTransform& partWorld) noexcept
-    {
-        auto& hand = g_hands_state[index];
-        hand.mode = Hand::Mode::Carry;
-        hand.part = partId;
-        hand.offset = relative(hand.frame, partWorld);
-        auto& part = g_parts[partId];
-        part.carriedBy = index;
-    }
-
-    // Where a loose part of this mod should go on the weapon, if known.
-    bool targetFor(const PartInfo& info, RE::NiAVObject* weapon3D, RE::NiPoint3& out) noexcept
-    {
-        const auto it = g_slotPlaces.find(info.slot);
-        if (it == g_slotPlaces.end()) {
+        const auto it = g_ghosts.find(mod);
+        if (it == g_ghosts.end()) {
             return false;
         }
-        out = compose(weapon3D->world, pointTransform(it->second)).translate;
+        auto* ref = lookupRef(it->second.ref);
+        return ref && looksLikeObject(ref->Get3D());
+    }
+
+    void setCulled(RE::NiAVObject* object, bool culled) noexcept
+    {
+        if (!looksLikeObject(object)) {
+            return;
+        }
+        if (culled) {
+            object->flags.flags |= 1ull;
+        } else {
+            object->flags.flags &= ~1ull;
+        }
+    }
+
+    void applyGhosts() noexcept
+    {
+        // colours: the script plays the outline effect; it makes the ghost on first use
+        std::unordered_set<std::uint32_t> mods;
+        for (const auto& [mod, wish] : g_ghostWish) {
+            mods.insert(mod);
+        }
+        for (const auto& [mod, color] : g_ghostColor) {
+            mods.insert(mod);
+        }
+        for (const auto mod : mods) {
+            const auto wish = g_ghostWish.find(mod);
+            const int color = wish == g_ghostWish.end() ? 0 : wish->second.color;
+            auto& sent = g_ghostColor[mod];
+            if (sent != color) {
+                sent = color;
+                PendingCommand command;
+                command.type = kGhost;
+                command.mod = mod;
+                command.pose = { static_cast<float>(color), 0.0f, 0.0f, 0.0f };
+                pushCommand(command);
+                if (color == 2) {
+                    soundCue(0);
+                }
+            }
+        }
+        // models: placed here every frame, hidden when not wanted
+        for (auto& [mod, ghost] : g_ghosts) {
+            auto* ref = lookupRef(ghost.ref);
+            auto* root = ref ? ref->Get3D() : nullptr;
+            if (!looksLikeObject(root)) {
+                continue;
+            }
+            if (ghost.detached != root) {
+                ghost.detached = root;
+                ref->DetachHavok(root);
+            }
+            const auto wish = g_ghostWish.find(mod);
+            if (wish == g_ghostWish.end()) {
+                setCulled(root, true);
+                continue;
+            }
+            setCulled(root, false);
+            place3D(root, wish->second.world);
+            if (auto* fade = root->IsFadeNode()) {
+                fade->GetRuntimeData().currentFade = wish->second.color == 2 ? g_settings.ghostFade : 1.0f;
+            }
+        }
+        g_ghostWish.clear();
+    }
+
+    // ------------------------------------------------------------ the weapon in the vise
+
+    // Where each slot's part sits, in weapon space (the part model's root goes there).
+    std::unordered_map<std::string, RE::NiTransform> g_slotFrames;
+    RE::NiTransform g_weaponWorld{};
+    bool g_weaponWorldSet{ false };
+    int g_weaponHeldBy{ -1 };
+
+    bool slotWorld(const PartInfo& info, RE::NiTransform& out) noexcept
+    {
+        const auto it = g_slotFrames.find(info.slot);
+        if (it == g_slotFrames.end()) {
+            return false;
+        }
+        out = compose(g_weaponWorld, it->second);
         return true;
+    }
+
+    // The attach point of a part node: a "P-..." node inside it or just above it.
+    RE::NiAVObject* attachPointOf(RE::NiAVObject* node) noexcept
+    {
+        RE::NiAVObject* found = nullptr;
+        forEachNode(node, [&](RE::NiAVObject* object, int depth) {
+            if (!found && depth <= 3 && nodeName(object).rfind("P-", 0) == 0) {
+                found = object;
+            }
+        });
+        auto* up = node;
+        for (int i = 0; !found && i < 3 && looksLikeObject(up); ++i) {
+            if (nodeName(up).rfind("P-", 0) == 0) {
+                found = up;
+            }
+            up = up->parent;
+        }
+        return found ? found : node;
     }
 
     bool unclampAllowed() noexcept
@@ -832,6 +915,122 @@ namespace
         return true;
     }
 
+    const Anchor* nearestAnchor(const RE::NiPoint3& point, float radius) noexcept
+    {
+        const Anchor* best = nullptr;
+        for (const auto& anchor : g_anchors) {
+            const float d = distance(point, anchor.center);
+            if (d < radius) {
+                radius = d;
+                best = &anchor;
+            }
+        }
+        return best;
+    }
+
+    // ------------------------------------------------------------ snapping a part on
+
+    struct Snap
+    {
+        std::uint32_t part{ 0 };
+        std::uint32_t mod{ 0 };
+        RE::NiTransform from{};
+        RE::NiTransform to{};
+        Clock::time_point start{};
+        bool detached{ false };
+    };
+    std::vector<Snap> g_snaps;
+
+    RE::NiMatrix3 blend(const RE::NiMatrix3& a, const RE::NiMatrix3& b, float t) noexcept
+    {
+        RE::NiMatrix3 m;
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                m.entry[r][c] = a.entry[r][c] + (b.entry[r][c] - a.entry[r][c]) * t;
+            }
+        }
+        // re-orthonormalise the rows
+        auto row = [&](int r) { return RE::NiPoint3{ m.entry[r][0], m.entry[r][1], m.entry[r][2] }; };
+        auto set = [&](int r, const RE::NiPoint3& v) { m.entry[r][0] = v.x; m.entry[r][1] = v.y; m.entry[r][2] = v.z; };
+        auto norm = [](RE::NiPoint3 v) { const float l = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); return l > 1e-6f ? v * (1.0f / l) : v; };
+        auto cross = [](const RE::NiPoint3& a, const RE::NiPoint3& b) { return RE::NiPoint3{ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; };
+        const auto x = norm(row(0));
+        const auto z = norm(cross(x, row(1)));
+        const auto y = cross(z, x);
+        set(0, x);
+        set(1, y);
+        set(2, z);
+        return m;
+    }
+
+    void startSnap(std::uint32_t partId, LoosePart& part, const RE::NiTransform& from, const RE::NiTransform& to) noexcept
+    {
+        part.carriedBy = -3;
+        Snap snap;
+        snap.part = partId;
+        snap.mod = part.mod;
+        snap.from = from;
+        snap.to = to;
+        snap.start = Clock::now();
+        g_snaps.push_back(snap);
+    }
+
+    void updateSnaps() noexcept
+    {
+        for (auto it = g_snaps.begin(); it != g_snaps.end();) {
+            auto* ref = lookupRef(it->part);
+            auto* root = ref ? ref->Get3D() : nullptr;
+            if (!looksLikeObject(root)) {
+                it = g_snaps.erase(it);
+                continue;
+            }
+            if (!it->detached) {
+                it->detached = true;
+                ref->DetachHavok(root);
+            }
+            const float t = (std::min)(1.0f, seconds(it->start) / (std::max)(0.01f, g_settings.snapTime));
+            const float e = t * t * (3.0f - 2.0f * t);
+            RE::NiTransform world;
+            world.translate = it->from.translate + (it->to.translate - it->from.translate) * e;
+            world.rotate = blend(it->from.rotate, it->to.rotate, e);
+            world.scale = 1.0f;
+            place3D(root, world);
+            if (t >= 1.0f) {
+                PendingCommand command;
+                command.type = kAttach;
+                command.mod = it->mod;
+                command.part = it->part;
+                command.pose = poseOf(world.translate, 0.0f);
+                pushCommand(command);
+                soundCue(2);
+                it = g_snaps.erase(it);
+                continue;
+            }
+            ++it;
+        }
+    }
+
+    // A part close to its place shows where it goes; let go there, it snaps on.
+    bool previewAttach(const LoosePart& part, const RE::NiTransform& partWorld, RE::NiTransform& target) noexcept
+    {
+        const auto* info = partInfo(part.mod);
+        if (!info || !slotWorld(*info, target)) {
+            return false;
+        }
+        if (std::find(g_mods.begin(), g_mods.end(), part.mod) != g_mods.end()) {
+            return false;  // already on
+        }
+        return distance(partWorld.translate, target.translate) < g_settings.previewRadius;
+    }
+
+    // ------------------------------------------------------------ hands at the weapon
+
+    void endHoldPart(Hand& hand) noexcept
+    {
+        setCulled(hand.hidden, false);
+        hand.hidden = nullptr;
+    }
+
     void updateHandAtWeapon(int index, RE::NiAVObject* weapon3D) noexcept
     {
         auto& hand = g_hands_state[index];
@@ -839,7 +1038,7 @@ namespace
             return;
         }
         const bool pressed = hand.grip && !hand.previousGrip;
-        const bool released = !hand.grip && hand.previousGrip;
+        const bool triggered = hand.trigger && !hand.previousTrigger;
 
         switch (hand.mode) {
         case Hand::Mode::Idle:
@@ -847,86 +1046,102 @@ namespace
                 if (!pressed) {
                     break;
                 }
+                const auto* anchor = nearestAnchor(hand.point, g_settings.grabRadius);
+                const float toWeapon = distance(hand.point, centerOf(weapon3D));
                 if (g_settings.logGrab) {
-                    float nearestPart = 9999.0f;
-                    for (auto& [id, part] : g_parts) {
-                        auto* ref = lookupRef(id);
-                        auto* root = ref ? ref->Get3D() : nullptr;
-                        if (looksLikeObject(root)) {
-                            nearestPart = (std::min)(nearestPart, distance(hand.point, centerOf(root)));
-                        }
-                    }
-                    float nearestAnchor = 9999.0f;
-                    for (const auto& anchor : g_anchors) {
-                        nearestAnchor = (std::min)(nearestAnchor, distance(hand.point, anchor.center));
-                    }
                     char text[200]{};
-                    std::snprintf(text, sizeof(text), "Grip %s: loose part %.1f, part on weapon %.1f, weapon %.1f (palm-wand %.1f)",
-                        index == 0 ? "R" : "L", nearestPart, nearestAnchor, distance(hand.point, centerOf(weapon3D)),
-                        distance(hand.point, hand.frame.translate));
+                    std::snprintf(text, sizeof(text), "Grip %s: part on weapon %s, weapon %.1f",
+                        index == 0 ? "R" : "L", anchor ? nodeName(anchor->node).c_str() : "-", toWeapon);
                     logNote(text);
                 }
-                // Loose parts are physical objects: ROCK picks them up, not us.
-                // Grip on the weapon holds it; the part nearest the palm is the one a pull takes off.
-                const bool onWeapon = distance(hand.point, centerOf(weapon3D)) < g_settings.weaponGrabRadius;
-                float best = g_settings.grabRadius;
-                const Anchor* bestAnchor = nullptr;
-                for (const auto& anchor : g_anchors) {
-                    const float d = distance(hand.point, anchor.center);
-                    if (d < best) {
-                        best = d;
-                        bestAnchor = &anchor;
-                    }
-                }
-                if (!bestAnchor && !onWeapon) {
-                    break;
-                }
-                hand.mode = Hand::Mode::Pull;
-                hand.start = hand.point;
-                hand.mod = bestAnchor ? bestAnchor->mod : 0;
-                hand.offset = relative(hand.frame, bestAnchor && looksLikeObject(bestAnchor->node) ? bestAnchor->node->world : weapon3D->world);
-                if (bestAnchor) {
-                    glowOn(index, bestAnchor->node);
-                    g_glowWeapon3D = weapon3D;
-                    if (const auto* info = partInfo(bestAnchor->mod)) {
-                        char text[160]{};
-                        std::snprintf(text, sizeof(text), "Держишь %s: потяни, чтобы снять. Курок: забрать оружие", slotName(info->slot));
-                        hud(text);
-                    }
+                if (anchor) {
+                    // hold a part: it shows in red; trigger takes it off
+                    hand.mode = Hand::Mode::HoldPart;
+                    hand.mod = anchor->mod;
+                    hand.hidden = nullptr;
+                    hand.holdNode = anchor->node;
                     buzz(index, 1500);
-                } else {
-                    hud("Держишь оружие. Курок: забрать");
-                    buzz(index, 800);
+                    soundCue(1);
+                } else if (toWeapon < g_settings.weaponGrabRadius && g_weaponHeldBy < 0) {
+                    // hold the weapon itself: it follows the hand
+                    hand.mode = Hand::Mode::HoldWeapon;
+                    hand.offset = relative(hand.frame, g_weaponWorld);
+                    g_weaponHeldBy = index;
+                    buzz(index, 1200);
+                    soundCue(3);
                 }
                 break;
             }
-        case Hand::Mode::Pull:
-            if (!hand.grip) {
-                glowOff(index);
-                hand.mode = Hand::Mode::Idle;
-            } else if (hand.trigger && !hand.previousTrigger) {
-                glowOff(index);
-                if (unclampAllowed()) {
-                    PendingCommand command;
-                    command.type = kUnclamp;
-                    pushCommand(command);
-                    buzz(index, 3000);
+        case Hand::Mode::HoldPart:
+            {
+                const auto* info = partInfo(hand.mod);
+                RE::NiTransform slot;
+                const bool known = info && slotWorld(*info, slot);
+                if (!hand.grip) {
+                    endHoldPart(hand);
+                    hand.mode = Hand::Mode::Idle;
+                    break;
                 }
-                hand.mode = Hand::Mode::Done;
-            } else if (hand.mod && distance(hand.point, hand.start) > g_settings.pullDistance) {
-                glowOff(index);
-                buzz(index, 3000);
-                hand.armed = false;
-                PendingCommand command;
-                command.type = kRemove;
-                command.mod = hand.mod;
-                const auto at = compose(hand.frame, hand.offset).translate;
-                command.pose = poseOf(at, headingOf(fingers(hand)));
-                pushCommand(command);
-                hand.mode = Hand::Mode::Await;
-                hand.since = Clock::now();
+                if (known) {
+                    wishGhost(hand.mod, 1, slot);
+                    // the outline stands in for the real part once it is showing
+                    if (!hand.hidden && ghostShowing(hand.mod) && looksLikeObject(hand.holdNode)) {
+                        hand.hidden = hand.holdNode;
+                        setCulled(hand.hidden, true);
+                    }
+                }
+                if (triggered) {
+                    endHoldPart(hand);
+                    PendingCommand command;
+                    command.type = kRemove;
+                    command.mod = hand.mod;
+                    const auto from = known ? slot : weapon3D->world;
+                    command.pose = poseOf(from.translate, headingOf({ from.rotate.entry[1][0], from.rotate.entry[1][1], from.rotate.entry[1][2] }));
+                    pushCommand(command);
+                    hand.offset = relative(hand.frame, from);
+                    hand.armed = false;
+                    hand.mode = Hand::Mode::Await;
+                    hand.since = Clock::now();
+                    buzz(index, 3000);
+                    soundCue(3);
+                }
+                break;
             }
-            break;
+        case Hand::Mode::HoldWeapon:
+            {
+                if (hand.trigger && !hand.previousTrigger) {
+                    if (unclampAllowed()) {
+                        PendingCommand command;
+                        command.type = kUnclamp;
+                        pushCommand(command);
+                        buzz(index, 3000);
+                    }
+                    g_weaponHeldBy = -1;
+                    hand.mode = Hand::Mode::Done;
+                    break;
+                }
+                g_weaponWorld = compose(hand.frame, hand.offset);
+                if (!hand.grip) {
+                    g_weaponHeldBy = -1;
+                    hand.mode = Hand::Mode::Idle;
+                    const auto& r = g_weaponWorld.rotate;
+                    if (inViseArea(g_weaponWorld.translate) || !unclampAllowed()) {
+                        PendingCommand command;
+                        command.type = kMove;
+                        command.pose = poseOf(g_weaponWorld.translate, headingOf({ r.entry[1][0], r.entry[1][1], r.entry[1][2] }));
+                        pushCommand(command);
+                        buzz(index, 1500);
+                        soundCue(2);
+                    } else {
+                        // taken out of the vise area: it is yours again
+                        PendingCommand command;
+                        command.type = kUnclamp;
+                        pushCommand(command);
+                        buzz(index, 3000);
+                    }
+                }
+                break;
+            }
         case Hand::Mode::Await:
             if (seconds(hand.since) > 3.0f) {
                 hand.mode = hand.grip ? Hand::Mode::Done : Hand::Mode::Idle;
@@ -944,67 +1159,82 @@ namespace
                 auto& part = it->second;
                 const auto world = compose(hand.frame, hand.offset);
                 place3D(root, world);
-                part.home = world;
-                part.placed = true;
+                RE::NiTransform target;
+                const bool closeBy = previewAttach(part, world, target);
                 const auto* info = partInfo(part.mod);
-                RE::NiPoint3 target{};
-                const RE::NiPoint3 here = centerOf(root);
-                bool snap = false;
-                if (info && targetFor(*info, weapon3D, target)) {
-                    const float d = distance(here, target);
-                    hand.armed = hand.armed || d > g_settings.attachRadius * 2.0f;
-                    snap = hand.armed && d < g_settings.attachRadius;
-                } else {
-                    const float d = distance(here, centerOf(weapon3D));
-                    const float reach = g_settings.attachRadiusAny + weapon3D->worldBound.fRadius * 0.5f;
-                    hand.armed = hand.armed || d > reach * 2.0f;
-                    snap = hand.armed && d < reach;
+                RE::NiTransform slot;
+                if (info && slotWorld(*info, slot)) {
+                    hand.armed = hand.armed || distance(world.translate, slot.translate) > g_settings.previewRadius * 1.5f;
                 }
-                if (snap) {
-                    buzz(index, 2500);
-                    PendingCommand command;
-                    command.type = kAttach;
-                    command.mod = part.mod;
-                    command.part = hand.part;
-                    command.pose = poseOf(world.translate, 0.0f);
-                    pushCommand(command);
-                    part.carriedBy = -2;  // being attached; leave it alone
-                    hand.mode = hand.grip ? Hand::Mode::Done : Hand::Mode::Idle;
-                } else if (!hand.grip) {
-                    PendingCommand command;
-                    command.type = kDrop;
-                    command.part = hand.part;
-                    command.pose = poseOf(world.translate, 0.0f);
-                    pushCommand(command);
-                    part.carriedBy = -1;
+                const bool show = closeBy && hand.armed;
+                if (show) {
+                    wishGhost(part.mod, 2, target);
+                }
+                if (!hand.grip) {
+                    if (show) {
+                        startSnap(hand.part, part, world, target);
+                    } else {
+                        PendingCommand command;
+                        command.type = kDrop;
+                        command.part = hand.part;
+                        command.pose = poseOf(world.translate, 0.0f);
+                        pushCommand(command);
+                        part.carriedBy = -1;
+                    }
                     hand.mode = Hand::Mode::Idle;
                 }
                 break;
             }
-        case Hand::Mode::Unclamp:
-            if (!hand.grip || distance(hand.point, hand.start) > g_settings.unclampStill) {
-                hand.mode = hand.grip ? Hand::Mode::Done : Hand::Mode::Idle;
-            } else if (seconds(hand.since) >= g_settings.unclampHold) {
-                if (unclampAllowed()) {
-                    PendingCommand command;
-                    command.type = kUnclamp;
-                    pushCommand(command);
-                }
-                hand.mode = Hand::Mode::Done;
-            }
-            break;
         case Hand::Mode::Done:
             if (!hand.grip) {
                 hand.mode = Hand::Mode::Idle;
             }
             break;
         }
-        (void)released;
+    }
+
+    // Parts held by ROCK: show where they go, snap them on when let go there.
+    void updateHeldParts(RE::NiAVObject* weapon3D) noexcept
+    {
+        for (auto& [id, part] : g_parts) {
+            if (part.carriedBy != -1) {
+                continue;
+            }
+            auto* ref = lookupRef(id);
+            auto* root = ref ? ref->Get3D() : nullptr;
+            if (!looksLikeObject(root) || distance(root->world.translate, centerOf(weapon3D)) > 60.0f) {
+                continue;
+            }
+            // which hand holds it (ROCK has it): a gripping hand right at it
+            int holder = -1;
+            for (int index = 0; index < 2; ++index) {
+                const auto& hand = g_hands_state[index];
+                const bool gripping = hand.grip || hand.previousGrip;
+                if (hand.valid && gripping && hand.mode == Hand::Mode::Idle && distance(hand.point, centerOf(root)) < g_settings.heldRadius) {
+                    holder = index;
+                }
+            }
+            if (holder < 0) {
+                continue;
+            }
+            RE::NiTransform target;
+            if (!previewAttach(part, root->world, target)) {
+                continue;
+            }
+            const auto& hand = g_hands_state[holder];
+            if (hand.grip) {
+                wishGhost(part.mod, 2, target);
+            } else {
+                buzz(holder, 2000);
+                startSnap(id, part, root->world, target);
+            }
+        }
     }
 
     void syncShared() noexcept
     {
         std::vector<std::pair<std::uint32_t, std::uint32_t>> added;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> ghosts;
         std::vector<std::uint32_t> inHand;
         std::vector<std::uint32_t> forgotten;
         {
@@ -1015,7 +1245,10 @@ namespace
                 if (g_shared.weapon != g_weapon) {
                     g_weapon = g_shared.weapon;
                     g_slotPlaces.clear();
+                    g_slotFrames.clear();
                     g_requiredAtClamp.clear();
+                    g_weaponWorldSet = false;
+                    g_weaponHeldBy = -1;
                     for (const auto omod : g_shared.mods) {
                         const auto* info = partInfo(omod);
                         if (info && info->required) {
@@ -1023,18 +1256,32 @@ namespace
                         }
                     }
                     g_treeLogged = false;
+                    if (!g_weapon) {
+                        g_ghosts.clear();
+                        g_ghostColor.clear();
+                        g_snaps.clear();
+                    }
                 }
                 g_mods = g_shared.mods;
                 g_weapon3D = nullptr;  // re-resolve
-                // the model may be rebuilt: never touch the shaders saved for the glow again
-                g_glow[0].clear();
-                g_glow[1].clear();
+                // the model may be rebuilt: hidden nodes are checked again before they are touched
+                for (auto& hand : g_hands_state) {
+                    hand.hidden = nullptr;
+                    hand.holdNode = nullptr;
+                    if (hand.mode == Hand::Mode::HoldPart) {
+                        hand.mode = Hand::Mode::Done;
+                    }
+                }
                 g_revisionTime = Clock::now();
                 g_shared.modelOutdated = false;
             }
             added.swap(g_shared.newParts);
+            ghosts.swap(g_shared.newGhosts);
             inHand.swap(g_shared.inHandParts);
             forgotten.swap(g_shared.forgottenParts);
+        }
+        for (const auto& [ref, mod] : ghosts) {
+            g_ghosts[mod] = Ghost{ ref, nullptr };
         }
         for (const auto id : forgotten) {
             g_parts.erase(id);
@@ -1064,10 +1311,8 @@ namespace
                     g_shared.inHandParts.push_back(id);
                     break;
                 }
-                const auto offset = hand.offset;
                 hand.mode = Hand::Mode::Carry;
                 hand.part = id;
-                hand.offset = offset;
                 g_parts[id].carriedBy = index;
                 break;
             }
@@ -1103,87 +1348,15 @@ namespace
         }
     }
 
-    // A part let go of (ROCK drops it) next to its place on the weapon goes on.
-    void attachReleasedParts(RE::NiAVObject* weapon3D) noexcept
+    void resolveSlots(RE::NiAVObject* root) noexcept
     {
-        bool released = false;
-        for (const auto& hand : g_hands_state) {
-            released = released || (hand.valid && hand.previousGrip && !hand.grip && hand.mode != Hand::Mode::Carry);
-        }
-        if (!released) {
-            return;
-        }
-        for (auto& [id, part] : g_parts) {
-            if (part.carriedBy != -1) {
-                continue;
-            }
-            auto* ref = lookupRef(id);
-            auto* root = ref ? ref->Get3D() : nullptr;
-            const auto* info = partInfo(part.mod);
-            if (!looksLikeObject(root) || !info) {
-                continue;
-            }
-            const auto here = centerOf(root);
-            RE::NiPoint3 target{};
-            bool snap = false;
-            if (targetFor(*info, weapon3D, target)) {
-                snap = distance(here, target) < g_settings.attachRadius;
-            } else {
-                snap = distance(here, centerOf(weapon3D)) < g_settings.attachRadiusAny + weapon3D->worldBound.fRadius * 0.5f;
-            }
-            char text[160]{};
-            if (g_settings.logGrab) {
-                std::snprintf(text, sizeof(text), "Release: part %08X %s %.1f from its place%s", id, info->edid.c_str(),
-                    targetFor(*info, weapon3D, target) ? distance(here, target) : -1.0f, snap ? " -> attach" : "");
-                if (distance(here, centerOf(weapon3D)) < 40.0f) {
-                    logNote(text);
-                }
-            }
-            if (snap) {
-                PendingCommand command;
-                command.type = kAttach;
-                command.mod = part.mod;
-                command.part = id;
-                command.pose = poseOf(here, 0.0f);
-                pushCommand(command);
-                part.carriedBy = -2;
-                return;  // one at a time
-            }
-        }
-    }
-
-    // Tell which part the hand would take off.
-    std::uint32_t g_hinted{ 0 };
-    Clock::time_point g_hintTime{};
-
-    void hintPart(int index) noexcept
-    {
-        const auto& hand = g_hands_state[index];
-        if (!hand.valid || hand.mode != Hand::Mode::Idle) {
-            return;
-        }
-        const Anchor* nearest = nullptr;
-        float best = g_settings.grabRadius;
         for (const auto& anchor : g_anchors) {
-            const float d = distance(hand.point, anchor.center);
-            if (d < best) {
-                best = d;
-                nearest = &anchor;
+            const auto* info = partInfo(anchor.mod);
+            if (!info) {
+                continue;
             }
-        }
-        if (nearest && nearest->mod != g_hinted && seconds(g_hintTime) > 1.5f) {
-            const auto* info = partInfo(nearest->mod);
-            if (info) {
-                char text[160]{};
-                std::snprintf(text, sizeof(text), "Грип и потянуть: снять %s", slotName(info->slot));
-                hud(text);
-                g_hintTime = Clock::now();
-            }
-        }
-        if (nearest) {
-            g_hinted = nearest->mod;
-        } else if (seconds(g_hintTime) > 3.0f) {
-            g_hinted = 0;
+            auto* point = attachPointOf(anchor.node);
+            g_slotFrames[info->slot] = relative(root->world, point->world);
         }
     }
 
@@ -1196,9 +1369,8 @@ namespace
         if (!g_weapon) {
             for (auto& hand : g_hands_state) {
                 hand.mode = Hand::Mode::Idle;
+                hand.hidden = nullptr;
             }
-            g_glow[0].clear();
-            g_glow[1].clear();
             updateClampGesture();
             return;
         }
@@ -1207,55 +1379,51 @@ namespace
         if (!looksLikeObject(root)) {
             return;
         }
+        if (!g_weaponWorldSet) {
+            g_weaponWorld = root->world;
+            g_weaponWorld.scale = 1.0f;
+            g_weaponWorldSet = true;
+        }
+        // the weapon stays exactly where it was left (or follows the hand holding it)
+        place3D(root, g_weaponWorld);
         if (root != g_weapon3D) {
             g_weapon3D = root;
-            g_glow[0].clear();
-            g_glow[1].clear();
             if (g_settings.logTree && !g_treeLogged) {
                 g_treeLogged = true;
                 logTree(root);
             }
             resolveAnchors(root);
+            resolveSlots(root);
             char message[160]{};
-            std::snprintf(message, sizeof(message), "Weapon %08X: %zu mods, %zu parts found on the model (by file name: %d)",
-                g_weapon, g_mods.size(), g_anchors.size(), g_stemsWork);
+            std::snprintf(message, sizeof(message), "Weapon %08X: %zu mods, %zu parts found on the model, %zu slots known",
+                g_weapon, g_mods.size(), g_anchors.size(), g_slotFrames.size());
             logNote(message);
             for (const auto& anchor : g_anchors) {
                 const auto* info = partInfo(anchor.mod);
-                std::snprintf(message, sizeof(message), "  part %s -> node '%s'", info ? info->edid.c_str() : "?", nodeName(anchor.node).c_str());
+                std::snprintf(message, sizeof(message), "  part %s -> node '%s', attach point '%s'", info ? info->edid.c_str() : "?",
+                    nodeName(anchor.node).c_str(), nodeName(attachPointOf(anchor.node)).c_str());
                 logNote(message);
             }
-        } else {
-            // the weapon does not move, but its parts may be re-created
-            for (auto& anchor : g_anchors) {
-                if (looksLikeObject(anchor.node)) {
-                    anchor.center = centerOf(anchor.node);
-                }
+        }
+        // parts may be re-created after a change
+        bool changed = false;
+        for (auto& anchor : g_anchors) {
+            if (looksLikeObject(anchor.node)) {
+                anchor.center = centerOf(anchor.node);
+            } else {
+                changed = true;
             }
         }
-        // Did the 3D follow the last change? If not, the script reloads it.
-        if (g_stemsWork && g_settings.refresh3D && seconds(g_revisionTime) > 0.4f && seconds(g_revisionTime) < 0.5f) {
-            std::unordered_set<std::string> expected;
-            for (const auto omod : g_mods) {
-                const auto* info = partInfo(omod);
-                if (info && info->part && !info->stem.empty()) {
-                    expected.insert(info->stem);
-                }
-            }
-            const auto present = stemsPresent(root);
-            if (expected != present && g_reloadedFor != g_mods) {
-                g_reloadedFor = g_mods;
-                logNote("Weapon model does not show the new parts yet; asking the script to reload it");
-                std::scoped_lock guard(g_shared.lock);
-                g_shared.modelOutdated = true;
-            }
+        if (changed || seconds(g_revisionTime) < 1.0f) {
+            resolveAnchors(root);
+            resolveSlots(root);
         }
         keepWeaponOutOfPhysics(weaponRef, root);
         updateHandAtWeapon(0, root);
         updateHandAtWeapon(1, root);
-        attachReleasedParts(root);
-        hintPart(0);
-        hintPart(1);
+        updateHeldParts(root);
+        updateSnaps();
+        applyGhosts();
     }
 
     // ------------------------------------------------------------ Papyrus natives
@@ -1392,6 +1560,15 @@ namespace
         return info && info->fallback ? RE::TESForm::GetFormByID<Mod>(info->fallback) : nullptr;
     }
 
+    void AddGhost(std::monostate, RE::TESObjectREFR* ghost, Mod* mod)
+    {
+        if (!ghost || !mod) {
+            return;
+        }
+        std::scoped_lock guard(g_shared.lock);
+        g_shared.newGhosts.emplace_back(ghost->GetFormID(), mod->GetFormID());
+    }
+
     bool IsFreeMod(std::monostate, Mod* mod)
     {
         if (!mod) {
@@ -1447,6 +1624,7 @@ namespace
         vm->BindNativeMethod(kScript, "Notify", Notify, true);
         vm->BindNativeMethod(kScript, "FallbackFor", FallbackFor, true);
         vm->BindNativeMethod(kScript, "IsFreeMod", IsFreeMod, true);
+        vm->BindNativeMethod(kScript, "AddGhost", AddGhost, true);
         logNote("Papyrus functions of script WeaponVise registered");
         return true;
     }

@@ -5,6 +5,10 @@ Records:
   MISC WV_Part_*       one loose part per weapon mod with a visible model of its own
   FLST WV_Mods / WV_PartItems / WV_LooseMods   parallel lists (same order)
   FLST WV_Weapons      weapons that can be clamped
+  STAT WV_Ghost_*      the same models as outlines: where a part goes, which part a hand holds
+  FLST WV_Ghosts       parallel to WV_Mods
+  EFSH WV_OutlineAttach / WV_OutlineRemove   edge-only glow (copied from HologramShaunFXS)
+  SOUN WV_Snd*, FLST WV_Sounds   workshop UI sounds: focus, focus red, snap, pick up
   QUST WV_Quest        start-game-enabled quest running WeaponViseMain
 Plain .esp, form version 131, master Fallout4.esm; works in Fallout 4 VR.
 Also writes WeaponVise_parts.csv for the plugin (same rows as data/parts.csv).
@@ -61,12 +65,38 @@ for r in parts:
         sub('DATA', struct.pack('<If', 5, 0.5)),
     ]))
 
+ghosts = []
+for r in parts:
+    ghosts.append(add('STAT', 'WV_Ghost_' + r['edid'].replace('mod_', '', 1), [
+        sub('OBND', b'\0' * 12),
+        sub('MODL', zstr(r['model'], 'latin1')),
+    ]))
+
+# HologramShaunFXS (Fallout4.esm 00183AFB): no fill (black zero-alpha texture), a glowing edge.
+HOLOGRAM_DNAM = bytes.fromhex(
+    '050000000200000007000000000000000000803e0000003f0000803f0000803e000000000000803f00000000000000000000003f73bed7000ad7233c0000a0410000803fcdcccc3e0000803e0000003f3333b33ecdcccc3e0200000000000000000020410000000000007f4300000000ffffff00ffffff00040000803f0000004000000040000000000000803f00002041088003000000803fcdcc4c3f')
+def outline(edid, rgb):
+    d = bytearray(HOLOGRAM_DNAM)
+    struct.pack_into('<ffff', d, 16, 0.05, 1.0, 0.1, 1.0)   # fill: fade in, full, fade out, persistent ratio
+    struct.pack_into('<ff', d, 32, 0.0, 1.0)                 # fill: no pulse
+    d[52:56] = bytes(rgb) + b'\0'                            # edge colour
+    return add('EFSH', edid, [sub('ICON', zstr('Effects\\ColorBlackZeroAlphaUtility.dds', 'latin1')),
+                              sub('NAM7', b'\0'), sub('NAM8', b'\0'), sub('DATA', b''), sub('DNAM', bytes(d))])
+outline('WV_OutlineAttach', (60, 255, 120))   # Pip-Boy green: where the part goes
+outline('WV_OutlineRemove', (255, 70, 40))    # red: the part a hand holds on the weapon
+
+SOUNDS = [('WV_SndFocus', 0x05FD82), ('WV_SndFocusRed', 0x05FD83), ('WV_SndSnap', 0x1926A2),
+          ('WV_SndPickUp', 0x0196B0)]   # UIWorkshopModeFocusGreen/Red, ItemSnapSuccess, ItemPickUpMetal1Small
+sounds = [add('SOUN', e, [sub('OBND', b'\0' * 12), sub('SDSC', struct.pack('<I', d))]) for e, d in SOUNDS]
+
 def flst(edid, forms):
     return add('FLST', edid, [sub('LNAM', struct.pack('<I', f)) for f in forms])
 
 flst('WV_Mods', [r['omod'] for r in parts])
 flst('WV_PartItems', part_items)
 flst('WV_LooseMods', [r['loose'] for r in parts])
+flst('WV_Ghosts', ghosts)
+flst('WV_Sounds', sounds)
 flst('WV_Weapons', sorted({r['weapon'] for r in rows}))
 
 def wstr(s): b = s.encode('latin1'); return struct.pack('<H', len(b)) + b
@@ -76,6 +106,8 @@ props = {
     'WorkbenchKeyword': WORKBENCH_KEYWORD,
     'WV_Mods': ids['WV_Mods'], 'WV_PartItems': ids['WV_PartItems'], 'WV_Weapons': ids['WV_Weapons'],
     'WV_LooseMods': ids['WV_LooseMods'],
+    'WV_Ghosts': ids['WV_Ghosts'], 'WV_Sounds': ids['WV_Sounds'],
+    'OutlineAttach': ids['WV_OutlineAttach'], 'OutlineRemove': ids['WV_OutlineRemove'],
 }
 vmad = struct.pack('<hhH', 6, 2, 1) + wstr('WeaponViseMain') + b'\0' + struct.pack('<H', len(props))
 vmad += b''.join(prop_obj(k, v) for k, v in props.items())
@@ -83,7 +115,7 @@ add('QUST', 'WV_Quest', [sub('VMAD', vmad), sub('FULL', zstr('Weapon Vise', 'lat
                          sub('DNAM', bytes.fromhex('110000000000000000000000')), sub('NEXT', b''),
                          sub('ANAM', struct.pack('<I', 0))])
 
-ORDER = ['MISC', 'FLST', 'QUST']
+ORDER = ['SOUN', 'MISC', 'STAT', 'QUST', 'EFSH', 'FLST']
 nrec = sum(len(recs[t]) for t in ORDER)
 tes4 = record('TES4', 0, [sub('HEDR', struct.pack('<fII', 1.0, nrec, next_id)), sub('CNAM', zstr('Aleshon')),
                           sub('SNAM', zstr('Weapon Vise: modify weapons by hand at a weapons workbench.', 'latin1')),
