@@ -90,7 +90,7 @@ namespace
         float snapTime{ 0.15f };        // seconds of the snap-on animation
         float ghostFade{ 0.5f };        // how see-through the attach ghost is
         float heldRadius{ 15.0f };      // a part held by ROCK this close to its place previews
-        bool removeIntoHand{ false };   // false: a removed part drops as a real object for ROCK to take
+        bool removeIntoHand{ true };   // false: a removed part drops as a real object for ROCK to take
         bool logGrab{ true };           // log what each grip press near the weapon found
         bool refresh3D{ false };         // reload the weapon's 3D when it does not show a change
         bool logTree{ true };
@@ -1194,11 +1194,10 @@ namespace
                     PendingCommand command;
                     command.type = kRemove;
                     command.mod = hover;
-                    const auto from = hoverKnown ? hoverSlot : weapon3D->world;
-                    command.pose = poseOf(from.translate, headingOf({ from.rotate.entry[1][0], from.rotate.entry[1][1], from.rotate.entry[1][2] }));
+                    // the part appears right in the palm (as in 0.4, where ROCK then holds it with the fingers)
+                    command.pose = poseOf(hand.point, headingOf(fingers(hand)));
                     pushCommand(command);
                     hand.mod = hover;
-                    hand.offset = relative(hand.frame, from);
                     hand.armed = false;
                     hand.mode = Hand::Mode::Await;
                     hand.since = Clock::now();
@@ -1299,14 +1298,6 @@ namespace
                     break;
                 }
                 auto& part = it->second;
-                if (hand.carried3D != root) {
-                    // no collision while carried: a keyframed part pushes the player away
-                    hand.carried3D = root;
-                    if (part.collision != 0) {
-                        part.detached = root;
-                        ref->DetachHavok(root);
-                    }
-                }
                 const auto world = compose(hand.frame, hand.offset);
                 place3D(root, world);
                 RE::NiTransform target;
@@ -1488,14 +1479,8 @@ namespace
                 if (hand.mode != Hand::Mode::Await || !hand.grip) {
                     continue;
                 }
-                {
-                    // the part sits in the palm: its middle where the hand grips
-                    auto world = compose(hand.frame, hand.offset);
-                    const auto localCenter = relative(root->world, pointTransform(centerOf(root))).translate;
-                    const auto center = compose(world, pointTransform(localCenter)).translate;
-                    world.translate = world.translate + (hand.point - center);
-                    hand.offset = relative(hand.frame, world);
-                }
+                // it stays where it appeared, in the palm
+                hand.offset = relative(hand.frame, root->world);
                 hand.mode = Hand::Mode::Carry;
                 hand.carried3D = nullptr;
                 hand.part = id;
