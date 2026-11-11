@@ -86,7 +86,7 @@ Function Spawn(int kind, float[] pose, int token)
 		return
 	endif
 	mag.SetPosition(pose[0], pose[1], pose[2])
-	mag.SetAngle(0.0, 0.0, pose[3])
+	mag.SetAngle(pose[3], pose[4], pose[5])
 	mag.Enable()
 	WaitFor3D(mag)
 	mag.SetMotionType(1, true)   ; a normal physical object: it falls, ROCK can hold it
