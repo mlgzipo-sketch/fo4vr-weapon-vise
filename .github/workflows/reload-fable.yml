@@ -1,0 +1,116 @@
+name: reload-fable
+
+on:
+  push:
+    branches-ignore:
+      - 'dist/**'
+    paths:
+      - 'reload-fable/**'
+      - '.github/workflows/reload-fable.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup cmake
+        uses: lukka/get-cmake@latest
+
+      - name: Setup vcpkg
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg "$env:VCPKG_ROOT"
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          New-Item -ItemType Directory -Force "$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-Null
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\vcpkg-cache
+          key: vcpkg-${{ hashFiles('reload-fable/vcpkg.json') }}
+          restore-keys: vcpkg-
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S reload-fable -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      - name: Get Caprica (open-source Papyrus compiler)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v0.3.0 -R Orvid/Caprica -D caprica
+          Get-ChildItem caprica -Filter *.zip | ForEach-Object { Expand-Archive $_.FullName -DestinationPath caprica -Force }
+          Get-ChildItem caprica -Filter *.7z | ForEach-Object { 7z x $_.FullName -ocaprica -y | Out-Null }
+          $exe = Get-ChildItem caprica -Recurse -Filter Caprica.exe | Select-Object -First 1
+          if (-not $exe) { Get-ChildItem caprica -Recurse | Format-Table FullName; throw "Caprica.exe not found" }
+          "CAPRICA=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Compile scripts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package\Scripts | Out-Null
+          $out = (Resolve-Path package\Scripts).Path
+          New-Item -ItemType Directory -Force reloadstubs | Out-Null
+          Copy-Item stubs\*.psc reloadstubs\
+          Copy-Item reload-fable\Scripts\Source\User\ManualReloadF.psc reloadstubs\
+          $stubs = (Resolve-Path reloadstubs).Path
+          Push-Location reload-fable\Scripts\Source\User
+          foreach ($script in @("ManualReloadF.psc", "ManualReloadFMain.psc")) {
+            & $env:CAPRICA --game fallout4 -i $stubs -o $out $script
+            if ($LASTEXITCODE -ne 0) { Pop-Location; throw "Caprica failed on $script" }
+          }
+          Pop-Location
+          foreach ($pex in @("ManualReloadF.pex", "ManualReloadFMain.pex")) {
+            if (-not (Test-Path "package\Scripts\$pex")) { throw "no $pex produced" }
+          }
+          New-Item -ItemType Directory -Force package\Scripts\Source\User | Out-Null
+          Copy-Item reload-fable\Scripts\Source\User\*.psc package\Scripts\Source\User
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $plugins = "package\F4SE\Plugins"
+          New-Item -ItemType Directory -Force $plugins | Out-Null
+          Copy-Item build\Release\ManualReloadF.dll $plugins
+          Copy-Item reload-fable\ManualReloadF.ini $plugins
+          python reload-fable\tools\build_esp.py package\ManualReloadF.esp
+          Compress-Archive -Path package\* -DestinationPath ManualReloadF.zip
+
+      - name: Upload mod
+        uses: actions/upload-artifact@v4
+        with:
+          name: ManualReloadF
+          path: package
+
+      - name: Publish build to the dist branch
+        if: github.event_name == 'push'
+        shell: pwsh
+        run: |
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $branch = "dist/reload-fable/${{ github.ref_name }}"
+          Copy-Item ManualReloadF.zip "ManualReloadF-$sha.zip"
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git checkout --orphan dist-tmp
+          git rm -rfq --cached .
+          Remove-Item -Recurse -Force (Get-ChildItem -Force -Exclude .git,"ManualReloadF-$sha.zip")
+          git add -A
+          git commit -qm "Build $sha"
+          git push -f origin "HEAD:refs/heads/$branch"
