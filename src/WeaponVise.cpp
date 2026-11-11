@@ -1813,24 +1813,17 @@ namespace
         return static_cast<std::int32_t>(g_shared.current.mod);
     }
 
-    Mod* CommandMod(std::monostate)
+    // Ids, not forms: returning a form made the VM crash in CreateObject (Papyrus calls Game.GetForm).
+    std::int32_t CommandModID(std::monostate)
     {
-        std::uint32_t id;
-        {
-            std::scoped_lock guard(g_shared.lock);
-            id = g_shared.current.mod;
-        }
-        return id ? RE::TESForm::GetFormByID<Mod>(id) : nullptr;
+        std::scoped_lock guard(g_shared.lock);
+        return static_cast<std::int32_t>(g_shared.current.mod);
     }
 
-    RE::TESObjectREFR* CommandPart(std::monostate)
+    std::int32_t CommandPartID(std::monostate)
     {
-        std::uint32_t id;
-        {
-            std::scoped_lock guard(g_shared.lock);
-            id = g_shared.current.part;
-        }
-        return lookupRef(id);
+        std::scoped_lock guard(g_shared.lock);
+        return static_cast<std::int32_t>(g_shared.current.part);
     }
 
     std::vector<float> CommandPose(std::monostate)
@@ -1875,10 +1868,10 @@ namespace
         };
     }
 
-    Mod* FallbackFor(std::monostate, Mod* mod)
+    std::int32_t FallbackID(std::monostate, Mod* mod)
     {
         const auto* info = mod ? partInfo(mod->GetFormID()) : nullptr;
-        return info && info->fallback ? RE::TESForm::GetFormByID<Mod>(info->fallback) : nullptr;
+        return info ? static_cast<std::int32_t>(info->fallback) : 0;
     }
 
     void AddGhost(std::monostate, RE::TESObjectREFR* ghost, Mod* mod)
@@ -1941,13 +1934,13 @@ namespace
         vm->BindNativeMethod(kScript, "AddPart", AddPart, true);
         vm->BindNativeMethod(kScript, "ForgetPart", ForgetPart, true);
         vm->BindNativeMethod(kScript, "PollCommand", PollCommand, true);
-        vm->BindNativeMethod(kScript, "CommandMod", CommandMod, true);
-        vm->BindNativeMethod(kScript, "CommandPart", CommandPart, true);
+        vm->BindNativeMethod(kScript, "CommandModID", CommandModID, true);
+        vm->BindNativeMethod(kScript, "CommandPartID", CommandPartID, true);
         vm->BindNativeMethod(kScript, "CommandPose", CommandPose, true);
         vm->BindNativeMethod(kScript, "RackPose", RackPose, true);
         vm->BindNativeMethod(kScript, "ModelOutdated", ModelOutdated, true);
         vm->BindNativeMethod(kScript, "Notify", Notify, true);
-        vm->BindNativeMethod(kScript, "FallbackFor", FallbackFor, true);
+        vm->BindNativeMethod(kScript, "FallbackID", FallbackID, true);
         vm->BindNativeMethod(kScript, "IsFreeMod", IsFreeMod, true);
         vm->BindNativeMethod(kScript, "AddGhost", AddGhost, true);
         vm->BindNativeMethod(kScript, "SetFrame", SetFrame, true);

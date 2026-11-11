@@ -264,15 +264,15 @@ Function Handle()
 		elseif cmd == CmdUnclamp
 			Unclamp(true)
 		elseif cmd == CmdRemove
-			RemovePart(WeaponVise.CommandMod())
+			RemovePart(CmdMod())
 		elseif cmd == CmdAttach
-			AttachPart(WeaponVise.CommandPart(), WeaponVise.CommandMod())
+			AttachPart(CmdPart(), CmdMod())
 		elseif cmd == CmdDrop
-			DropPart(WeaponVise.CommandPart())
+			DropPart(CmdPart())
 		elseif cmd == CmdMove
 			MoveWeapon()
 		elseif cmd == CmdGhost
-			ShowGhost(WeaponVise.CommandMod(), WeaponVise.CommandPose()[0] as int)
+			ShowGhost(CmdMod(), WeaponVise.CommandPose()[0] as int)
 		elseif cmd == CmdSound
 			PlaySound(WeaponVise.CommandPose()[0] as int)
 		elseif cmd == CmdFramePose
@@ -287,6 +287,22 @@ Function Handle()
 	if Clamped && Clamped.GetBaseObject() as Weapon && WeaponVise.ModelOutdated()
 		Reload3D()
 	endif
+EndFunction
+
+ObjectMod Function CmdMod()
+	int id = WeaponVise.CommandModID()
+	if id == 0
+		return None
+	endif
+	return Game.GetForm(id) as ObjectMod
+EndFunction
+
+ObjectReference Function CmdPart()
+	int id = WeaponVise.CommandPartID()
+	if id == 0
+		return None
+	endif
+	return Game.GetForm(id) as ObjectReference
 EndFunction
 
 bool Function WaitFor3D(ObjectReference ref)
@@ -403,7 +419,7 @@ Function RemovePart(ObjectMod m)
 	endif
 	float[] pose = WeaponVise.CommandPose()
 	Clamped.RemoveMod(m)
-	ObjectMod filler = WeaponVise.FallbackFor(m)
+	ObjectMod filler = Game.GetForm(WeaponVise.FallbackID(m)) as ObjectMod
 	if filler
 		Clamped.AttachMod(filler)
 	endif
