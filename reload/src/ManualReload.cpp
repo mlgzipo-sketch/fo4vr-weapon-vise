@@ -25,6 +25,7 @@
 
 #include "api/FRIKApiV2.h"
 #include "api/openvr.h"
+#include "api/ROCKProviderApi.h"
 
 #include <algorithm>
 #include <array>
@@ -80,7 +81,12 @@ namespace
         float snapRadius{ 5.0f };       // ..and this close goes in by itself, even still in the hand
         float magTilt{ -1.0f };
         float captureDepth{ 6.0f };     // the well catches a magazine whose top is this close below its mouth
-        float slideLockAt{ 0.8f };      // a slide held open stands this part of its travel back         // the well's slope back from straight down (degrees); below 0 = learned from the model
+        float slideLockAt{ 0.8f };
+        bool  wellCenter{ true };       // put the well's mouth on the gun's middle plane
+        float wellShiftX{ 0.0f };       // ..and move it by these (gun frame: x right, y forward, z up)
+        float wellShiftY{ 0.0f };
+        float wellShiftZ{ 0.0f };
+        bool  rockOffhand{ true };      // ask ROCK to keep the free hand off the gun while it reloads      // a slide held open stands this part of its travel back         // the well's slope back from straight down (degrees); below 0 = learned from the model
         float handRadius{ 16.0f };      // a hand this close to a magazine is the one holding it
         float looseLifetime{ 90.0f };   // seconds a dropped magazine stays before it is cleaned up
         int   maxLoose{ 6 };
@@ -109,6 +115,11 @@ namespace
                 else if (key == "fMagTilt") s.magTilt = value;
                 else if (key == "fCaptureDepth") s.captureDepth = value;
                 else if (key == "fSlideLockAt") s.slideLockAt = value;
+                else if (key == "bWellCenter") s.wellCenter = value != 0.0f;
+                else if (key == "fWellShiftX") s.wellShiftX = value;
+                else if (key == "fWellShiftY") s.wellShiftY = value;
+                else if (key == "fWellShiftZ") s.wellShiftZ = value;
+                else if (key == "bRockOffhand") s.rockOffhand = value != 0.0f;
                 else if (key == "iDumpDepth") s.dumpDepth = static_cast<int>(value);
                 else if (key == "iGunHand") s.gunHand = value != 0.0f ? 1 : 0;
                 else if (key == "iGripButton") s.gripButton = static_cast<int>(value);
@@ -650,6 +661,185 @@ namespace
     };
     std::array<Hand, 2> g_hands;   // 0 right, 1 left
 
+    // ------------------------------------------------------------ ROCK
+    // ROCK holds the hands. Through its provider API the free hand is kept off the gun's support grip
+    // while it works the slide or a magazine, and a magazine made in the palm is put in the hand.
+    namespace rock
+    {
+        using namespace ::rock::provider;
+
+        std::uint64_t g_owner{ 0 };
+        bool g_tried{ false };
+        bool g_reserved{ false };
+        std::array<bool, 2> g_suppressed{};
+
+        RockProviderHand toRock(int index) noexcept
+        {
+            return index == 0 ? RockProviderHand::Right : RockProviderHand::Left;
+        }
+
+        bool has(std::uint32_t tableBytes) noexcept
+        {
+            return RockProviderApi::inst && providerApiTableSupportsV1(tableBytes);
+        }
+
+        bool ready() noexcept
+        {
+            if (g_owner) {
+                return true;
+            }
+            if (g_tried) {
+                return false;
+            }
+            g_tried = true;
+            const int error = RockProviderApi::initialize();
+            if (error != 0 || !RockProviderApi::inst || !RockProviderApi::inst->registerConsumerV1) {
+                char message[96]{};
+                std::snprintf(message, sizeof(message), "ROCK provider API not available (%d): the free hand is not kept off the gun", error);
+                logNote(message);
+                return false;
+            }
+            RockProviderConsumerRegistrationV1 registration{};
+            std::snprintf(registration.modName, sizeof(registration.modName), "ManualReload");
+            registration.requestedCapabilities =
+                static_cast<std::uint32_t>(RockProviderConsumerCapabilityV1::FrameSnapshots) |
+                static_cast<std::uint32_t>(RockProviderConsumerCapabilityV1::OffhandReservation) |
+                static_cast<std::uint32_t>(RockProviderConsumerCapabilityV1::InteractionCommands) |
+                static_cast<std::uint32_t>(RockProviderConsumerCapabilityV1::HandInputSuppression);
+            RockProviderConsumerHandleV1 handle{};
+            const auto result = RockProviderApi::inst->registerConsumerV1(&registration, &handle);
+            char message[200]{};
+            std::snprintf(message, sizeof(message), "ROCK provider API v%u (table %u bytes): register %u, granted %08X; offhand leases %d, force grab %d, input suppression %d",
+                RockProviderApi::negotiatedApiVersion, RockProviderApi::negotiatedTableByteSize, static_cast<std::uint32_t>(result), handle.grantedCapabilities,
+                supportsOffhandReservationLeasesV1() ? 1 : 0, supportsForceGrabCommandV1() ? 1 : 0, supportsHandInputSuppressionV1() ? 1 : 0);
+            logNote(message);
+            if (result != RockProviderResultV1::Ok || handle.ownerToken == 0) {
+                return false;
+            }
+            g_owner = handle.ownerToken;
+            return true;
+        }
+
+        bool snapshot(RockProviderFrameSnapshot& out) noexcept
+        {
+            out = {};
+            return ready() && RockProviderApi::inst->getFrameSnapshot && RockProviderApi::inst->getFrameSnapshot(&out) &&
+                   out.worldGeneration != 0 && out.skeletonGeneration != 0 && out.providerGeneration != 0;
+        }
+
+        void logOnce(const char* what, RockProviderResultV1 result) noexcept
+        {
+            static std::array<std::uint32_t, 8> seen{};
+            static int count = 0;
+            const auto value = static_cast<std::uint32_t>(result);
+            if (result == RockProviderResultV1::Ok || count >= 8) {
+                return;
+            }
+            for (int i = 0; i < count; ++i) {
+                if (seen[i] == value) {
+                    return;
+                }
+            }
+            seen[count++] = value;
+            char message[120]{};
+            std::snprintf(message, sizeof(message), "ROCK %s answered %u", what, value);
+            logNote(message);
+        }
+
+        // Keep the free hand off the gun's support grip (ROCK's reload reservation), renewed every frame.
+        void reserveOffhand(bool on) noexcept
+        {
+            if (!ready() || !has(ROCK_PROVIDER_API_V1_OFFHAND_RESERVATION_LEASES_TABLE_BYTES)) {
+                return;
+            }
+            auto* api = RockProviderApi::inst;
+            if (!on) {
+                if (g_reserved && api->releaseOffhandReservationV1) {
+                    (void)api->releaseOffhandReservationV1(g_owner);
+                }
+                g_reserved = false;
+                return;
+            }
+            RockProviderFrameSnapshot snap{};
+            if (!snapshot(snap) || !api->acquireOffhandReservationV1 || !api->renewOffhandReservationV1) {
+                return;
+            }
+            RockProviderOffhandReservationRequestV1 request{};
+            request.reservation = RockProviderOffhandReservation::ReloadReserved;
+            request.leaseFrames = 6;
+            request.worldGeneration = snap.worldGeneration;
+            request.skeletonGeneration = snap.skeletonGeneration;
+            request.providerGeneration = snap.providerGeneration;
+            auto result = g_reserved ? api->renewOffhandReservationV1(g_owner, &request) : api->acquireOffhandReservationV1(g_owner, &request);
+            if (result != RockProviderResultV1::Ok && g_reserved) {
+                result = api->acquireOffhandReservationV1(g_owner, &request);
+            }
+            logOnce("offhand reservation", result);
+            const bool was = g_reserved;
+            g_reserved = result == RockProviderResultV1::Ok;
+            if (g_reserved && !was) {
+                logInfo("Free hand reserved from the gun's support grip");
+            }
+        }
+
+        // ROCK ignores this hand's grab presses (our own grip check still sees them).
+        void suppressGrab(int index, bool on) noexcept
+        {
+            if (!ready() || !has(ROCK_PROVIDER_API_V1_HAND_INPUT_SUPPRESSION_TABLE_BYTES)) {
+                return;
+            }
+            auto* api = RockProviderApi::inst;
+            if (!on) {
+                if (g_suppressed[index] && api->clearHandInputSuppressionV1) {
+                    (void)api->clearHandInputSuppressionV1(g_owner, toRock(index));
+                }
+                g_suppressed[index] = false;
+                return;
+            }
+            RockProviderFrameSnapshot snap{};
+            if (!snapshot(snap) || !api->setHandInputSuppressionV1) {
+                return;
+            }
+            RockProviderHandInputSuppressionRequestV1 request{};
+            request.hand = toRock(index);
+            request.flags = static_cast<std::uint32_t>(RockProviderHandInputSuppressionFlagV1::SuppressNormalGrabPress);
+            request.leaseFrames = 6;
+            request.worldGeneration = snap.worldGeneration;
+            request.skeletonGeneration = snap.skeletonGeneration;
+            request.providerGeneration = snap.providerGeneration;
+            const auto result = api->setHandInputSuppressionV1(g_owner, &request);
+            logOnce("grab suppression", result);
+            g_suppressed[index] = result == RockProviderResultV1::Ok;
+        }
+
+        // Put a reference into a hand.
+        void forceGrab(int index, std::uint32_t formId, const RE::NiPoint3& at) noexcept
+        {
+            if (!ready() || !has(ROCK_PROVIDER_API_V1_FORCE_GRAB_TABLE_BYTES) || !RockProviderApi::inst->requestForceGrabV1) {
+                return;
+            }
+            RockProviderFrameSnapshot snap{};
+            if (!snapshot(snap)) {
+                return;
+            }
+            RockProviderForceGrabRequestV1 request{};
+            request.hand = toRock(index);
+            request.targetFormId = formId;
+            request.worldGeneration = snap.worldGeneration;
+            request.skeletonGeneration = snap.skeletonGeneration;
+            request.providerGeneration = snap.providerGeneration;
+            request.maxDistanceGame = 40.0f;
+            request.preferredGrabPointGame[0] = at.x;
+            request.preferredGrabPointGame[1] = at.y;
+            request.preferredGrabPointGame[2] = at.z;
+            std::uint64_t command = 0;
+            const auto result = RockProviderApi::inst->requestForceGrabV1(g_owner, &request, &command);
+            char message[120]{};
+            std::snprintf(message, sizeof(message), "ROCK force grab of %08X into the %s hand: %u", formId, index == 0 ? "right" : "left", static_cast<std::uint32_t>(result));
+            logInfo(message);
+        }
+    }
+
     vr::TrackedDeviceIndex_t controllerOf(int index) noexcept
     {
         if (!g_vr) {
@@ -786,6 +976,7 @@ namespace
         int           kind{ 0 };
         bool          fromBelt{ false };
         RE::NiMatrix3 rotation{};
+        int           hand{ -1 };      // made in this hand's palm: ROCK is asked to hold it
     };
 
     struct State
@@ -818,6 +1009,8 @@ namespace
         bool               racking{ false };
         float              rackPull{ 0.0f };
         float              rackGrabY{ 0.0f };
+        float              rackGrabHands{ 0.0f };   // distance between the palms when the slide was taken
+        float              rackGrabPull{ 0.0f };
         bool               rackCycled{ false };
         bool               slideLocked{ false };  // held back after the last shot until racked
         // a magazine caught by the well, pushed in by the hand
@@ -863,10 +1056,10 @@ namespace
         return total;
     }
 
-    void spawnMagazine(int kind, const RE::NiPoint3& at, const RE::NiMatrix3& rotation, std::uint32_t rounds, bool fromBelt) noexcept
+    void spawnMagazine(int kind, const RE::NiPoint3& at, const RE::NiMatrix3& rotation, std::uint32_t rounds, bool fromBelt, int hand = -1) noexcept
     {
         const auto token = g_nextToken++;
-        g_pending[token] = Pending{ rounds, kind, fromBelt, rotation };
+        g_pending[token] = Pending{ rounds, kind, fromBelt, rotation, hand };
         const auto angles = anglesFor(rotation);
         PendingCommand command;
         command.type = kSpawn;
@@ -999,6 +1192,10 @@ namespace
                 loose.fromBelt = it->second.fromBelt;
                 auto* ref = lookupRef(mag.ref);
                 auto* mag3D = ref ? ref->Get3D() : nullptr;
+                const int hand = it->second.hand;
+                if (hand >= 0 && hand < 2 && g_hands[hand].grip && looksLikeObject(mag3D)) {
+                    rock::forceGrab(hand, mag.ref, mag3D->world.translate);
+                }
                 learnConvention(ref, mag3D);
                 if (looksLikeObject(mag3D)) {
                     char message[120]{};
@@ -1097,7 +1294,7 @@ namespace
         RE::NiTransform t;
         t.rotate = rotation;
         const auto up = axisOf(t, 2);
-        spawnMagazine(g_state.kind, hand.palm + up * g_settings.holdUp, rotation, rounds, fromBelt);
+        spawnMagazine(g_state.kind, hand.palm + up * g_settings.holdUp, rotation, rounds, fromBelt, static_cast<int>(&hand - g_hands.data()));
         // which axis of the hand bone runs along the fingers (to tune fHoldRot*)
         RE::NiTransform bone;
         bone.rotate = hand.bone;
@@ -1161,10 +1358,42 @@ namespace
         }
     }
 
+    // Where a loose magazine sits when it is seated, in the gun root's frame. The gun's own magazine node
+    // stands off to the side of the visible magazine (x about -5.7 on the 10mm), so the mouth is put on the
+    // gun's middle plane (the slide's), plus the ini shifts.
+    RE::NiTransform wellFrame() noexcept
+    {
+        auto frame = g_state.wellLocal;
+        if (g_settings.wellCenter && g_state.slideCenterKnown) {
+            frame.translate.x = g_state.slideCenter.x;
+        }
+        frame.translate.x += g_settings.wellShiftX;
+        frame.translate.y += g_settings.wellShiftY;
+        frame.translate.z += g_settings.wellShiftZ;
+        return frame;
+    }
+
+    // A point on the gun's magazine as it is drawn: its body, `offset` out of the well.
+    RE::NiPoint3 magazineGrabPoint(const RE::NiAVObject* root) noexcept
+    {
+        const float scale = root->world.scale > 0.0f ? root->world.scale : 1.0f;
+        return compose(root->world, wellFrame()).translate + directionToWorld(root->world, g_state.magAxis) * ((g_state.offset + 3.0f) * scale);
+    }
+
+    // The middle of the slide in the world, where it stands now.
+    RE::NiPoint3 slideGrabPoint(const RE::NiAVObject* root, const RE::NiAVObject* bolt) noexcept
+    {
+        const float scale = root->world.scale > 0.0f ? root->world.scale : 1.0f;
+        if (!g_state.slideCenterKnown) {
+            return bolt->world.translate;
+        }
+        return compose(root->world, pointTransform(g_state.slideCenter)).translate + axisOf(root->world, 1) * (-g_state.rackPull * scale);
+    }
+
     // A point's place along the well (0 = seated, more = further out) and its distance off the well's line.
     float alongWell(const RE::NiAVObject* root, const RE::NiPoint3& point, float* side = nullptr) noexcept
     {
-        const auto rel = relative(root->world, pointTransform(point)).translate - g_state.wellLocal.translate;
+        const auto rel = relative(root->world, pointTransform(point)).translate - wellFrame().translate;
         const float along = dot(rel, g_state.magAxis);
         if (side) {
             const auto off = rel - g_state.magAxis * along;
@@ -1272,7 +1501,7 @@ namespace
         const bool wellOpen = gun && g_state.phase == kOut && g_state.wellKnown && looksLikeObject(root);
         RE::NiTransform well{};
         if (wellOpen) {
-            well = compose(root->world, g_state.wellLocal);
+            well = compose(root->world, wellFrame());
         }
         int ghost = -1;
         std::uint32_t toInsert = 0;
@@ -1432,16 +1661,13 @@ namespace
         const float scale = root->world.scale > 0.0f ? root->world.scale : 1.0f;
         const auto handLocal = relative(root->world, pointTransform(spare.palm)).translate;
         if (!g_state.racking && spare.valid && spare.grip && !spare.previousGrip && g_state.phase != kExtending && g_state.phase != kGuided) {
-            auto slideAt = bolt->world.translate;
-            if (g_state.slideCenterKnown) {
-                slideAt = compose(root->world, pointTransform(g_state.slideCenter)).translate +
-                          axisOf(root->world, 1) * (-g_state.rackPull * scale);
-            }
-            const float toSlide = distance(spare.palm, slideAt);
-            const float toMag = looksLikeObject(magazine) ? distance(spare.palm, magazine->world.translate) : 1e9f;
+            const float toSlide = distance(spare.palm, slideGrabPoint(root, bolt));
+            const float toMag = looksLikeObject(magazine) && g_state.phase != kOut ? distance(spare.palm, magazineGrabPoint(root)) : 1e9f;
             if (toSlide < g_settings.slideGrabRadius && toSlide <= toMag) {
                 g_state.racking = true;
                 g_state.rackGrabY = handLocal.y + g_state.rackPull;
+                g_state.rackGrabHands = distance(spare.palm, g_hands[g_settings.gunHand].palm);
+                g_state.rackGrabPull = g_state.rackPull;
                 buzz(1 - g_settings.gunHand, 500);
                 char message[120]{};
                 std::snprintf(message, sizeof(message), "Slide taken by the free hand (%.1f from its middle)", toSlide);
@@ -1453,7 +1679,10 @@ namespace
         }
         const float lockAt = g_settings.rackTravel * std::clamp(g_settings.slideLockAt, 0.0f, 1.0f);
         if (g_state.racking) {
-            g_state.rackPull = std::clamp(g_state.rackGrabY - handLocal.y, g_state.slideLocked ? lockAt : 0.0f, g_settings.rackTravel);
+            // along the gun, and by the hands closing in (when the gun turns after the hand, the first stays put)
+            const float byGun = g_state.rackGrabY - handLocal.y;
+            const float byHands = g_state.rackGrabPull + (g_state.rackGrabHands - distance(spare.palm, g_hands[g_settings.gunHand].palm)) / scale;
+            g_state.rackPull = std::clamp(std::max(byGun, byHands), g_state.slideLocked ? lockAt : 0.0f, g_settings.rackTravel);
             if (g_state.slideLocked && g_state.rackPull >= g_settings.rackTravel * 0.95f) {
                 g_state.slideLocked = false;   // pulled off the slide stop: let go and it runs home
                 g_state.rackCycled = true;
@@ -1657,6 +1886,8 @@ namespace
         }
 
         if (!g_state.managed) {
+            rock::reserveOffhand(false);
+            rock::suppressGrab(1 - g_settings.gunHand, false);
             looseMagazines(nullptr, nullptr, player);
             return;
         }
@@ -1772,8 +2003,8 @@ namespace
                 const auto& gunHand = g_hands[g_settings.gunHand];
                 const bool held = g_state.heldMask != 0 && (gunHand.buttons & g_state.heldMask) != 0;
                 const auto& spare = g_hands[1 - g_settings.gunHand];
-                if (spare.valid && spare.grip && !spare.previousGrip && looksLikeObject(magazine) &&
-                    distance(spare.palm, magazine->world.translate) < g_settings.handRadius) {
+                if (spare.valid && spare.grip && !spare.previousGrip && looksLikeObject(magazine) && looksLikeObject(root) &&
+                    distance(spare.palm, magazineGrabPoint(root)) < g_settings.handRadius) {
                     finishEject(root, magazine, &spare);
                 } else if (!held) {
                     g_state.phase = kSlidingOut;
@@ -1814,6 +2045,30 @@ namespace
             (gun.data->ammoCount == 0 || g_state.slideLocked || g_state.racking || g_state.rackPull > 0.0f)) {
             bolt->local = g_state.idle[1];
             refreshSubtree(bolt, RE::NiPoint3{});
+        }
+        // ROCK: the free hand stays off the gun's support grip while it works the slide or a magazine
+        {
+            const int free = 1 - g_settings.gunHand;
+            const auto& spare = g_hands[free];
+            bool nearSlide = false;
+            if (spare.valid && looksLikeObject(root) && looksLikeObject(bolt)) {
+                nearSlide = distance(spare.palm, slideGrabPoint(root, bolt)) < g_settings.slideGrabRadius + 6.0f;
+            }
+            bool holdingLoose = false;
+            if (spare.valid && spare.grip) {
+                for (const auto& [id, loose] : g_loose) {
+                    auto* ref = lookupRef(id);
+                    auto* mag3D = ref ? ref->Get3D() : nullptr;
+                    if (looksLikeObject(mag3D) && distance(mag3D->world.translate, spare.palm) < g_settings.handRadius) {
+                        holdingLoose = true;
+                        break;
+                    }
+                }
+            }
+            const bool working = g_state.racking || g_state.phase == kExtending || g_state.phase == kGuided;
+            const bool reserve = g_settings.rockOffhand && (working || nearSlide || holdingLoose);
+            rock::reserveOffhand(reserve);
+            rock::suppressGrab(free, g_settings.rockOffhand && (g_state.racking || (nearSlide && !holdingLoose && g_state.phase != kExtending)));
         }
         rackByHand(gun, root, bolt, magazine, dt);
 
