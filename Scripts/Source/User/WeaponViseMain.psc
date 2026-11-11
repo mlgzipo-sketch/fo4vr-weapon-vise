@@ -79,6 +79,9 @@ EndEvent
 ; A part picked up (by hand or by activating it) becomes the game's loose mod,
 ; so the workbench menu and other weapons can use it.
 Event ObjectReference.OnItemAdded(ObjectReference akSender, Form akBaseItem, int aiItemCount, ObjectReference akItemReference, ObjectReference akSourceContainer)
+	if !Ready()
+		return
+	endif
 	int i = WV_PartItems.Find(akBaseItem)
 	if i < 0
 		return
@@ -97,6 +100,9 @@ EndEvent
 
 ; A loose mod dropped into the world turns into the part itself.
 Event ObjectReference.OnItemRemoved(ObjectReference akSender, Form akBaseItem, int aiItemCount, ObjectReference akItemReference, ObjectReference akDestContainer)
+	if !Ready()
+		return
+	endif
 	if akDestContainer || !akItemReference
 		return
 	endif
@@ -147,7 +153,16 @@ Function PruneParts()
 	endwhile
 EndFunction
 
+; False for a stale copy of this script left in a save (its quest id now names another record):
+; without properties it must do nothing at all.
+bool Function Ready()
+	return WorkbenchKeyword && WV_Weapons && WV_LooseMods && WV_PartItems && WV_Mods
+EndFunction
+
 Event OnTimer(int aiTimerID)
+	if !Ready()
+		return
+	endif
 	if aiTimerID == TimerScan
 		Scan()
 		if !Busy

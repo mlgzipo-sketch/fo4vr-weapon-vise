@@ -19,7 +19,16 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = sys.argv[1] if len(sys.argv) > 1 else 'WeaponVise.esp'
 FORM_VERSION = 131
 OWN = 0x01000000
-next_id = 0x800
+next_id = 0x900   # records added after 0.5 get ids from here
+
+# FormIDs of 0.5 must never move: saves keep the running quest script by its id (0x816),
+# and a script whose quest id points at another record loses all its properties.
+PINNED = {'WV_Mods': 0x812, 'WV_PartItems': 0x813, 'WV_LooseMods': 0x814, 'WV_Weapons': 0x815, 'WV_Quest': 0x816}
+for _k, _e in enumerate(['Grip_Standard', 'Mag_Large', 'Mag_Small', 'Barrel_LightShort', 'Muzzle_Suppressor',
+                         'Scope_SightReflex', 'Scope_SightReflex_Circle', 'Scope_SightsGlow', 'Grip_Better1',
+                         'Barrel_LightPortedShort', 'Grip_Better2', 'Muzzle_MuzzleBrake', 'Muzzle_Compensator',
+                         'Mag_LargeQuick', 'Mag_SmallQuick', 'Barrel_Short', 'Barrel_PortedShort', 'Scope_ScopeRecon']):
+    PINNED['WV_Part_10mm_' + _e] = 0x800 + _k
 
 def zstr(s, enc='cp1251'): return s.encode(enc) + b'\0'
 def sub(tag, data):
@@ -39,7 +48,7 @@ def new_id():
 
 recs, ids = {}, {}
 def add(tag, edid, subs):
-    fid = new_id()
+    fid = (OWN | PINNED[edid]) if edid in PINNED else new_id()
     ids[edid] = fid
     recs.setdefault(tag, []).append(record(tag, fid, [sub('EDID', zstr(edid))] + subs))
     return fid
