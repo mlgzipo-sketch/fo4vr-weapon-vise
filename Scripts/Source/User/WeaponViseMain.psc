@@ -100,10 +100,14 @@ Event ObjectReference.OnItemRemoved(ObjectReference akSender, Form akBaseItem, i
 	if akDestContainer || !akItemReference
 		return
 	endif
+	if !(akBaseItem as MiscObject)
+		return   ; only loose mods turn into parts: never touch a dropped weapon
+	endif
 	int i = WV_LooseMods.Find(akBaseItem)
 	if i < 0 || Parts.Length >= MaxParts
 		return
 	endif
+	WeaponVise.Notify(11)
 	WaitFor3D(akItemReference)
 	float[] pose = new float[4]
 	pose[0] = akItemReference.GetPositionX()
@@ -257,7 +261,7 @@ Function Handle()
 		endif
 		cmd = WeaponVise.PollCommand()
 	endwhile
-	if Clamped && WeaponVise.ModelOutdated()
+	if Clamped && Clamped.GetBaseObject() as Weapon && WeaponVise.ModelOutdated()
 		Reload3D()
 	endif
 EndFunction
@@ -427,6 +431,7 @@ EndFunction
 
 ; Some mod changes do not show until the weapon's 3D is rebuilt.
 Function Reload3D()
+	WeaponVise.Notify(12)
 	Clamped.Disable()
 	Clamped.Enable()
 	WaitFor3D(Clamped)
@@ -499,7 +504,8 @@ EndFunction
 Function ClearGhosts()
 	int i = 0
 	while Ghosts && i < Ghosts.Length
-		if Ghosts[i]
+		if Ghosts[i] && Ghosts[i].GetBaseObject() as Static
+			WeaponVise.Notify(13)
 			Ghosts[i].Disable()
 			Ghosts[i].Delete()
 		endif
