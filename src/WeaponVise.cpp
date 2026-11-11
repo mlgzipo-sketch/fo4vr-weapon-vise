@@ -90,6 +90,7 @@ namespace
         float snapTime{ 0.15f };        // seconds of the snap-on animation
         float ghostFade{ 0.5f };        // how see-through the attach ghost is
         float heldRadius{ 15.0f };      // a part held by ROCK this close to its place previews
+        bool removeIntoHand{ false };   // false: a removed part drops as a real object for ROCK to take
         bool logGrab{ true };           // log what each grip press near the weapon found
         bool refresh3D{ false };         // reload the weapon's 3D when it does not show a change
         bool logTree{ true };
@@ -145,6 +146,7 @@ namespace
                 else if (key == "fGhostFade") s.ghostFade = value;
                 else if (key == "fHeldRadius") s.heldRadius = value;
                 else if (key == "bLogGrab") s.logGrab = value != 0.0f;
+                else if (key == "bRemoveIntoHand") s.removeIntoHand = value != 0.0f;
                 else if (key == "bRefresh3D") s.refresh3D = value != 0.0f;
                 else if (key == "bLogTree") s.logTree = value != 0.0f;
                 else if (key == "bMessages") s.messages = value != 0.0f;
@@ -1471,16 +1473,20 @@ namespace
         for (const auto id : inHand) {
             auto* ref = lookupRef(id);
             auto* root = ref ? ref->Get3D() : nullptr;
-            for (int index = 0; index < 2; ++index) {
+            if (!looksLikeObject(root)) {
+                // 3D not loaded yet: try again next frame
+                std::scoped_lock guard(g_shared.lock);
+                g_shared.inHandParts.push_back(id);
+                continue;
+            }
+            if (g_parts[id].collision < 0) {
+                g_parts[id].collision = hasCollision(root) ? 1 : 0;
+            }
+            bool taken = false;
+            for (int index = 0; index < 2 && g_settings.removeIntoHand; ++index) {
                 auto& hand = g_hands_state[index];
                 if (hand.mode != Hand::Mode::Await || !hand.grip) {
                     continue;
-                }
-                if (!looksLikeObject(root)) {
-                    // 3D not loaded yet: try again next frame
-                    std::scoped_lock guard(g_shared.lock);
-                    g_shared.inHandParts.push_back(id);
-                    break;
                 }
                 {
                     // the part sits in the palm: its middle where the hand grips
@@ -1490,14 +1496,32 @@ namespace
                     world.translate = world.translate + (hand.point - center);
                     hand.offset = relative(hand.frame, world);
                 }
-                if (g_parts[id].collision < 0) {
-                    g_parts[id].collision = hasCollision(root) ? 1 : 0;
-                }
                 hand.mode = Hand::Mode::Carry;
                 hand.carried3D = nullptr;
                 hand.part = id;
                 g_parts[id].carriedBy = index;
+                taken = true;
                 break;
+            }
+            if (!taken) {
+                // nobody carries it (grip let go, or bRemoveIntoHand=0): it becomes a normal
+                // object right where it came off, falls onto the bench and ROCK takes it.
+                // A keyframed part left alone used to hang in the air for good.
+                for (auto& hand : g_hands_state) {
+                    if (hand.mode == Hand::Mode::Await) {
+                        hand.mode = hand.grip ? Hand::Mode::Done : Hand::Mode::Idle;
+                    }
+                }
+                PendingCommand command;
+                command.type = kDrop;
+                command.part = id;
+                command.pose = poseOf(root->world.translate, 0.0f);
+                RE::NiTransform benchWorld;
+                if (g_parts[id].collision == 0 && benchFrame(lookupRef(g_bench), benchWorld)) {
+                    command.pose[2] = benchPoint(benchWorld, 0.0f, 0.0f, g_settings.tableZ).z;
+                }
+                pushCommand(command);
+                g_parts[id].carriedBy = -1;
             }
         }
     }
