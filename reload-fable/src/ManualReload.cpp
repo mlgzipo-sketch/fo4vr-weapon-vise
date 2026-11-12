@@ -124,7 +124,9 @@ namespace
         bool  rockPlacesHeld{ true };   // a magazine ROCK holds in the hand is drawn where ROCK has it (one attachment, not two)
         bool  realInHand{ false };      // a magazine out of the well is a real object ROCK holds (always so with bCore2)
         bool  core2{ true };            // 0.12 core: parts move along their way by the palm on them (no grab point), a magazine out of the gun is ROCK's
-        float contactMargin{ 2.5f };    // the palm this close to a part's box touches it (gun units)
+        float contactMargin{ 2.5f };
+        int   markButton{ 32 };         // the free hand's stick click: writes a numbered mark and the whole state to the log
+        bool  traceState{ true };       // every change of what the plugin thinks (where the magazine is, the slide, who holds what)    // the palm this close to a part's box touches it (gun units)
         bool  recordedBolt{ true };     // the bolt / slide moves along the recorded way (a bolt action lifts, then goes back)
         bool  autoRecord{ true };       // a gun whose reload is not recorded yet is left to the game for one reload, which is recorded
         bool  recordAnim{ false };      // the plugin keeps its hands off and writes down how the game's own reload moves every part
@@ -172,7 +174,7 @@ namespace
             { "fSlideGrabRadius", 2, &s.slideGrabRadius }, { "fSlideGrabAt", 2, &s.slideGrabAt }, { "fSlideGrabHigh", 2, &s.slideGrabHigh }, { "fRackTravel", 2, &s.rackTravel }, { "fSlideLockAt", 2, &s.slideLockAt },
             { "fHandRadius", 2, &s.handRadius }, { "fLooseLifetime", 2, &s.looseLifetime }, { "iMaxLoose", 1, &s.maxLoose },
             { "bAllGuns", 0, &s.allGuns }, { "bRockParts", 0, &s.rockParts }, { "bRockBeltHandover", 0, &s.rockBeltHandover },
-            { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bBreech", 0, &s.breech }, { "bRecordAnim", 0, &s.recordAnim }, { "bAutoRecord", 0, &s.autoRecord }, { "bRecordedBolt", 0, &s.recordedBolt }, { "bRealInHand", 0, &s.realInHand }, { "bCore2", 0, &s.core2 }, { "fContactMargin", 2, &s.contactMargin }, { "fCylinderSwing", 2, &s.cylinderSwing },
+            { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bBreech", 0, &s.breech }, { "bRecordAnim", 0, &s.recordAnim }, { "bAutoRecord", 0, &s.autoRecord }, { "bRecordedBolt", 0, &s.recordedBolt }, { "bRealInHand", 0, &s.realInHand }, { "bCore2", 0, &s.core2 }, { "fContactMargin", 2, &s.contactMargin }, { "iMarkButton", 1, &s.markButton }, { "bTraceState", 0, &s.traceState }, { "fCylinderSwing", 2, &s.cylinderSwing },
             { "fBreakAngle", 2, &s.breakAngle }, { "fFlickSpeed", 2, &s.flickSpeed }, { "fBreechRadius", 2, &s.breechRadius }, { "bRockPlacesHeld", 0, &s.rockPlacesHeld }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
             { "fChamberForward", 2, &s.chamberForward }, { "fRoundUp", 2, &s.roundUp }, { "fRoundRotX", 2, &s.roundRotX },
             { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale },
@@ -3385,6 +3387,87 @@ namespace
         }
     }
 
+    // ------------------------------------------------------------ what the plugin thinks, for the log
+
+    const char* placeName(int place) noexcept
+    {
+        switch (place) {
+        case kSeated: return "in the gun";
+        case kRailAuto: return "sticking out by itself";
+        case kRailHand: return "in the well, moved by the hand";
+        case kHand: return "drawn in the hand (real one on its way)";
+        case kGone: return "no magazine in the gun";
+        default: return "?";
+        }
+    }
+
+    std::string nodeState(RE::NiAVObject* node) noexcept
+    {
+        if (!looksLikeObject(node)) {
+            return "missing";
+        }
+        int hiddenUp = 0;
+        for (auto* at = node->parent; looksLikeObject(at) && hiddenUp < 12; at = at->parent) {
+            if (at->flags.flags & 1ull) {
+                char text[96];
+                std::snprintf(text, sizeof(text), "HIDDEN by parent '%s'", nodeName(at).c_str());
+                return text;
+            }
+            ++hiddenUp;
+        }
+        return (node->flags.flags & 1ull) ? "HIDDEN" : "shown";
+    }
+
+    // One line per thing: the magazine, the slide, the free hand, the real magazines around.
+    void writeState(const char* why, const Gun& gun, RE::NiAVObject* root, RE::NiAVObject* magazine, RE::NiAVObject* bolt) noexcept
+    {
+        const auto& st = g_state;
+        const auto& free = g_hands[freeIndex()];
+        note("[%s] magazine: %s, %.1f out of %.1f%s%s, %u rounds; gun ammoCount %u, chamber %s", why, placeName(st.place), st.s, st.length,
+            st.autoHold ? ", held out by the button" : "", st.resting ? ", resting half in" : "", st.rounds, gun.data ? gun.data->ammoCount : 0u,
+            st.chamber ? "loaded" : "empty");
+        if (looksLikeObject(magazine) && looksLikeObject(root)) {
+            const auto at = inGun(root, magazine->world.translate);
+            const auto want = st.magRest.translate + st.axis * st.s;
+            note("[%s]   magazine node %s, at (%.1f %.1f %.1f) in the gun, %.1f from where it should be", why, nodeState(magazine).c_str(), at.x, at.y,
+                at.z, distance(at, want));
+        } else {
+            note("[%s]   magazine node missing", why);
+        }
+        if (looksLikeObject(bolt) && looksLikeObject(root)) {
+            const auto at = inGun(root, bolt->world.translate);
+            note("[%s] slide: pulled %.2f of %.1f%s%s%s%s, node %s at (%.1f %.1f %.1f)", why, st.rackPull, g_settings.rackTravel,
+                st.racking ? ", TAKEN by the grip" : "", st.pushing ? ", pushed by the open palm" : "", st.slideLocked ? ", locked open" : "",
+                st.boltAction ? ", bolt action" : "", nodeState(bolt).c_str(), at.x, at.y, at.z);
+        }
+        const bool onMag = looksLikeObject(root) && palmOnMagazine(root, free.palm);
+        note("[%s] free hand: %s, grip %s (%s), palm on the magazine %d, wants %d, ROCK holds %08X (on magazine %d, on slide %d, on gun %d)", why,
+            free.valid ? "tracked" : "NOT TRACKED", free.grip ? "closed" : "open", griphook::owned() ? "hidden from ROCK" : "seen by ROCK", onMag ? 1 : 0,
+            st.armReason, rocklink::heldBy(freeIndex()), g_rock.onMagazine ? 1 : 0, g_rock.onBolt ? 1 : 0, g_rock.onGun ? 1 : 0);
+        if (st.handToken || st.handRef) {
+            note("[%s] real magazine for the hand: token %d (spare %d, let go %d), ref %08X, ROCK took it %d", why, st.handToken, st.handSpare ? 1 : 0,
+                st.handTokenDropped ? 1 : 0, st.handRef, st.grabDone ? 1 : 0);
+        }
+        for (const auto& [id, loose] : g_loose) {
+            auto* ref = lookupRef(id);
+            auto* mag3D = ref ? ref->Get3D() : nullptr;
+            note("[%s] real magazine %08X: %u rounds, %s, 3D %s, %.0f from the free hand", why, id, loose.rounds,
+                !ref ? "GONE" : (ref->IsDisabled() ? "DISABLED" : "enabled"), looksLikeObject(mag3D) ? nodeState(mag3D).c_str() : "NONE",
+                looksLikeObject(mag3D) && free.valid ? distance(mag3D->world.translate, free.palm) : -1.0f);
+        }
+    }
+
+    // A short fingerprint of the state: when it changes the whole state is written down.
+    std::string stateKey() noexcept
+    {
+        const auto& st = g_state;
+        char text[160];
+        std::snprintf(text, sizeof(text), "%d|%d|%d|%u|%d|%d|%d|%d|%d|%d|%d|%u|%d", st.place, st.resting ? 1 : 0, st.autoHold ? 1 : 0, st.rounds,
+            st.chamber ? 1 : 0, st.racking ? 1 : 0, st.slideLocked ? 1 : 0, st.rackPull > 0.5f ? 1 : 0, st.rackPull > g_settings.rackTravel - 0.5f ? 1 : 0,
+            g_rock.onMagazine ? 1 : 0, g_rock.onBolt ? 1 : 0, st.handRef, st.grabDone ? 1 : 0);
+        return text;
+    }
+
     void update() noexcept
     {
         auto* player = RE::PlayerCharacter::GetSingleton();
@@ -3691,6 +3774,7 @@ namespace
                 }
             }
         } else if (press && g_settings.spareFromBelt && st.place != kGone && !st.racking && inBelt(player, free.palm) &&
+                   distance(free.palm, root->world.translate) > g_settings.gunRadius && st.armReason != kArmSlide && !g_rock.onBolt && !g_rock.onGun &&
                    now - st.lastBelt > std::chrono::milliseconds(700)) {
             // the gun still has its magazine: a spare one is a real object for ROCK to hold
             const auto rounds = freshMagazineRounds(gun, inventory);
@@ -4057,6 +4141,31 @@ namespace
                 st.lastDrive = now;
             }
             g_rock = rocklink::frame(link);
+        }
+
+        // the log: every change of state, and a numbered mark when the free hand clicks its stick
+        {
+            static std::string lastKey;
+            static int marks = 0;
+            const bool markNow = free.valid && (free.buttons & buttonMask(g_settings.markButton)) != 0 &&
+                                 (free.previousButtons & buttonMask(g_settings.markButton)) == 0;
+            if (markNow) {
+                ++marks;
+                char tag[32];
+                std::snprintf(tag, sizeof(tag), "MARK %d", marks);
+                logNote("==================================================================");
+                writeState(tag, gun, root, magazine, bolt);
+                char text[96];
+                std::snprintf(text, sizeof(text), "Метка %d записана в лог", marks);
+                hud(text);
+                buzz(freeIndex(), 3000);
+            } else if (g_settings.traceState) {
+                auto key = stateKey();
+                if (key != lastKey) {
+                    lastKey = std::move(key);
+                    writeState("state", gun, root, magazine, bolt);
+                }
+            }
         }
 
         // the grip of some controllers is also their third axis
