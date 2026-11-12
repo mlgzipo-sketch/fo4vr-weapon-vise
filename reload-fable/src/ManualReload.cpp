@@ -1904,6 +1904,9 @@ namespace
                         const float point[3]{ palm.x, palm.y, palm.z };
                         auto* ref = lookupRef(mag.ref);
                         auto* mag3D = ref ? ref->Get3D() : nullptr;
+                        if (const auto held = rocklink::heldBy(freeIndex()); held != 0 && held != mag.ref) {
+                            rocklink::releaseHeld(freeIndex(), held);
+                        }
                         if (looksLikeObject(mag3D)) {
                             const auto c = mag3D->worldBound.center;
                             const float middle[3]{ c.x, c.y, c.z };
@@ -3012,6 +3015,11 @@ namespace
             st.grabTriedAt = now;
             ++st.grabTries;
             detail("CORE2: asking ROCK again for magazine %08X (state %d, failure %d, held %08X)", st.handRef, state, failure, held);
+            if (held != 0) {
+                // ROCK still has the hand on the gun's magazine part (pulled out of the well): it lets go first
+                const bool let = rocklink::releaseHeld(freeIndex(), held);
+                detail("CORE2: ROCK is asked to let go of %08X first: %d", held, let ? 1 : 0);
+            }
             auto* ref = lookupRef(st.handRef);
             auto* mag3D = ref ? ref->Get3D() : nullptr;
             const auto c = looksLikeObject(mag3D) ? mag3D->worldBound.center : free.palm;
