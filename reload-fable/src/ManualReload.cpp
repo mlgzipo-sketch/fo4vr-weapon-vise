@@ -118,7 +118,7 @@ namespace
         float handRadius{ 16.0f };
         float looseLifetime{ 90.0f };
         int   maxLoose{ 6 };
-        bool  allGuns{ false };         // every gun with a magazine of group 1, not only the 10mm pistol
+        bool  allGuns{ true };         // every gun with a magazine of group 1, not only the 10mm pistol
         bool  rockParts{ true };        // ROCK 1.0 holds the free hand on the magazine and the slide (its hand and fingers)
         bool  rockBeltHandover{ true }; // a magazine from the belt: the grip is shown to ROCK so that it closes the hand on it
         bool  holdPoseOnExit{ false };  // a magazine pulled out of the well turns to the pose of one from the belt
@@ -1290,6 +1290,9 @@ namespace
         Clock::time_point  handoverAt{};                   // a magazine from the belt: when the grip is shown to ROCK
         bool               handoverDue{ false };
         bool               rockWasOnBolt{ false };
+        RE::NiPoint3       sideInNode{};                   // the magazine's middle line off the node's own Z line, in the node's frame
+        RE::NiPoint3       sideInGun{};                    // ..the same in the gun's frame
+        Clock::time_point  forceTargets{};                 // until then ROCK is told what may be taken even with the hand closed
         bool               magBoxUsed{ false };            // the magazine's size was taken from ROCK's box
         bool               boltBoxUsed{ false };
         Clock::time_point  seatedAt{};
@@ -1354,7 +1357,7 @@ namespace
     // gun's units, and its distance off the rail's line.
     float alongRail(const RE::NiAVObject* root, const RE::NiPoint3& point, float* side = nullptr) noexcept
     {
-        const auto rel = relative(root->world, pointTransform(point)).translate - g_state.magRest.translate;
+        const auto rel = relative(root->world, pointTransform(point)).translate - g_state.magRest.translate - (side ? g_state.sideInGun : RE::NiPoint3{});
         const float along = dot(rel, g_state.axis);
         if (side) {
             const auto off = rel - g_state.axis * along;
@@ -1366,14 +1369,15 @@ namespace
     // The top of a magazine whose node stands at `pose`.
     RE::NiPoint3 topOf(const RE::NiTransform& pose) noexcept
     {
-        return pose.translate + axisOf(pose, 2) * (g_state.topAt * pose.scale);
+        return pose.translate + (axisOf(pose, 0) * g_state.sideInNode.x + axisOf(pose, 1) * g_state.sideInNode.y + axisOf(pose, 2) * g_state.topAt) * pose.scale;
     }
 
     // Where the palm takes a magazine on the rail.
     RE::NiPoint3 grabPoint(const RE::NiAVObject* root) noexcept
     {
         const auto pose = railPose(root, g_state.s);
-        return pose.translate + axisOf(pose, 2) * ((g_state.bottomAt + g_settings.grabUp) * pose.scale);
+        return pose.translate + (axisOf(pose, 0) * g_state.sideInNode.x + axisOf(pose, 1) * g_state.sideInNode.y +
+                                 axisOf(pose, 2) * (g_state.bottomAt + g_settings.grabUp)) * pose.scale;
     }
 
     RE::NiPoint3 tiltAxis(float degrees) noexcept
@@ -1473,6 +1477,14 @@ namespace
             if (halfLength > 1.5f && halfLength < 25.0f && std::fabs(out) < 30.0f) {
                 const float before = st.bottomAt;
                 st.bottomAt = -(out + halfLength) / scale;
+                st.sideInGun = (middle - st.magRest.translate) - st.axis * out;
+                st.sideInNode = { dot(axisOf(st.magRest, 0), st.sideInGun) / scale, dot(axisOf(st.magRest, 1), st.sideInGun) / scale, 0.0f };
+                if (std::sqrt(dot(st.sideInGun, st.sideInGun)) < 1.0f) {
+                    st.sideInGun = {};      // the node is on the magazine's line (the 10mm pistol)
+                    st.sideInNode = {};
+                } else {
+                    note("  the magazine is (%.1f, %.1f) off its node's line: the hand and the well follow the magazine itself", st.sideInNode.x, st.sideInNode.y);
+                }
                 const float top = (halfLength - out) / scale;
                 note("ROCK box of the magazine: (%.1f %.1f %.1f)..(%.1f %.1f %.1f); baseplate %.2f below the node (was %.2f), top %.2f above (node says %.2f)",
                     lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], -st.bottomAt, -before, top, st.topAt);
@@ -1904,7 +1916,8 @@ namespace
         RE::NiTransform pose = identityTransform();
         pose.rotate = fromMat(mul(turn, toMat(base.rotate)));
         pose.scale = scale;
-        pose.translate = hand.palm - axisOf(pose, 2) * ((g_state.bottomAt + g_settings.holdUp) * scale) + axisOf(pose, 0) * (g_settings.holdSide * scale) +
+        pose.translate = hand.palm - axisOf(pose, 2) * ((g_state.bottomAt + g_settings.holdUp) * scale) +
+                         axisOf(pose, 0) * ((g_settings.holdSide - g_state.sideInNode.x) * scale) - axisOf(pose, 1) * (g_state.sideInNode.y * scale) +
                          axisOf(pose, 1) * (g_settings.holdForward * scale);
         return pose;
     }
@@ -2340,6 +2353,7 @@ namespace
                     st.blendSeconds = 0.0f;
                     st.lastBelt = now;
                     st.handoverAt = now + std::chrono::milliseconds(60);
+                    st.forceTargets = now + std::chrono::milliseconds(50);   // ROCK learns of the magazine before it sees the grip
                     st.handoverDue = g_settings.rockBeltHandover;
                     playSound(4);
                     buzz(freeIndex(), 1200);
@@ -2585,11 +2599,13 @@ namespace
             link.freeHand = freeIndex();
             link.exclusive = st.place != kSeated || st.armReason == kArmSlide || st.racking;
             const bool justSeated = now - st.seatedAt < std::chrono::milliseconds(700);   // the hand must not jump from the magazine to the slide
-            link.keepTargets = free.grip && !justSeated;
+            link.keepTargets = free.grip && !justSeated && now > st.forceTargets;
             link.chamber = st.chamber ? 2 : 1;
             const bool magOut = draw && (st.place == kRailAuto || st.place == kRailHand || st.place == kHand) && looksLikeObject(magazine);
             link.magazine.node = kMovingParts[0];
             link.magazine.grab = magOut && st.railKnown;
+            link.magazine.point[0] = st.sideInNode.x;
+            link.magazine.point[1] = st.sideInNode.y;
             link.magazine.point[2] = st.bottomAt + g_settings.grabUp;
             link.magazine.radius = g_settings.magGrabRadius;
             if (magOut && looksLikeObject(magazine->parent)) {
