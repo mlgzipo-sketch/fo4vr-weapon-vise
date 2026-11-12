@@ -122,6 +122,8 @@ namespace
         bool  rockParts{ true };        // ROCK 1.0 holds the free hand on the magazine and the slide (its hand and fingers)
         bool  rockBeltHandover{ true }; // a magazine from the belt: the grip is shown to ROCK so that it closes the hand on it
         bool  rockPlacesHeld{ true };   // a magazine ROCK holds in the hand is drawn where ROCK has it (one attachment, not two)
+        bool  recordedBolt{ true };     // the bolt / slide moves along the recorded way (a bolt action lifts, then goes back)
+        bool  autoRecord{ true };       // a gun whose reload is not recorded yet is left to the game for one reload, which is recorded
         bool  recordAnim{ false };      // the plugin keeps its hands off and writes down how the game's own reload moves every part
         bool  breech{ true };           // revolvers and the break-action shotgun are opened and loaded by hand
         float cylinderSwing{ -80.0f };  // how far a revolver's cylinder swings out (degrees; minus = to the gun's left)
@@ -165,7 +167,7 @@ namespace
             { "fSlideGrabRadius", 2, &s.slideGrabRadius }, { "fSlideGrabAt", 2, &s.slideGrabAt }, { "fSlideGrabHigh", 2, &s.slideGrabHigh }, { "fRackTravel", 2, &s.rackTravel }, { "fSlideLockAt", 2, &s.slideLockAt },
             { "fHandRadius", 2, &s.handRadius }, { "fLooseLifetime", 2, &s.looseLifetime }, { "iMaxLoose", 1, &s.maxLoose },
             { "bAllGuns", 0, &s.allGuns }, { "bRockParts", 0, &s.rockParts }, { "bRockBeltHandover", 0, &s.rockBeltHandover },
-            { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bBreech", 0, &s.breech }, { "bRecordAnim", 0, &s.recordAnim }, { "fCylinderSwing", 2, &s.cylinderSwing },
+            { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bBreech", 0, &s.breech }, { "bRecordAnim", 0, &s.recordAnim }, { "bAutoRecord", 0, &s.autoRecord }, { "bRecordedBolt", 0, &s.recordedBolt }, { "fCylinderSwing", 2, &s.cylinderSwing },
             { "fBreakAngle", 2, &s.breakAngle }, { "fFlickSpeed", 2, &s.flickSpeed }, { "fBreechRadius", 2, &s.breechRadius }, { "bRockPlacesHeld", 0, &s.rockPlacesHeld }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
             { "fChamberForward", 2, &s.chamberForward }, { "fRoundUp", 2, &s.roundUp }, { "fRoundRotX", 2, &s.roundRotX },
             { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale },
@@ -363,7 +365,7 @@ namespace
 
     // Guns with a detachable magazine and a slide / bolt / charging handle (group 1). A gun is handled when the
     // magazine mod it wears has one of these models; the index is the magazine's kind (MRF_Mags order in the ESP).
-    constexpr std::array<const char*, 16> kMagModels{
+    constexpr std::array<const char*, 19> kMagModels{
         "weapons\\10mmpistol\\10mmmag01.nif", "weapons\\10mmpistol\\10mmmaglarge.nif",
         "weapons\\machinegun\\mgmagstraight.nif", "weapons\\machinegun\\mgmagdrum.nif",
         "weapons\\combatshotgun\\combatriflemagmedium.nif", "weapons\\combatshotgun\\combatriflemaglarge.nif",
@@ -373,6 +375,7 @@ namespace
         "weapons\\handmade\\magazines\\piperifledrummag.nif",
         "weapons\\combatshotgun\\combatshotgunsmallmag.nif", "weapons\\combatshotgun\\combatshotgunmediummag.nif",
         "weapons\\combatshotgun\\drummag.nif",
+        "ammo\\308\\308smallmag.nif", "ammo\\308\\308mediummag.nif", "ammo\\308\\308largemag.nif",
     };
 
     // The magazine the equipped gun wears: its magazine mod's model, looked up in kMagModels (-1: none of ours).
@@ -1261,11 +1264,14 @@ namespace
         bool              driving{ false };   // the free hand turns the opening part about its hinge
         float             driveAngle0{ 0.0f };
         float             driveT0{ 0.0f };
+        bool              pushing{ false };   // the open palm is against the opening part
+        float             pushAngle{ 0.0f };
     };
 
     struct State
     {
         Breech             breech{};
+        bool               recordTold{ false };
         RE::TESObjectWEAP* weapon{ nullptr };
         bool               managed{ false };
         std::uint32_t      lastAmmo{ 0xFFFFFFFF };
@@ -1343,6 +1349,8 @@ namespace
         Clock::time_point  handoverAt{};                   // a magazine from the belt: when the grip is shown to ROCK
         bool               handoverDue{ false };
         bool               rockWasOnBolt{ false };
+        bool               boltAction{ false };            // the recording turns the bolt up first: worked by hand after every shot
+        RE::NiPoint3       handInBolt{};                   // the hand against the bolt when taken (recorded path)
         RE::NiPoint3       sideInNode{};                   // the magazine's middle line off the node's own Z line, in the node's frame
         RE::NiPoint3       sideInGun{};                    // ..the same in the gun's frame
         RE::NiPoint3       prevDrawnAt{};                  // last frame: the magazine in the hand and its parent node,
@@ -2087,141 +2095,6 @@ namespace
         }
     }
 
-    // The slide: grip it with the free hand, pull it back along the gun, let it go forward.
-    // All the way back throws out the chambered round; going forward takes the next one from the magazine.
-    void rackByHand(const Gun& gun, RE::NiAVObject* root, RE::NiAVObject* bolt, float dt) noexcept
-    {
-        auto& st = g_state;
-        if (!looksLikeObject(root) || !looksLikeObject(bolt)) {
-            st.racking = false;
-            return;
-        }
-        const auto& spare = g_hands[freeIndex()];
-        const auto& firing = g_hands[g_settings.gunHand];
-        const float scale = gunScale(root);
-        // the controller, not the drawn hand: ROCK moves the drawn hand onto whatever it holds
-        const auto handLocal = relative(root->world, pointTransform(spare.wand.translate)).translate;
-        const bool handBusy = st.place == kRailHand || st.place == kHand || (griphook::owned() && st.armReason != kArmSlide);
-        const bool rockTook = g_rock.onBolt && !st.rockWasOnBolt && spare.valid && spare.grip && !handBusy &&
-                              Clock::now() - st.seatedAt > std::chrono::milliseconds(700);
-        st.rockWasOnBolt = g_rock.onBolt;
-        if (!st.racking && spare.valid && spare.grip && ((!spare.previousGrip && !handBusy) || rockTook)) {
-            const float toSlide = distance(spare.palm, slideGrabPoint(root, bolt));
-            const float toMag = st.place == kRailAuto && st.railKnown ? distance(spare.palm, grabPoint(root)) : 1e9f;
-            if (rockTook || (toSlide < g_settings.slideGrabRadius && toSlide <= toMag)) {
-                st.racking = true;
-                st.rackGrabY = handLocal.y + st.rackPull;
-                st.rackGrabHands = distance(spare.wand.translate, firing.wand.translate);
-                st.rackGrabPull = st.rackPull;
-                buzz(freeIndex(), 500);
-                detail("Slide taken by the free hand (%.1f from its middle)", toSlide);
-            }
-        }
-        if (st.racking && !(spare.valid && spare.grip)) {
-            st.racking = false;   // let go: the spring sends it home
-        }
-        const float lockAt = g_settings.rackTravel * std::clamp(g_settings.slideLockAt, 0.0f, 1.0f);
-        if (st.racking) {
-            // along the gun, and by the hands closing in (when the gun turns after the hand, the first stays put)
-            const float byGun = st.rackGrabY - handLocal.y;
-            const float byHands = st.rackGrabPull + (st.rackGrabHands - distance(spare.wand.translate, firing.wand.translate)) / scale;
-            st.rackPull = std::clamp(std::max(byGun, byHands), st.slideLocked ? lockAt : 0.0f, g_settings.rackTravel);
-            if (st.slideLocked && st.rackPull >= g_settings.rackTravel * 0.95f) {
-                st.slideLocked = false;   // pulled off the slide stop: let go and it runs home
-                st.rackCycled = true;
-                playSound(2);
-                logNote("RACK: slide pulled off the stop");
-            }
-        } else if (st.slideLocked) {
-            st.rackPull = approach(st.rackPull, lockAt, 80.0f * dt);   // held open after the last shot
-        } else {
-            st.rackPull = approach(st.rackPull, 0.0f, 25.0f * g_settings.rackTravel * dt);
-        }
-        if (!st.rackCycled && !st.slideLocked && st.rackPull >= g_settings.rackTravel * 0.85f) {
-            st.rackCycled = true;
-            if (st.chamber) {
-                st.chamber = false;   // the round flies out (back to the ammo you carry)
-            }
-            syncAmmo(gun);
-            playSound(2);
-            buzz(freeIndex(), 1500);
-            logNote("RACK: slide all the way back");
-        }
-        if (st.rackCycled && st.rackPull <= g_settings.rackTravel * 0.25f) {
-            st.rackCycled = false;
-            if (st.place == kSeated && st.rounds > 0) {
-                st.rounds -= 1;
-                st.chamber = true;
-            }
-            syncAmmo(gun);
-            playSound(3);
-            buzz(freeIndex(), 2000);
-            buzz(g_settings.gunHand, 1500);
-            note("RACK: slide home, chamber %s, magazine %u", st.chamber ? "loaded" : "empty", st.rounds);
-        }
-        if (st.rackPull > 0.0f) {
-            refreshSubtree(bolt, axisOf(root->world, 1) * (-st.rackPull * scale));
-        }
-    }
-
-    // ------------------------------------------------------------ every frame
-
-    // The gun is gone from the hand while its magazine was in play: the magazine goes back to the pouch.
-    void putAway(const char* why) noexcept
-    {
-        auto& st = g_state;
-        if (st.place == kRailAuto || st.place == kRailHand || st.place == kHand) {
-            note("The magazine in play is put away (%s): %u rounds stay with the ammo you carry", why, st.rounds);
-            st.rounds = 0;
-            st.place = kGone;
-        }
-        releaseHand();
-        griphook::setArmed(false);
-        st.armReason = kArmNone;
-    }
-
-    std::uint64_t buttonMask(int id) noexcept
-    {
-        return vr::ButtonMaskFromId(static_cast<vr::EVRButtonId>(id));
-    }
-
-    bool menuOpen() noexcept
-    {
-        const auto* frik = FRIKApiV2::inst;
-        if (frik && frik->isWristPipboyOpen && frik->isWristPipboyOpen()) {
-            return true;
-        }
-        if (frik && frik->isConfigOpen && frik->isConfigOpen()) {
-            return true;
-        }
-        const auto* ui = RE::UI::GetSingleton();
-        return ui && ui->menuMode != 0;
-    }
-
-    // ------------------------------------------------------------ revolvers and break actions
-
-    // Turns the rows (the node's own axes as its parent sees them) about one of the parent's axes.
-    void turnRows(RE::NiMatrix3& rotation, int axis, float angle) noexcept
-    {
-        const float c = std::cos(angle);
-        const float sn = std::sin(angle);
-        auto m = toMat(rotation);
-        for (auto& row : m) {
-            const float x = row[0], y = row[1], z = row[2];
-            if (axis == 1) {
-                row[0] = x * c + z * sn;
-                row[2] = -x * sn + z * c;
-            } else {
-                row[1] = y * c - z * sn;
-                row[2] = y * sn + z * c;
-            }
-        }
-        rotation = fromMat(m);
-    }
-
-    // The reload button opens and closes the gun. Open, with the muzzle up, everything falls out of it. Rounds
-    // come from the belt in the free hand (a full clip for a revolver, one shell at a time for a break action)
-    // and go in at the breech. The free hand on the gun, or a jerk of the gun, closes it.
     // ------------------------------------------------------------ the game's reload, written down
 
     // While bRecordAnim is on the plugin leaves the gun alone; each time the game plays its own reload,
@@ -2242,6 +2115,28 @@ namespace
         int                                    takes{ 0 };
     };
     AnimRecorder g_rec;
+    std::unordered_map<std::uint32_t, bool> g_recorded;   // weapon -> a recording of its reload is on disk
+    bool g_playStale{ false };                              // a new recording: read it again
+
+    bool hasRecording(std::uint32_t weapon) noexcept
+    {
+        const auto known = g_recorded.find(weapon);
+        if (known != g_recorded.end()) {
+            return known->second;
+        }
+        char path[160];
+        std::snprintf(path, sizeof(path), "Data/F4SE/Plugins/ManualReloadF_anim/%08X.txt", weapon);
+        // a take under a second (cut short) does not count: the gun is recorded again
+        bool there = false;
+        if (std::ifstream file(path); file) {
+            std::string first;
+            std::getline(file, first);
+            const auto over = first.find(" over ");
+            there = over != std::string::npos && std::strtof(first.c_str() + over + 6, nullptr) >= 1.0f;
+        }
+        g_recorded[weapon] = there;
+        return there;
+    }
 
     struct M3 { float m[3][3]; };   // columns = the node's axes in the root's frame
 
@@ -2401,7 +2296,9 @@ namespace
                 out << line;
             }
         }
-        hud("Запись перезарядки сохранена");
+        g_recorded[r.weapon] = true;
+        g_playStale = true;
+        hud("Запись перезарядки сохранена: со следующего раза ствол заряжается руками");
     }
 
     void recordReload(RE::PlayerCharacter* player, const Gun& gun, Clock::time_point now) noexcept
@@ -2479,12 +2376,24 @@ namespace
         std::vector<int>                          posed;               // the nodes posed (indices in names)
         std::vector<RE::NiAVObject*>              nodes;               // resolved on the drawn gun
         RE::NiAVObject*                           rootSeen{ nullptr };
+        bool                                      parsed{ false };     // frames are there (whatever opens)
+        std::unordered_map<std::string, int>      index;
+        // the bolt / slide (WeaponBolt): its way back, from rest to where it goes furthest
+        bool                                      boltKnown{ false };
+        int                                       bolt{ -1 };
+        std::size_t                               boltFrom{ 0 };
+        std::size_t                               boltTo{ 0 };
+        float                                     boltTurn{ 0.0f };    // radians it turns on the way (a bolt action lifts its handle)
     };
     PlayedAnim g_play;
 
     bool loadPlayed(std::uint32_t weapon) noexcept
     {
         auto& p = g_play;
+        if (g_playStale) {
+            g_playStale = false;
+            p.weapon = 0;
+        }
         if (p.weapon == weapon) {
             return p.loaded;
         }
@@ -2494,7 +2403,6 @@ namespace
         std::snprintf(path, sizeof(path), "Data/F4SE/Plugins/ManualReloadF_anim/%08X.txt", weapon);
         std::ifstream file(path);
         if (!file) {
-            note("PLAY: no recording of %08X (bRecordAnim=1 and one reload makes it)", weapon);
             return false;
         }
         struct HingeLine { float angle; RE::NiPoint3 axis, pivot; float from; };
@@ -2555,10 +2463,37 @@ namespace
             tr.translate = { v[0], v[1], v[2] };
             p.frames.back()[found->second] = tr;
         }
+        p.parsed = p.frames.size() >= 10;
+        p.index = index;
+        if (const auto boltAt = index.find("WeaponBolt"); p.parsed && boltAt != index.end()) {
+            const int n = boltAt->second;
+            const auto restCols = colsOf(p.frames[0][n]);
+            std::vector<float> away(p.frames.size(), 0.0f);
+            std::size_t peak = 0;
+            for (std::size_t f = 1; f < p.frames.size(); ++f) {
+                const auto d = p.frames[f][n].translate - p.frames[0][n].translate;
+                away[f] = std::sqrt(dot(d, d)) + 3.0f * angleOf(mulAB(colsOf(p.frames[f][n]), transposed(restCols)));
+                if (away[f] > away[peak]) peak = f;
+            }
+            if (away[peak] > 0.5f) {
+                std::size_t from = peak;
+                while (from > 0 && away[from - 1] > away[peak] * 0.02f) --from;
+                from = from > 0 ? from - 1 : 0;
+                p.bolt = n;
+                p.boltFrom = from;
+                p.boltTo = peak;
+                for (std::size_t f = from; f <= peak; ++f) {
+                    p.boltTurn = std::max(p.boltTurn, angleOf(mulAB(colsOf(p.frames[f][n]), transposed(restCols))));
+                }
+                p.boltKnown = true;
+                note("PLAY: bolt / slide path of %08X: frames %zu..%zu (%.2f..%.2f s), turns %.1f deg on the way%s", weapon, from, peak, p.times[from],
+                    p.times[peak], p.boltTurn * 57.29578f, p.boltTurn > 0.35f ? ": a bolt action, worked by hand after every shot" : "");
+            }
+        }
         const auto main = hinges.find("WeaponMagazine");
         const auto mainIndex = index.find("WeaponMagazine");
         if (p.frames.size() < 10 || main == hinges.end() || mainIndex == index.end()) {
-            note("PLAY: the recording of %08X has no hinge on WeaponMagazine (%zu frames): not used", weapon, p.frames.size());
+            detail("PLAY: the recording of %08X has no hinge on WeaponMagazine (%zu frames)", weapon, p.frames.size());
             return false;
         }
         p.openAngle = main->second.angle * 0.01745329f;
@@ -2673,6 +2608,196 @@ namespace
         return std::atan2(dot(flat, v), dot(flat, u));
     }
 
+    // The bolt as the recording has it at `s` (0 rest .. 1 furthest back), in the gun root's frame.
+    RE::NiTransform boltAt(float s) noexcept
+    {
+        const auto& p = g_play;
+        const float time = p.times[p.boltFrom] + std::clamp(s, 0.0f, 1.0f) * (p.times[p.boltTo] - p.times[p.boltFrom]);
+        if (s <= 0.0f) {
+            return p.frames[0][p.bolt];
+        }
+        return playedAt(p, p.bolt, time);
+    }
+
+    bool boltPathFor(const Gun& gun) noexcept
+    {
+        if (!gun.weapon) {
+            return false;
+        }
+        loadPlayed(gun.weapon->GetFormID());
+        return g_play.parsed && g_play.boltKnown && g_play.weapon == gun.weapon->GetFormID();
+    }
+
+    // The slide: grip it with the free hand, pull it back along the gun, let it go forward.
+    // All the way back throws out the chambered round; going forward takes the next one from the magazine.
+    void rackByHand(const Gun& gun, RE::NiAVObject* root, RE::NiAVObject* bolt, float dt) noexcept
+    {
+        auto& st = g_state;
+        if (!looksLikeObject(root) || !looksLikeObject(bolt)) {
+            st.racking = false;
+            return;
+        }
+        const auto& spare = g_hands[freeIndex()];
+        const auto& firing = g_hands[g_settings.gunHand];
+        const float scale = gunScale(root);
+        const bool path = g_settings.recordedBolt && boltPathFor(gun) && looksLikeObject(bolt->parent);
+        const float travel = g_settings.rackTravel;
+        if (path && !st.boltAction && g_play.boltTurn > 0.35f) {
+            st.boltAction = true;
+        }
+        // the controller, not the drawn hand: ROCK moves the drawn hand onto whatever it holds
+        const auto handLocal = relative(root->world, pointTransform(spare.wand.translate)).translate;
+        const bool handBusy = st.place == kRailHand || st.place == kHand || (griphook::owned() && st.armReason != kArmSlide);
+        const bool rockTook = g_rock.onBolt && !st.rockWasOnBolt && spare.valid && spare.grip && !handBusy &&
+                              Clock::now() - st.seatedAt > std::chrono::milliseconds(700);
+        st.rockWasOnBolt = g_rock.onBolt;
+        if (!st.racking && spare.valid && spare.grip && ((!spare.previousGrip && !handBusy) || rockTook)) {
+            const float toSlide = distance(spare.palm, slideGrabPoint(root, bolt));
+            const float toMag = st.place == kRailAuto && st.railKnown ? distance(spare.palm, grabPoint(root)) : 1e9f;
+            if (rockTook || (toSlide < g_settings.slideGrabRadius && toSlide <= toMag)) {
+                st.racking = true;
+                st.rackGrabY = handLocal.y + st.rackPull;
+                st.rackGrabHands = distance(spare.wand.translate, firing.wand.translate);
+                st.rackGrabPull = st.rackPull;
+                if (path) {
+                    st.handInBolt = relative(boltAt(st.rackPull / travel), pointTransform(handLocal)).translate;
+                }
+                buzz(freeIndex(), 500);
+                detail("Slide taken by the free hand (%.1f from its middle)", toSlide);
+            }
+        }
+        if (st.racking && !(spare.valid && spare.grip)) {
+            st.racking = false;   // let go: the spring sends it home
+        }
+        const float lockAt = g_settings.rackTravel * std::clamp(g_settings.slideLockAt, 0.0f, 1.0f);
+        if (st.racking && path) {
+            // the hand's point on the bolt follows the recorded way back (a bolt action: up, then back)
+            const float cur = st.rackPull / travel;
+            float best = cur, bestDistance = 1e9f;
+            for (int k = -20; k <= 20; ++k) {
+                const float s = std::clamp(cur + k * 0.01f, 0.0f, 1.0f);
+                const auto at = compose(boltAt(s), pointTransform(st.handInBolt)).translate;
+                const float d = distance(at, handLocal);
+                if (d < bestDistance) {
+                    bestDistance = d;
+                    best = s;
+                }
+            }
+            st.rackPull = std::clamp(best * travel, st.slideLocked ? lockAt : 0.0f, travel);
+            if (st.slideLocked && st.rackPull >= travel * 0.95f) {
+                st.slideLocked = false;
+                st.rackCycled = true;
+                playSound(2);
+                logNote("RACK: slide pulled off the stop");
+            }
+        } else if (st.racking) {
+            // along the gun, and by the hands closing in (when the gun turns after the hand, the first stays put)
+            const float byGun = st.rackGrabY - handLocal.y;
+            const float byHands = st.rackGrabPull + (st.rackGrabHands - distance(spare.wand.translate, firing.wand.translate)) / scale;
+            st.rackPull = std::clamp(std::max(byGun, byHands), st.slideLocked ? lockAt : 0.0f, g_settings.rackTravel);
+            if (st.slideLocked && st.rackPull >= g_settings.rackTravel * 0.95f) {
+                st.slideLocked = false;   // pulled off the slide stop: let go and it runs home
+                st.rackCycled = true;
+                playSound(2);
+                logNote("RACK: slide pulled off the stop");
+            }
+        } else if (st.slideLocked) {
+            st.rackPull = approach(st.rackPull, lockAt, 80.0f * dt);   // held open after the last shot
+        } else if (!st.boltAction) {
+            st.rackPull = approach(st.rackPull, 0.0f, 25.0f * g_settings.rackTravel * dt);
+        }
+        if (!st.rackCycled && !st.slideLocked && st.rackPull >= g_settings.rackTravel * 0.85f) {
+            st.rackCycled = true;
+            if (st.chamber) {
+                st.chamber = false;   // the round flies out (back to the ammo you carry)
+            }
+            syncAmmo(gun);
+            playSound(2);
+            buzz(freeIndex(), 1500);
+            logNote("RACK: slide all the way back");
+        }
+        if (st.rackCycled && st.rackPull <= g_settings.rackTravel * 0.25f) {
+            st.rackCycled = false;
+            if (st.place == kSeated && st.rounds > 0) {
+                st.rounds -= 1;
+                st.chamber = true;
+            }
+            syncAmmo(gun);
+            playSound(3);
+            buzz(freeIndex(), 2000);
+            buzz(g_settings.gunHand, 1500);
+            note("RACK: slide home, chamber %s, magazine %u", st.chamber ? "loaded" : "empty", st.rounds);
+        }
+        if (path) {
+            if (st.rackPull > 0.0f || st.racking) {
+                auto recorded = boltAt(st.rackPull / travel);
+                recorded.scale = bolt->world.scale / scale;
+                bolt->local = relative(bolt->parent->world, compose(root->world, recorded));
+                refreshSubtree(bolt, RE::NiPoint3{});
+            }
+        } else if (st.rackPull > 0.0f) {
+            refreshSubtree(bolt, axisOf(root->world, 1) * (-st.rackPull * scale));
+        }
+    }
+
+    // ------------------------------------------------------------ every frame
+
+    // The gun is gone from the hand while its magazine was in play: the magazine goes back to the pouch.
+    void putAway(const char* why) noexcept
+    {
+        auto& st = g_state;
+        if (st.place == kRailAuto || st.place == kRailHand || st.place == kHand) {
+            note("The magazine in play is put away (%s): %u rounds stay with the ammo you carry", why, st.rounds);
+            st.rounds = 0;
+            st.place = kGone;
+        }
+        releaseHand();
+        griphook::setArmed(false);
+        st.armReason = kArmNone;
+    }
+
+    std::uint64_t buttonMask(int id) noexcept
+    {
+        return vr::ButtonMaskFromId(static_cast<vr::EVRButtonId>(id));
+    }
+
+    bool menuOpen() noexcept
+    {
+        const auto* frik = FRIKApiV2::inst;
+        if (frik && frik->isWristPipboyOpen && frik->isWristPipboyOpen()) {
+            return true;
+        }
+        if (frik && frik->isConfigOpen && frik->isConfigOpen()) {
+            return true;
+        }
+        const auto* ui = RE::UI::GetSingleton();
+        return ui && ui->menuMode != 0;
+    }
+
+    // ------------------------------------------------------------ revolvers and break actions
+
+    // Turns the rows (the node's own axes as its parent sees them) about one of the parent's axes.
+    void turnRows(RE::NiMatrix3& rotation, int axis, float angle) noexcept
+    {
+        const float c = std::cos(angle);
+        const float sn = std::sin(angle);
+        auto m = toMat(rotation);
+        for (auto& row : m) {
+            const float x = row[0], y = row[1], z = row[2];
+            if (axis == 1) {
+                row[0] = x * c + z * sn;
+                row[2] = -x * sn + z * c;
+            } else {
+                row[1] = y * c - z * sn;
+                row[2] = y * sn + z * c;
+            }
+        }
+        rotation = fromMat(m);
+    }
+
+    // The reload button opens and closes the gun. Open, with the muzzle up, everything falls out of it. Rounds
+    // come from the belt in the free hand (a full clip for a revolver, one shell at a time for a break action)
+    // and go in at the breech. The free hand on the gun, or a jerk of the gun, closes it.
     void updateBreech(RE::PlayerCharacter* player, const Gun& gun, RE::NiAVObject* root, Clock::time_point now, float dt) noexcept
     {
         auto& st = g_state;
@@ -2789,7 +2914,7 @@ namespace
                 note("OPEN: %u rounds, %u fired cases", b.live, b.spent);
             }
         }
-        if (!b.driving) {
+        if (!b.driving && !b.pushing) {
             b.t = approach(b.t, b.open ? 1.0f : 0.0f, 7.0f * dt);
         }
 
@@ -2889,6 +3014,32 @@ namespace
                 }
             }
         }
+        // the open palm pushes it shut (no grip needed): only a move towards closed carries it
+        const bool touching = played && b.open && !b.driving && b.held == 0 && spare.valid && !spare.grip && !atBelt &&
+                              distance(spare.palm, mag->world.translate) < 8.0f * scale;
+        if (touching) {
+            const float angle = hingeAngle(root, spare.palm);
+            if (b.pushing) {
+                float turn = angle - b.pushAngle;
+                while (turn > 3.14159265f) turn -= 6.2831853f;
+                while (turn < -3.14159265f) turn += 6.2831853f;
+                if (turn < 0.0f) {
+                    b.t = std::clamp(b.t + turn / std::max(g_play.openAngle, 0.1f), 0.0f, 1.0f);
+                    b.opened = std::min(b.opened, now);
+                    if (b.t <= 0.08f) {
+                        b.pushing = false;
+                        close("pushed shut by the palm");
+                    }
+                }
+            }
+            b.pushAngle = angle;
+            b.pushing = b.open;
+        } else {
+            if (b.pushing && b.open && b.t < 0.5f) {
+                close("pushed shut by the palm");
+            }
+            b.pushing = false;
+        }
         if (b.held > 0 && !(spare.valid && spare.grip)) {
             note("The rounds in the hand are put away");
             b.held = 0;
@@ -2985,7 +3136,13 @@ namespace
                 capacityOf(gun), total, magModel.c_str(), kind, st.managed ? "reloaded by hand" : "not handled (no magazine of group 1)");
         }
 
-        if (g_settings.recordAnim) {
+        const bool unrecorded = g_settings.autoRecord && gun.weapon && gun.data && gun.data->ammo && !hasRecording(gun.weapon->GetFormID());
+        if (g_settings.recordAnim || unrecorded || g_rec.active) {
+            if (unrecorded && !st.recordTold) {
+                st.recordTold = true;
+                hud("Этот ствол ещё не записан: перезаряди его один раз как обычно, мод запишет анимацию");
+                note("RECORD: %08X has no recording yet, the next reload is the game's own and is written down", gun.weapon->GetFormID());
+            }
             releaseHand();
             griphook::setArmed(false);
             recordReload(player, gun, now);
@@ -3112,7 +3269,13 @@ namespace
             } else if (ammo < st.lastAmmo) {
                 st.lastShot = now;
                 st.chamber = ammo > 0;
-                if (st.place == kSeated) {
+                if (st.boltAction && st.place == kSeated) {
+                    // a bolt action: the fired case stays in the chamber until the bolt is worked
+                    st.rounds = ammo;
+                    st.chamber = false;
+                    ammo = 0;
+                    gun.data->ammoCount = 0;
+                } else if (st.place == kSeated) {
                     st.rounds = ammo > 0 ? ammo - 1 : 0;
                     if (ammo == 0 && st.lastAmmo == 1) {
                         st.slideLocked = true;   // the last round of a magazine: the slide stays open
