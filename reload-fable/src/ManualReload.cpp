@@ -2673,11 +2673,18 @@ namespace
         if (st.racking && path) {
             // the hand's point on the bolt follows the recorded way back (a bolt action: up, then back)
             const float cur = st.rackPull / travel;
+            // the pull along the bolt's way back counts fully, the rest (lifting the handle) only partly:
+            // pulling back lifts the handle by itself instead of holding the bolt where it is
+            const auto travelled = boltAt(1.0f).translate - boltAt(0.0f).translate;
+            const auto wayBack = dot(travelled, travelled) > 0.09f ? normalized(travelled) : RE::NiPoint3{};
             float best = cur, bestDistance = 1e9f;
-            for (int k = -20; k <= 20; ++k) {
+            for (int k = -35; k <= 35; ++k) {
                 const float s = std::clamp(cur + k * 0.01f, 0.0f, 1.0f);
                 const auto at = compose(boltAt(s), pointTransform(st.handInBolt)).translate;
-                const float d = distance(at, handLocal);
+                const auto off = at - handLocal;
+                const float along = dot(off, wayBack);
+                const auto side = off - wayBack * along;
+                const float d = along * along + 0.1f * dot(side, side);
                 if (d < bestDistance) {
                     bestDistance = d;
                     best = s;
@@ -3140,7 +3147,7 @@ namespace
         if (g_settings.recordAnim || unrecorded || g_rec.active) {
             if (unrecorded && !st.recordTold) {
                 st.recordTold = true;
-                hud("Этот ствол ещё не записан: перезаряди его один раз как обычно, мод запишет анимацию");
+                hud("Этот ствол ещё не записан: выстрели хотя бы раз и перезаряди как обычно, мод запишет анимацию");
                 note("RECORD: %08X has no recording yet, the next reload is the game's own and is written down", gun.weapon->GetFormID());
             }
             releaseHand();
