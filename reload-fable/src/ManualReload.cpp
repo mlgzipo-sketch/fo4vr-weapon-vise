@@ -104,14 +104,15 @@ namespace
         float holdUp{ 2.0f };           // magazine from the belt: its bottom sits this far below the palm's middle
         float holdSide{ 0.0f };
         float holdForward{ 0.0f };
-        float holdRotX{ 90.0f };
+        float holdRotX{ 0.0f };
         float holdRotY{ 0.0f };
         float holdRotZ{ 0.0f };
         int   holdFlip{ 0 };            // 1 = the magazine from the belt is upside down in the hand: turn it
         float fingerCurl{ 0.35f };      // fingers around a magazine: 0 = fist, 1 = open
         float freezeSeconds{ 1.6f };
         float slideGrabRadius{ 8.0f };
-        float slideGrabAt{ 0.3f };      // the hand takes the slide this part of its length from its rear end
+        float slideGrabAt{ 0.2f };      // the hand takes the slide this part of its length from its rear end..
+        float slideGrabHigh{ 0.85f };   // ..and this part of its height from its underside (1 = the very top)
         float rackTravel{ 5.0f };
         float slideLockAt{ 0.8f };
         float handRadius{ 16.0f };
@@ -154,7 +155,7 @@ namespace
             { "fHoldUp", 2, &s.holdUp }, { "fHoldSide", 2, &s.holdSide }, { "fHoldForward", 2, &s.holdForward },
             { "fHoldRotX", 2, &s.holdRotX }, { "fHoldRotY", 2, &s.holdRotY }, { "fHoldRotZ", 2, &s.holdRotZ },
             { "iHoldFlip", 1, &s.holdFlip }, { "fFingerCurl", 2, &s.fingerCurl }, { "fFreezeSeconds", 2, &s.freezeSeconds },
-            { "fSlideGrabRadius", 2, &s.slideGrabRadius }, { "fSlideGrabAt", 2, &s.slideGrabAt }, { "fRackTravel", 2, &s.rackTravel }, { "fSlideLockAt", 2, &s.slideLockAt },
+            { "fSlideGrabRadius", 2, &s.slideGrabRadius }, { "fSlideGrabAt", 2, &s.slideGrabAt }, { "fSlideGrabHigh", 2, &s.slideGrabHigh }, { "fRackTravel", 2, &s.rackTravel }, { "fSlideLockAt", 2, &s.slideLockAt },
             { "fHandRadius", 2, &s.handRadius }, { "fLooseLifetime", 2, &s.looseLifetime }, { "iMaxLoose", 1, &s.maxLoose },
             { "bAllGuns", 0, &s.allGuns }, { "bRockParts", 0, &s.rockParts }, { "bRockBeltHandover", 0, &s.rockBeltHandover },
             { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
@@ -1486,7 +1487,8 @@ namespace
         if (!st.boltBoxUsed && atRest && looksLikeObject(bolt) && rocklink::partBox(1, lo, hi)) {
             st.boltBoxUsed = true;
             const float at = std::clamp(g_settings.slideGrabAt, 0.0f, 1.0f);
-            st.slideCenter = { (lo[0] + hi[0]) * 0.5f, lo[1] + (hi[1] - lo[1]) * at, (lo[2] + hi[2]) * 0.5f };
+            const float high = std::clamp(g_settings.slideGrabHigh, 0.0f, 1.0f);
+            st.slideCenter = { (lo[0] + hi[0]) * 0.5f, lo[1] + (hi[1] - lo[1]) * at, lo[2] + (hi[2] - lo[2]) * high };
             st.slideCenterKnown = true;
             st.slidePointInBolt = relative(bolt->world, pointTransform(compose(root->world, pointTransform(st.slideCenter)).translate)).translate;
             st.slidePointKnown = true;
