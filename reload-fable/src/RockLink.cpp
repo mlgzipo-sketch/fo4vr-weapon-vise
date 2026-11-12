@@ -5,6 +5,7 @@
 #include "RockLink.h"
 
 #include "ROCK/Client.h"
+#include "ROCK/Grab.h"
 #include "ROCK/Weapon.h"
 #include "ROCK/WeaponParts.h"
 
@@ -33,6 +34,8 @@ namespace rocklink
         api::Client g_client;
         const api::weapon::Api* g_weapon{ nullptr };
         const parts::Api* g_parts{ nullptr };
+        const api::grab::Api* g_grab{ nullptr };
+        std::uint64_t g_grabCommand{ 0 };
 
         std::uint64_t g_key{ 0 };
         std::uint64_t g_frames{ 0 };
@@ -411,6 +414,8 @@ namespace rocklink
         }
         const auto weaponStatus = g_client.acquire(3, g_weapon);
         const auto partsStatus = g_client.acquire(3, g_parts);
+        const auto grabStatus = g_grab ? api::Status::Ok : g_client.acquire(3, g_grab);
+        say("ROCK: grab interface %u (0 = ok): a magazine out of the gun is put straight into the palm", static_cast<unsigned>(grabStatus));
         const char* version = nullptr;
         if (g_client.core() && g_client.core()->getModVersion) {
             g_client.core()->getModVersion(g_client.owner(), &version);
@@ -521,4 +526,79 @@ namespace rocklink
         std::memcpy(point, g_handle, sizeof(g_handle));
         return true;
     }
+
+    namespace
+    {
+        api::Hand rockHand(int hand) noexcept { return hand == 0 ? api::Hand::Right : api::Hand::Left; }
+    }
+
+    bool forceGrab(int hand, std::uint32_t refFormId, const float point[3]) noexcept
+    {
+        if (!g_grab || !g_grab->requestForceGrab || !refFormId) {
+            return false;
+        }
+        api::grab::ForceGrabRequest request{};
+        request.hand = rockHand(hand);
+        request.targetFormId = refFormId;
+        request.maxDistanceGame = 60.0f;
+        if (point) {
+            request.flags = static_cast<std::uint32_t>(api::grab::ForceGrabFlag::UsePreferredGrabPointGame);
+            for (int i = 0; i < 3; ++i) {
+                request.preferredGrabPointGame[i] = point[i];
+            }
+        }
+        std::uint64_t id = 0;
+        const auto status = g_grab->requestForceGrab(g_client.owner(), &request, &id);
+        say("ROCK: force grab of %08X into the %s hand: status %u, command %llu", refFormId, hand == 0 ? "right" : "left",
+            static_cast<unsigned>(status), static_cast<unsigned long long>(id));
+        if (status != api::Status::Ok) {
+            return false;
+        }
+        g_grabCommand = id;
+        return true;
+    }
+
+    int forceGrabState(int* failure) noexcept
+    {
+        if (failure) {
+            *failure = 0;
+        }
+        if (!g_grab || !g_grab->getInteractionCommandResult || !g_grabCommand) {
+            return 0;
+        }
+        api::grab::InteractionCommandResult result{};
+        if (g_grab->getInteractionCommandResult(g_client.owner(), g_grabCommand, &result) != api::Status::Ok) {
+            return 0;
+        }
+        if (failure) {
+            *failure = static_cast<int>(result.failure);
+        }
+        return static_cast<int>(result.state);
+    }
+
+    std::uint32_t heldBy(int hand) noexcept
+    {
+        if (!g_grab || !g_grab->getHandInteractionState) {
+            return 0;
+        }
+        api::grab::HandInteractionState state{};
+        if (g_grab->getHandInteractionState(g_client.owner(), rockHand(hand), &state) != api::Status::Ok) {
+            return 0;
+        }
+        return state.phase == api::grab::HandInteractionPhase::Holding ? state.targetFormId : 0;
+    }
+
+    bool releaseHeld(int hand, std::uint32_t refFormId) noexcept
+    {
+        if (!g_grab || !g_grab->requestForceRelease) {
+            return false;
+        }
+        api::grab::ForceReleaseRequest request{};
+        request.hand = rockHand(hand);
+        request.targetFormId = refFormId;
+        request.flags = static_cast<std::uint32_t>(api::grab::ForceReleaseFlag::RequireMatchingTarget);
+        std::uint64_t id = 0;
+        return g_grab->requestForceRelease(g_client.owner(), &request, &id) == api::Status::Ok;
+    }
 }
+

@@ -54,4 +54,12 @@ namespace rocklink
     bool partBox(int which, float lo[3], float hi[3]) noexcept;
     // The middle of the bolt's handle where it sticks out of one side of the gun (the gun root's frame); false for a slide.
     bool boltHandle(float point[3]) noexcept;
+    // ROCK puts a real object (a reference) into the hand's palm (0 right, 1 left); `point` = where on it, in the world, or null.
+    bool forceGrab(int hand, std::uint32_t refFormId, const float point[3]) noexcept;
+    // The last force grab: 0 unknown, 1 queued, 2 succeeded, 3 rejected, 4 cancelled.
+    int forceGrabState(int* failure) noexcept;
+    // The reference the hand holds through ROCK now (0 none).
+    std::uint32_t heldBy(int hand) noexcept;
+    // ROCK lets go of that reference.
+    bool releaseHeld(int hand, std::uint32_t refFormId) noexcept;
 }
