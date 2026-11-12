@@ -118,6 +118,7 @@ namespace
         int   maxLoose{ 6 };
         bool  rockApi{ true };          // ROCK 1.0: the free hand's fingers take ROCK's own grip pose
         bool  allGuns{ false };         // every gun with a magazine of group 1, not only the 10mm pistol
+        int   calibrate{ 0 };           // 1 = guns not measured yet are measured by hand when drawn, 2 = every gun again
         bool  nativeSound{ true };      // sounds played by the plugin (the script's Sound objects are not heard)
         int   soundFlags{ 16 };
         bool  showRound{ true };        // a cartridge is seen in the chamber / on top of the magazine while the slide is open
@@ -153,7 +154,7 @@ namespace
             { "iHoldFlip", 1, &s.holdFlip }, { "fFingerCurl", 2, &s.fingerCurl }, { "fFreezeSeconds", 2, &s.freezeSeconds },
             { "fSlideGrabRadius", 2, &s.slideGrabRadius }, { "fRackTravel", 2, &s.rackTravel }, { "fSlideLockAt", 2, &s.slideLockAt },
             { "fHandRadius", 2, &s.handRadius }, { "fLooseLifetime", 2, &s.looseLifetime }, { "iMaxLoose", 1, &s.maxLoose },
-            { "bRockApi", 0, &s.rockApi }, { "bAllGuns", 0, &s.allGuns }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
+            { "bRockApi", 0, &s.rockApi }, { "bAllGuns", 0, &s.allGuns }, { "iCalibrate", 1, &s.calibrate }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
             { "fChamberForward", 2, &s.chamberForward }, { "fRoundUp", 2, &s.roundUp }, { "fRoundRotX", 2, &s.roundRotX },
             { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale },
         };
@@ -1174,6 +1175,7 @@ namespace
         kArmBelt = 2,    // the palm is at the belt and the gun wants a magazine
         kArmSlide = 3,   // the palm is at the slide
         kArmBlock = 4,   // the palm is at a gun without a magazine: no second-hand hold yet
+        kArmCal = 5,     // calibration: the grip marks points on the gun
     };
 
     struct Loose
@@ -1262,8 +1264,95 @@ namespace
         bool               slideLocked{ false };
         RE::NiPoint3       slideCenter{};
         bool               slideCenterKnown{ false };
+        // measured by hand (calibration), per gun and magazine
+        std::string        calKey;
+        int                calStep{ -1 };                  // -1 = not calibrating
+        Clock::time_point  calTold{};
+        RE::NiPoint3       calGrab{};                      // in the magazine node's frame
+        RE::NiPoint3       calOut{};                       // in the gun root's frame
+        RE::NiPoint3       calHandle{};
+        bool               grabCal{ false };
+        RE::NiPoint3       grabLocal{};                    // where the palm takes the magazine, in its node's frame
+        bool               handleCal{ false };
+        RE::NiPoint3       handlePoint{};                  // the slide / charging handle, in the gun root's frame
+        RE::NiPoint3       rackDir{ 0.0f, -1.0f, 0.0f };   // the way the slide is pulled, in the gun root's frame
+        float              rackLength{ -1.0f };            // its travel (below 0 = fRackTravel)
     };
     State g_state;
+
+    // ------------------------------------------------------------ calibration file
+
+    struct GunCal
+    {
+        RE::NiPoint3 grab{};      // magazine node frame
+        RE::NiPoint3 out{};       // gun root frame
+        bool         slide{ false };
+        RE::NiPoint3 handle{};    // gun root frame
+        RE::NiPoint3 back{};
+    };
+    constexpr auto kCalFile = "Data/F4SE/Plugins/ManualReloadF_guns.txt";
+    std::unordered_map<std::string, GunCal> g_cals;
+    bool g_calsLoaded{ false };
+
+    void loadCals() noexcept
+    {
+        if (g_calsLoaded) {
+            return;
+        }
+        g_calsLoaded = true;
+        try {
+            std::ifstream file(kCalFile);
+            std::string line;
+            while (file && std::getline(file, line)) {
+                const auto bar = line.find('|');
+                if (line.empty() || line[0] == ';' || bar == std::string::npos) {
+                    continue;
+                }
+                GunCal cal{};
+                float v[12]{};
+                const int n = std::sscanf(line.c_str() + bar + 1, "%f %f %f %f %f %f %f %f %f %f %f %f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6],
+                    &v[7], &v[8], &v[9], &v[10], &v[11]);
+                if (n < 6) {
+                    continue;
+                }
+                cal.grab = { v[0], v[1], v[2] };
+                cal.out = { v[3], v[4], v[5] };
+                cal.slide = n >= 12;
+                if (cal.slide) {
+                    cal.handle = { v[6], v[7], v[8] };
+                    cal.back = { v[9], v[10], v[11] };
+                }
+                g_cals[line.substr(0, bar)] = cal;
+            }
+        } catch (...) {
+        }
+        note("Calibration: %zu guns measured by hand (%s)", g_cals.size(), kCalFile);
+    }
+
+    void saveCals() noexcept
+    {
+        try {
+            std::ofstream file(kCalFile, std::ios::trunc);
+            file << "; ManualReloadF: guns measured by hand (iCalibrate). weapon:magazine model | grab xyz, out xyz [, handle xyz, back xyz]\n";
+            for (const auto& [key, cal] : g_cals) {
+                char text[512];
+                if (cal.slide) {
+                    std::snprintf(text, sizeof(text), "%s|%.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n", key.c_str(), cal.grab.x, cal.grab.y,
+                        cal.grab.z, cal.out.x, cal.out.y, cal.out.z, cal.handle.x, cal.handle.y, cal.handle.z, cal.back.x, cal.back.y, cal.back.z);
+                } else {
+                    std::snprintf(text, sizeof(text), "%s|%.3f %.3f %.3f %.3f %.3f %.3f\n", key.c_str(), cal.grab.x, cal.grab.y, cal.grab.z, cal.out.x,
+                        cal.out.y, cal.out.z);
+                }
+                file << text;
+            }
+        } catch (...) {
+        }
+    }
+
+    float rackTravel() noexcept
+    {
+        return g_state.rackLength > 0.0f ? g_state.rackLength : g_settings.rackTravel;
+    }
 
     constexpr std::array<const char*, 5> kMovingParts{ "WeaponMagazine", "WeaponBolt", "WeaponExtra1", "WeaponExtra2", "WeaponExtra3" };
 
@@ -1338,7 +1427,47 @@ namespace
     RE::NiPoint3 grabPoint(const RE::NiAVObject* root) noexcept
     {
         const auto pose = railPose(root, g_state.s);
+        if (g_state.grabCal) {
+            return compose(pose, pointTransform(g_state.grabLocal)).translate;
+        }
         return pose.translate + axisOf(pose, 2) * ((g_state.bottomAt + g_settings.grabUp) * pose.scale);
+    }
+
+    // The points measured by hand replace what the model gave.
+    void applyCal() noexcept
+    {
+        auto& st = g_state;
+        const auto it = g_cals.find(st.calKey);
+        if (st.calKey.empty() || it == g_cals.end()) {
+            return;
+        }
+        const auto& cal = it->second;
+        if (st.railKnown) {
+            const auto grabInGun = compose(st.magRest, pointTransform(cal.grab)).translate;
+            const auto way = cal.out - grabInGun;
+            const float length = std::sqrt(dot(way, way));
+            if (length > 1.0f) {
+                st.axis = way * (1.0f / length);
+                st.length = g_settings.railLength > 0.0f ? g_settings.railLength : length;
+                st.grabLocal = cal.grab;
+                st.grabCal = true;
+                st.bottomAt = cal.grab.z - g_settings.grabUp;
+                note("Calibration: magazine taken at (%.2f, %.2f, %.2f) of its node, way out (%.2f, %.2f, %.2f), travel %.2f", cal.grab.x, cal.grab.y,
+                    cal.grab.z, st.axis.x, st.axis.y, st.axis.z, st.length);
+            }
+        }
+        if (cal.slide) {
+            const auto way = cal.back - cal.handle;
+            const float length = std::sqrt(dot(way, way));
+            if (length > 0.5f) {
+                st.handleCal = true;
+                st.handlePoint = cal.handle;
+                st.rackDir = way * (1.0f / length);
+                st.rackLength = length;
+                note("Calibration: slide handle at (%.2f, %.2f, %.2f), pulled (%.2f, %.2f, %.2f), travel %.2f", cal.handle.x, cal.handle.y, cal.handle.z,
+                    st.rackDir.x, st.rackDir.y, st.rackDir.z, length);
+            }
+        }
     }
 
     RE::NiPoint3 tiltAxis(float degrees) noexcept
@@ -1400,6 +1529,7 @@ namespace
             note("Rail: baseplate %.2f below the origin (%s; bound middle %.2f, radius %.2f)", -st.bottomAt, measured ? "measured" : "default", middle, bound.fRadius);
             note("Rail: loose model against the node: (%.2f, %.2f, %.2f)", st.looseInNode.translate.x, st.looseInNode.translate.y, st.looseInNode.translate.z);
         }
+        applyCal();
     }
 
     void learnSlide(RE::NiAVObject* root, RE::NiAVObject* bolt) noexcept
@@ -1420,10 +1550,14 @@ namespace
 
     RE::NiPoint3 slideGrabPoint(const RE::NiAVObject* root, const RE::NiAVObject* bolt) noexcept
     {
+        if (g_state.handleCal) {
+            return compose(root->world, pointTransform(g_state.handlePoint)).translate +
+                   directionToWorld(root->world, g_state.rackDir) * (g_state.rackPull * gunScale(root));
+        }
         if (!g_state.slideCenterKnown) {
             return bolt->world.translate;
         }
-        return compose(root->world, pointTransform(g_state.slideCenter)).translate + axisOf(root->world, 1) * (-g_state.rackPull * gunScale(root));
+        return compose(root->world, pointTransform(g_state.slideCenter)).translate + directionToWorld(root->world, g_state.rackDir) * (g_state.rackPull * gunScale(root));
     }
 
     // ------------------------------------------------------------ magazines as real objects
@@ -1573,7 +1707,7 @@ namespace
             }
             return;
         }
-        const bool open = st.slideLocked || st.rackPull >= g_settings.rackTravel * std::clamp(g_settings.roundOpenAt, 0.05f, 1.0f);
+        const bool open = st.slideLocked || st.rackPull >= rackTravel() * std::clamp(g_settings.roundOpenAt, 0.05f, 1.0f);
         const bool inChamber = st.chamber && !st.rackCycled;
         const bool onMagazine = !inChamber && st.place == kSeated && st.rounds > 0;
         const bool visible = open && (inChamber || onMagazine);
@@ -1828,6 +1962,12 @@ namespace
         pose.scale = scale;
         pose.translate = hand.palm - axisOf(pose, 2) * ((g_state.bottomAt + g_settings.holdUp) * scale) + axisOf(pose, 0) * (g_settings.holdSide * scale) +
                          axisOf(pose, 1) * (g_settings.holdForward * scale);
+        if (g_state.grabCal) {
+            auto turnOnly = pose;
+            turnOnly.translate = {};
+            pose.translate = hand.palm - compose(turnOnly, pointTransform(g_state.grabLocal)).translate + axisOf(pose, 0) * (g_settings.holdSide * scale) +
+                             axisOf(pose, 1) * (g_settings.holdForward * scale);
+        }
         return pose;
     }
 
@@ -1956,7 +2096,7 @@ namespace
             const float toMag = st.place == kRailAuto && st.railKnown ? distance(spare.palm, grabPoint(root)) : 1e9f;
             if (toSlide < g_settings.slideGrabRadius && toSlide <= toMag) {
                 st.racking = true;
-                st.rackGrabY = handLocal.y + st.rackPull;
+                st.rackGrabY = st.rackPull - dot(handLocal, st.rackDir);
                 st.rackGrabHands = distance(spare.wand.translate, firing.wand.translate);
                 st.rackGrabPull = st.rackPull;
                 buzz(freeIndex(), 500);
@@ -1966,13 +2106,13 @@ namespace
         if (st.racking && !(spare.valid && spare.grip)) {
             st.racking = false;   // let go: the spring sends it home
         }
-        const float lockAt = g_settings.rackTravel * std::clamp(g_settings.slideLockAt, 0.0f, 1.0f);
+        const float lockAt = rackTravel() * std::clamp(g_settings.slideLockAt, 0.0f, 1.0f);
         if (st.racking) {
             // along the gun, and by the hands closing in (when the gun turns after the hand, the first stays put)
-            const float byGun = st.rackGrabY - handLocal.y;
+            const float byGun = dot(handLocal, st.rackDir) + st.rackGrabY;
             const float byHands = st.rackGrabPull + (st.rackGrabHands - distance(spare.wand.translate, firing.wand.translate)) / scale;
-            st.rackPull = std::clamp(std::max(byGun, byHands), st.slideLocked ? lockAt : 0.0f, g_settings.rackTravel);
-            if (st.slideLocked && st.rackPull >= g_settings.rackTravel * 0.95f) {
+            st.rackPull = std::clamp(std::max(byGun, byHands), st.slideLocked ? lockAt : 0.0f, rackTravel());
+            if (st.slideLocked && st.rackPull >= rackTravel() * 0.95f) {
                 st.slideLocked = false;   // pulled off the slide stop: let go and it runs home
                 st.rackCycled = true;
                 playSound(2);
@@ -1981,9 +2121,9 @@ namespace
         } else if (st.slideLocked) {
             st.rackPull = approach(st.rackPull, lockAt, 80.0f * dt);   // held open after the last shot
         } else {
-            st.rackPull = approach(st.rackPull, 0.0f, 25.0f * g_settings.rackTravel * dt);
+            st.rackPull = approach(st.rackPull, 0.0f, 25.0f * rackTravel() * dt);
         }
-        if (!st.rackCycled && !st.slideLocked && st.rackPull >= g_settings.rackTravel * 0.85f) {
+        if (!st.rackCycled && !st.slideLocked && st.rackPull >= rackTravel() * 0.85f) {
             st.rackCycled = true;
             if (st.chamber) {
                 st.chamber = false;   // the round flies out (back to the ammo you carry)
@@ -1993,7 +2133,7 @@ namespace
             buzz(freeIndex(), 1500);
             logNote("RACK: slide all the way back");
         }
-        if (st.rackCycled && st.rackPull <= g_settings.rackTravel * 0.25f) {
+        if (st.rackCycled && st.rackPull <= rackTravel() * 0.25f) {
             st.rackCycled = false;
             if (st.place == kSeated && st.rounds > 0) {
                 st.rounds -= 1;
@@ -2006,7 +2146,7 @@ namespace
             note("RACK: slide home, chamber %s, magazine %u", st.chamber ? "loaded" : "empty", st.rounds);
         }
         if (st.rackPull > 0.0f) {
-            refreshSubtree(bolt, axisOf(root->world, 1) * (-st.rackPull * scale));
+            refreshSubtree(bolt, directionToWorld(root->world, st.rackDir) * (st.rackPull * scale));
         }
     }
 
@@ -2042,6 +2182,84 @@ namespace
         }
         const auto* ui = RE::UI::GetSingleton();
         return ui && ui->menuMode != 0;
+    }
+
+    // Calibration: the free hand's grip marks the magazine's grab point, where it is clear of the well,
+    // the slide's handle and how far it goes back. Saved per gun and magazine.
+    void calibrate(RE::NiAVObject* root, RE::NiAVObject* magazine, RE::NiAVObject* bolt, const Hand& hand, bool press, Clock::time_point now) noexcept
+    {
+        auto& st = g_state;
+        if (st.calStep < 0 || !st.railKnown || !looksLikeObject(magazine) || st.place != kSeated) {
+            return;
+        }
+        static const char* const kPrompts[4]{
+            "Калибровка 1/4: положи ладонь свободной руки на магазин туда, где его берёшь, и нажми грип",
+            "Калибровка 2/4: отведи руку туда, где магазин уже целиком вышел из гнезда, и нажми грип",
+            "Калибровка 3/4: положи ладонь на рукоятку затвора и нажми грип",
+            "Калибровка 4/4: отведи руку назад, насколько ходит затвор, и нажми грип",
+        };
+        if (st.calTold == Clock::time_point{} || now - st.calTold > std::chrono::seconds(7)) {
+            st.calTold = now;
+            hud(kPrompts[st.calStep]);
+        }
+        if (!press || !hand.valid) {
+            return;
+        }
+        const auto inGun = relative(root->world, pointTransform(hand.palm)).translate;
+        auto again = [&](const char* why) {
+            hud(why);
+            st.calTold = now;
+        };
+        switch (st.calStep) {
+        case 0:
+            st.calGrab = relative(magazine->world, pointTransform(hand.palm)).translate;
+            st.calStep = 1;
+            break;
+        case 1: {
+            const auto grabInGun = compose(st.magRest, pointTransform(st.calGrab)).translate;
+            const auto way = inGun - grabInGun;
+            if (dot(way, way) < 4.0f) {
+                again("Слишком близко к магазину: отведи руку дальше и нажми грип");
+                return;
+            }
+            st.calOut = inGun;
+            st.calStep = looksLikeObject(bolt) ? 2 : 4;
+            break;
+        }
+        case 2:
+            st.calHandle = inGun;
+            st.calStep = 3;
+            break;
+        default: {
+            const auto way = inGun - st.calHandle;
+            if (dot(way, way) < 0.5f) {
+                again("Затвор почти не сдвинут: отведи руку дальше назад и нажми грип");
+                return;
+            }
+            st.calStep = 4;
+            break;
+        }
+        }
+        buzz(freeIndex(), 1500);
+        note("Calibration step done, next %d (palm at %.2f, %.2f, %.2f in the gun)", st.calStep, inGun.x, inGun.y, inGun.z);
+        if (st.calStep < 4) {
+            st.calTold = {};
+            return;
+        }
+        GunCal cal{};
+        cal.grab = st.calGrab;
+        cal.out = st.calOut;
+        cal.slide = looksLikeObject(bolt);
+        if (cal.slide) {
+            cal.handle = st.calHandle;
+            cal.back = inGun;
+        }
+        g_cals[st.calKey] = cal;
+        saveCals();
+        st.calStep = -1;
+        applyCal();
+        hud("Калибровка сохранена: можно перезаряжать");
+        note("Calibration of '%s' saved", st.calKey.c_str());
     }
 
     // The pose the fingers take on the slide and the magazine is learned once from ROCK's own hand:
@@ -2117,7 +2335,18 @@ namespace
             std::string magModel;
             const int kind = gun.weapon && gun.data ? magazineKindOf(player, gun.weapon, magModel) : -1;
             const bool pistol10 = gun.weapon && gun.data && gun.weapon->GetFormID() == k10mmPistol;
-            st.managed = gun.weapon && gun.data && (pistol10 || (kind >= 0 && g_settings.allGuns));
+            loadCals();
+            if (gun.weapon && kind >= 0) {
+                char key[32];
+                std::snprintf(key, sizeof(key), "%08X:", gun.weapon->GetFormID());
+                st.calKey = key + magModel;
+            }
+            const bool measured = !st.calKey.empty() && g_cals.contains(st.calKey);
+            st.managed = gun.weapon && gun.data && (pistol10 || (kind >= 0 && (g_settings.allGuns || measured || g_settings.calibrate > 0)));
+            if (st.managed && !st.calKey.empty() && (g_settings.calibrate >= 2 || (g_settings.calibrate == 1 && !measured))) {
+                st.calStep = 0;
+                note("Calibration of '%s' starts once the gun is measured at rest", st.calKey.c_str());
+            }
             st.equippedAt = now;
             const auto total = gun.data ? gun.data->ammoCount : 0u;
             st.chamber = total > 0;
@@ -2269,6 +2498,7 @@ namespace
 
         // the free hand closes
         const bool press = free.valid && free.grip && !free.previousGrip;
+        calibrate(root, magazine, bolt, free, press, now);
         if (press) {
             detail("Free hand grip: %s, reason %d, place %d, hidden reads %u", griphook::owned() ? "ours" : "everyone's", st.armReason,
                 st.place, griphook::hiddenCount());
@@ -2496,7 +2726,9 @@ namespace
             if (free.valid) {
                 const float toSlide = looksLikeObject(bolt) ? distance(free.palm, slideGrabPoint(root, bolt)) : 1e9f;
                 const float toMag = st.place == kRailAuto && st.railKnown ? distance(free.palm, grabPoint(root)) : 1e9f;
-                if (toMag < g_settings.magGrabRadius && toMag <= toSlide) {
+                if (st.calStep >= 0 && distance(free.palm, root->world.translate) < g_settings.gunRadius + 10.0f) {
+                    reason = kArmCal;
+                } else if (toMag < g_settings.magGrabRadius && toMag <= toSlide) {
                     reason = kArmRail;
                 } else if (toSlide < g_settings.slideGrabRadius) {
                     reason = kArmSlide;
