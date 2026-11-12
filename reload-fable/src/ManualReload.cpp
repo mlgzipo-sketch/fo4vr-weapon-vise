@@ -1258,6 +1258,9 @@ namespace
         RE::NiPoint3      prevAt{};
         bool              prevKnown{ false };
         RE::NiPoint3      velocity{};
+        bool              driving{ false };   // the free hand turns the opening part about its hinge
+        float             driveAngle0{ 0.0f };
+        float             driveT0{ 0.0f };
     };
 
     struct State
@@ -2219,246 +2222,6 @@ namespace
     // The reload button opens and closes the gun. Open, with the muzzle up, everything falls out of it. Rounds
     // come from the belt in the free hand (a full clip for a revolver, one shell at a time for a break action)
     // and go in at the breech. The free hand on the gun, or a jerk of the gun, closes it.
-    void updateBreech(RE::PlayerCharacter* player, const Gun& gun, RE::NiAVObject* root, Clock::time_point now, float dt) noexcept
-    {
-        auto& st = g_state;
-        auto& b = st.breech;
-        const auto& spare = g_hands[freeIndex()];
-        const auto& firing = g_hands[g_settings.gunHand];
-        hideRound();
-        looseMagazines(nullptr, nullptr);
-        rocklink::Frame link{};
-        link.gun = true;
-        link.freeHand = freeIndex();
-        link.magazine.node = kMovingParts[0];
-        link.bolt.node = kMovingParts[1];
-        g_rock = rocklink::frame(link);
-
-        auto* mag = findNamed(root, kMovingParts[0]);
-        if (!looksLikeObject(mag) || !looksLikeObject(mag->parent)) {
-            return;
-        }
-        const bool revolver = b.mech == 1;
-        std::array<RE::NiAVObject*, 5> child{};
-        for (int i = 0; i < 5; ++i) {
-            char name[32]{};
-            std::snprintf(name, sizeof(name), "WeaponMagazineChild%d", i + 1);
-            child[i] = findNamed(mag, name);
-        }
-        const auto gunState = static_cast<std::uint32_t>(player->gunState);
-        const auto reloading = static_cast<std::uint32_t>(g_settings.reloadGunState);
-        if (gunState == reloading && st.lastGunState != reloading) {
-            b.freezeUntil = now + std::chrono::milliseconds(static_cast<int>(g_settings.freezeSeconds * 1000.0f));
-        }
-        st.lastGunState = gunState;
-        const auto capacity = std::max(capacityOf(gun), 1u);
-        const float scale = gunScale(root);
-
-        if (!st.dumped && now - st.equippedAt > std::chrono::seconds(2)) {
-            st.dumped = true;
-            logNote("Weapon node tree:");
-            dumpTree(root);
-        }
-
-        // the closed pose
-        if (!b.known) {
-            const bool idle = gunState == static_cast<std::uint32_t>(g_settings.idleGunState) && now - st.equippedAt > std::chrono::milliseconds(1500);
-            if (!idle) {
-                return;
-            }
-            b.rest = mag->local;
-            b.kids.clear();
-            forEachNode(mag, [&](RE::NiAVObject* object, int depth) {
-                if (depth > 0 && object->IsNode() && b.kids.size() < 40) {
-                    b.kids.emplace_back(object, object->local);
-                }
-                return true;
-            });
-            b.known = true;
-            b.live = gun.data->ammoCount;
-            b.lastAmmo = b.live;
-            note("Breech: closed pose remembered (%zu nodes below), %u of %u rounds in it", b.kids.size(), b.live, capacity);
-        }
-
-        // the rounds
-        auto ammo = gun.data->ammoCount;
-        if (b.open) {
-            if (ammo != 0) {
-                gun.data->ammoCount = 0;   // an open gun does not fire, and the game's own refill is undone
-            }
-            b.lastAmmo = 0;
-        } else {
-            if (ammo > b.lastAmmo && g_settings.blockReload) {
-                note("Game refill %u -> %u reverted", b.lastAmmo, ammo);
-                ammo = b.lastAmmo;
-                gun.data->ammoCount = ammo;
-            } else if (ammo < b.lastAmmo) {
-                b.spent = std::min(b.spent + (b.lastAmmo - ammo), capacity - std::min(ammo, capacity));
-                detail("Shot: %u rounds and %u fired cases in the gun", ammo, b.spent);
-            }
-            b.live = ammo;
-            b.lastAmmo = ammo;
-        }
-        st.lastAmmo = gun.data->ammoCount;
-
-        const auto close = [&](const char* how) {
-            b.open = false;
-            b.held = 0;
-            b.toggled = now;
-            gun.data->ammoCount = b.live;
-            b.lastAmmo = b.live;
-            st.lastAmmo = b.live;
-            playSound(3);
-            buzz(g_settings.gunHand, 2000);
-            note("CLOSE (%s): %u rounds, %u fired cases", how, b.live, b.spent);
-        };
-
-        // the reload button: a tap opens or closes
-        const bool buttonNow = (firing.buttons & buttonMask(g_settings.reloadButton)) != 0;
-        const bool buttonBefore = (firing.previousButtons & buttonMask(g_settings.reloadButton)) != 0;
-        if (buttonNow && !buttonBefore) {
-            st.buttonSince = now;
-        }
-        if (!buttonNow && buttonBefore && now - st.buttonSince < std::chrono::milliseconds(600) && now - b.toggled > std::chrono::milliseconds(400) &&
-            !menuOpen()) {
-            if (b.open) {
-                close("the button");
-            } else {
-                b.open = true;
-                b.opened = now;
-                b.toggled = now;
-                gun.data->ammoCount = 0;
-                b.lastAmmo = 0;
-                playSound(1);
-                buzz(g_settings.gunHand, 1200);
-                note("OPEN: %u rounds, %u fired cases", b.live, b.spent);
-            }
-        }
-        b.t = approach(b.t, b.open ? 1.0f : 0.0f, 7.0f * dt);
-
-        // the pose: ours while it is open or moving, and held still while the game plays its own reload
-        if (b.t > 0.0f || gunState == reloading || now < b.freezeUntil) {
-            mag->local = b.rest;
-            if (b.t > 0.0f) {
-                const float eased = b.t * b.t * (3.0f - 2.0f * b.t);
-                turnRows(mag->local.rotate, revolver ? 1 : 0, (revolver ? g_settings.cylinderSwing : g_settings.breakAngle) * 0.01745329f * eased);
-            }
-            for (auto& [object, local] : b.kids) {
-                if (looksLikeObject(object)) {
-                    object->local = local;
-                }
-            }
-            refreshSubtree(mag, RE::NiPoint3{});
-        }
-
-        // the gun's speed against the player (a jerk closes it)
-        const auto at = root->world.translate - player->GetPosition();
-        if (b.prevKnown) {
-            b.velocity = b.velocity * 0.5f + (at - b.prevAt) * (0.5f / dt);
-        }
-        b.prevAt = at;
-        b.prevKnown = true;
-
-        const auto barrel = axisOf(mag->world, 1);   // the cylinder's / the barrels' own line, forward
-        const auto breechNode = looksLikeObject(child[0]) ? child[0] : mag;
-        const auto breechAt = breechNode->world.translate - (revolver ? barrel * (2.0f * scale) : RE::NiPoint3{});
-        const bool fullyOpen = b.open && b.t >= 0.95f;
-
-        // muzzle up: everything falls out
-        if (fullyOpen && b.live + b.spent > 0 && barrel.z > (revolver ? 0.5f : 0.3f) && now - b.opened > std::chrono::milliseconds(350)) {
-            note("EMPTIED: %u rounds back to the pouch, %u fired cases gone", b.live, b.spent);
-            if (b.live > 0) {
-                hud("Патроны высыпались и вернулись в запас");
-            }
-            b.live = 0;
-            b.spent = 0;
-            playSound(4);
-            buzz(g_settings.gunHand, 1500);
-        }
-
-        // the free hand
-        const bool press = spare.valid && spare.grip && !spare.previousGrip;
-        const bool atBelt = spare.valid && inBelt(player, spare.palm);
-        const float toGun = spare.valid ? distance(spare.palm, breechAt) : 1e9f;
-        if (press && griphook::owned() && b.open) {
-            if (atBelt && b.held == 0) {
-                const auto inventory = gun.data->ammo ? inventoryCount(player, gun.data->ammo) : 0u;
-                const auto have = inventory > b.live ? inventory - b.live : 0u;
-                const auto room = capacity - std::min(capacity, b.live + b.spent);
-                const auto take = std::min(have, revolver ? room : std::min(room, 1u));
-                if (b.spent > 0 && room == 0) {
-                    hud("Сначала вытряхни гильзы: подними ствол вверх");
-                } else if (take == 0) {
-                    hud(have == 0 ? "Патронов нет" : "Заряжено полностью");
-                } else {
-                    b.held = take;
-                    playSound(4);
-                    buzz(freeIndex(), 1200);
-                    note("BELT: %u round(s) in the free hand", take);
-                }
-            } else if (!atBelt && b.held == 0 && fullyOpen && toGun < 12.0f * scale) {
-                close("the free hand");
-            }
-        }
-        if (b.held > 0 && !(spare.valid && spare.grip)) {
-            note("The rounds in the hand are put away");
-            b.held = 0;
-        }
-        if (b.held > 0 && fullyOpen && toGun < g_settings.breechRadius * scale) {
-            b.live += b.held;
-            note("LOAD: %u round(s) in, %u of %u in the gun", b.held, b.live, capacity);
-            b.held = 0;
-            playSound(0);
-            buzz(0, 2000);
-            buzz(1, 2000);
-            griphook::setOwned(false);
-        }
-        if (fullyOpen && b.held == 0 && now - b.opened > std::chrono::milliseconds(700)) {
-            const float jerk = revolver ? std::fabs(dot(b.velocity, axisOf(root->world, 0))) : b.velocity.z;
-            if (jerk > g_settings.flickSpeed * scale && !(barrel.z > 0.3f && b.live + b.spent > 0)) {
-                close("a jerk of the gun");
-            }
-        }
-
-        // what is seen in it, and the rounds carried in the hand
-        const auto show = [&](int index, bool on) {
-            if (looksLikeObject(child[index])) {
-                setCulled(child[index], !on);
-            }
-        };
-        const std::uint32_t filled = b.live + b.spent;
-        if (revolver) {
-            show(4, b.live > 0 || b.held > 0);   // the bullets
-            show(3, filled > 0);                 // the cases
-            show(2, b.held > 0);                 // the clip they come on
-        } else {
-            show(0, filled >= 1 || (b.held > 0 && filled == 0));
-            show(1, filled >= 2 || (b.held > 0 && filled == 1));
-        }
-        if (b.held > 0 && spare.valid) {
-            const auto y = normalized(axisOf(spare.wrist, 0));   // along the fingers
-            auto z = axisOf(spare.wrist, 2);
-            z = normalized(z - y * dot(z, y));
-            RE::NiTransform pose = identityTransform();
-            setRows(pose, cross(y, z), y, z);
-            pose.scale = scale;
-            pose.translate = spare.palm + y * ((revolver ? 2.0f : 0.0f) * scale);
-            if (revolver) {
-                placeNode(child[2], pose);
-                placeNode(child[4], pose);
-            } else {
-                placeNode(child[filled == 0 ? 0 : 1], pose);
-            }
-        }
-
-        // an open gun: the free hand's grip near it or at the belt is this plugin's (no second-hand hold, no ROCK grab)
-        if (!spare.grip) {
-            const bool mine = b.open && spare.valid && (atBelt || distance(spare.palm, root->world.translate) < g_settings.gunRadius);
-            st.armReason = mine ? (atBelt ? kArmBelt : kArmBlock) : kArmNone;
-            griphook::setArmed(mine);
-        }
-    }
-
     // ------------------------------------------------------------ the game's reload, written down
 
     // While bRecordAnim is on the plugin leaves the gun alone; each time the game plays its own reload,
@@ -2690,9 +2453,498 @@ namespace
         r.times.push_back(t);
         r.frames.push_back(std::move(frame));
         r.culled.push_back(std::move(hidden));
-        // keeps going a moment after the state ends (the last part of the move), at most 8 s
-        if ((!reloading && now - r.lastSeen > std::chrono::milliseconds(400)) || t > 8.0f) {
+        // keeps going 2.5 s after the state ends (the game's animation runs on after it), at most 8 s
+        if ((!reloading && now - r.lastSeen > std::chrono::milliseconds(2500)) || t > 8.0f) {
             finishRecording();
+        }
+    }
+
+
+    // ------------------------------------------------------------ the game's reload, played back by hand
+
+    // A recording (ManualReloadF_anim/<weapon>.txt) read back: the moving nodes frame by frame against the gun root,
+    // and the hinge of the part that opens (WeaponMagazine: a cylinder, the barrels). The opening part and whatever
+    // moves with it are posed from the recording at a point of its opening move chosen by the plugin or the hand.
+    struct PlayedAnim
+    {
+        bool                                      loaded{ false };
+        std::uint32_t                             weapon{ 0 };
+        std::vector<std::string>                  names;
+        std::vector<float>                        times;
+        std::vector<std::vector<RE::NiTransform>> frames;   // [frame][node]
+        float                                     openTime{ 0.0f };
+        float                                     openAngle{ 0.0f };   // radians
+        RE::NiPoint3                              axis{};              // hinge, gun root frame
+        RE::NiPoint3                              pivot{};
+        std::vector<int>                          posed;               // the nodes posed (indices in names)
+        std::vector<RE::NiAVObject*>              nodes;               // resolved on the drawn gun
+        RE::NiAVObject*                           rootSeen{ nullptr };
+    };
+    PlayedAnim g_play;
+
+    bool loadPlayed(std::uint32_t weapon) noexcept
+    {
+        auto& p = g_play;
+        if (p.weapon == weapon) {
+            return p.loaded;
+        }
+        p = PlayedAnim{};
+        p.weapon = weapon;
+        char path[160];
+        std::snprintf(path, sizeof(path), "Data/F4SE/Plugins/ManualReloadF_anim/%08X.txt", weapon);
+        std::ifstream file(path);
+        if (!file) {
+            note("PLAY: no recording of %08X (bRecordAnim=1 and one reload makes it)", weapon);
+            return false;
+        }
+        struct HingeLine { float angle; RE::NiPoint3 axis, pivot; float from; };
+        std::unordered_map<std::string, HingeLine> hinges;
+        std::unordered_map<std::string, int> index;
+        std::string line;
+        float lastTime = -1.0f;
+        while (std::getline(file, line)) {
+            std::vector<std::string> words;
+            {
+                std::size_t at = 0;
+                while (at < line.size()) {
+                    while (at < line.size() && (line[at] == ' ' || line[at] == '\t' || line[at] == '\r')) ++at;
+                    const auto start = at;
+                    while (at < line.size() && line[at] != ' ' && line[at] != '\t' && line[at] != '\r') ++at;
+                    if (at > start) words.emplace_back(line.substr(start, at - start));
+                }
+            }
+            const auto num = [&](std::size_t i) { return i < words.size() ? std::strtof(words[i].c_str(), nullptr) : 0.0f; };
+            const auto after = [&](const char* key) -> std::size_t {
+                for (std::size_t i = 0; i < words.size(); ++i) if (words[i] == key) return i + 1;
+                return words.size();
+            };
+            if (words.size() > 12 && words[0] == "hinge") {
+                HingeLine h{};
+                h.angle = num(after("angle"));
+                const auto ax = after("axis");
+                h.axis = { num(ax), num(ax + 1), num(ax + 2) };
+                const auto pv = after("pivot");
+                h.pivot = { num(pv), num(pv + 1), num(pv + 2) };
+                h.from = num(after("from"));
+                hinges[words[1]] = h;
+                continue;
+            }
+            if (words.size() < 15 || words[0] != "f") {
+                continue;
+            }
+            const float t = num(1);
+            const std::string name = words[2];
+            float v[12]{};
+            for (int k = 0; k < 12; ++k) v[k] = num(3 + k);
+            if (t != lastTime) {
+                lastTime = t;
+                p.times.push_back(t);
+                p.frames.emplace_back(p.names.size(), identityTransform());
+            }
+            auto found = index.find(name);
+            if (found == index.end()) {
+                if (p.frames.size() > 1) {
+                    continue;   // every node is in the first frame
+                }
+                found = index.emplace(name, static_cast<int>(p.names.size())).first;
+                p.names.emplace_back(name);
+                p.frames.back().push_back(identityTransform());
+            }
+            RE::NiTransform tr = identityTransform();
+            setRows(tr, { v[3], v[4], v[5] }, { v[6], v[7], v[8] }, { v[9], v[10], v[11] });
+            tr.translate = { v[0], v[1], v[2] };
+            p.frames.back()[found->second] = tr;
+        }
+        const auto main = hinges.find("WeaponMagazine");
+        const auto mainIndex = index.find("WeaponMagazine");
+        if (p.frames.size() < 10 || main == hinges.end() || mainIndex == index.end()) {
+            note("PLAY: the recording of %08X has no hinge on WeaponMagazine (%zu frames): not used", weapon, p.frames.size());
+            return false;
+        }
+        p.openAngle = main->second.angle * 0.01745329f;
+        p.axis = normalized(main->second.axis);
+        p.pivot = main->second.pivot;
+        const auto restCols = colsOf(p.frames[0][mainIndex->second]);
+        p.openTime = p.times.back();
+        for (std::size_t f = 1; f < p.frames.size(); ++f) {
+            if (angleOf(mulAB(colsOf(p.frames[f][mainIndex->second]), transposed(restCols))) >= p.openAngle * 0.97f) {
+                p.openTime = p.times[f];
+                break;
+            }
+        }
+        // posed: everything that is on the way by the time it is open, except parts that swing on their own axis
+        // below the opening part (a speedloader, shells thrown out)
+        for (std::size_t n = 0; n < p.names.size(); ++n) {
+            const auto& name = p.names[n];
+            const auto h = hinges.find(name);
+            bool moving = true;
+            if (h != hinges.end()) {
+                const bool sameHinge = std::fabs(dot(normalized(h->second.axis), p.axis)) > 0.97f && std::fabs(h->second.angle - main->second.angle) < 3.0f;
+                const bool early = h->second.from <= p.openTime + 0.01f;
+                const bool own = name.rfind("WeaponMagazineChild", 0) == 0 || name.find("Shell") != std::string::npos ||
+                                 name.find("SpeedLoader") != std::string::npos || name.find("Bullet") != std::string::npos ||
+                                 name.find("Casing") != std::string::npos;
+                moving = early && (sameHinge || !own);
+            } else {
+                moving = false;   // slides are left to the game (triggers, sights)
+            }
+            if (moving) {
+                p.posed.push_back(static_cast<int>(n));
+            }
+        }
+        p.loaded = true;
+        std::string list;
+        for (const auto n : p.posed) {
+            list += p.names[n] + " ";
+        }
+        note("PLAY: recording of %08X, %zu frames; opens %.1f deg about (%.2f, %.2f, %.2f) at (%.2f, %.2f, %.2f) by %.2f s; posed: %s", weapon, p.frames.size(),
+            main->second.angle, p.axis.x, p.axis.y, p.axis.z, p.pivot.x, p.pivot.y, p.pivot.z, p.openTime, list.c_str());
+        return true;
+    }
+
+    RE::NiTransform playedAt(const PlayedAnim& p, int node, float time) noexcept
+    {
+        std::size_t hi = 1;
+        while (hi < p.times.size() - 1 && p.times[hi] < time) {
+            ++hi;
+        }
+        const std::size_t lo = hi - 1;
+        const float span = p.times[hi] - p.times[lo];
+        const float k = span > 1e-5f ? std::clamp((time - p.times[lo]) / span, 0.0f, 1.0f) : 0.0f;
+        const auto& a = p.frames[lo][node];
+        const auto& b = p.frames[hi][node];
+        RE::NiTransform out = identityTransform();
+        out.translate = a.translate + (b.translate - a.translate) * k;
+        const auto x = normalized(axisOf(a, 0) + (axisOf(b, 0) - axisOf(a, 0)) * k);
+        auto y = axisOf(a, 1) + (axisOf(b, 1) - axisOf(a, 1)) * k;
+        y = normalized(y - x * dot(y, x));
+        setRows(out, x, y, cross(x, y));
+        return out;
+    }
+
+    // Poses the opening part as the recording has it at `amount` (0 closed .. 1 open) of its opening move.
+    bool posePlayed(RE::NiAVObject* root, float amount) noexcept
+    {
+        auto& p = g_play;
+        if (!p.loaded) {
+            return false;
+        }
+        if (p.rootSeen != root || p.nodes.size() != p.posed.size()) {
+            p.rootSeen = root;
+            p.nodes.clear();
+            for (const auto n : p.posed) {
+                p.nodes.push_back(findNamed(root, p.names[n].c_str()));
+            }
+        }
+        const float time = std::clamp(amount, 0.0f, 1.0f) * p.openTime;
+        std::unordered_map<RE::NiAVObject*, RE::NiTransform> placed;
+        std::vector<RE::NiAVObject*> tops;
+        for (std::size_t i = 0; i < p.posed.size(); ++i) {
+            auto* node = p.nodes[i];
+            if (!looksLikeObject(node) || !looksLikeObject(node->parent)) {
+                continue;
+            }
+            auto recorded = playedAt(p, p.posed[i], time);
+            recorded.scale = root->world.scale > 0.0f ? node->world.scale / root->world.scale : 1.0f;
+            const auto world = compose(root->world, recorded);
+            const auto up = placed.find(node->parent);
+            const bool parentPosed = up != placed.end();
+            node->local = relative(parentPosed ? up->second : node->parent->world, world);
+            placed[node] = world;
+            if (!parentPosed) {
+                tops.push_back(node);
+            }
+        }
+        for (auto* node : tops) {
+            refreshSubtree(node, RE::NiPoint3{});
+        }
+        return true;
+    }
+
+    // The angle of a point about the hinge (gun root frame), for turning the opening part by hand.
+    float hingeAngle(const RE::NiAVObject* root, const RE::NiPoint3& world) noexcept
+    {
+        const auto& p = g_play;
+        const auto at = relative(root->world, pointTransform(world)).translate - p.pivot;
+        const auto flat = at - p.axis * dot(at, p.axis);
+        auto u = std::fabs(p.axis.z) < 0.9f ? RE::NiPoint3{ 0.0f, 0.0f, 1.0f } : RE::NiPoint3{ 1.0f, 0.0f, 0.0f };
+        u = normalized(u - p.axis * dot(u, p.axis));
+        const auto v = cross(p.axis, u);
+        return std::atan2(dot(flat, v), dot(flat, u));
+    }
+
+    void updateBreech(RE::PlayerCharacter* player, const Gun& gun, RE::NiAVObject* root, Clock::time_point now, float dt) noexcept
+    {
+        auto& st = g_state;
+        auto& b = st.breech;
+        const auto& spare = g_hands[freeIndex()];
+        const auto& firing = g_hands[g_settings.gunHand];
+        hideRound();
+        looseMagazines(nullptr, nullptr);
+        rocklink::Frame link{};
+        link.gun = true;
+        link.freeHand = freeIndex();
+        link.magazine.node = kMovingParts[0];
+        link.bolt.node = kMovingParts[1];
+        g_rock = rocklink::frame(link);
+
+        auto* mag = findNamed(root, kMovingParts[0]);
+        if (!looksLikeObject(mag) || !looksLikeObject(mag->parent)) {
+            return;
+        }
+        const bool revolver = b.mech == 1;
+        const bool played = gun.weapon && loadPlayed(gun.weapon->GetFormID());
+        std::array<RE::NiAVObject*, 5> child{};
+        for (int i = 0; i < 5; ++i) {
+            char name[32]{};
+            std::snprintf(name, sizeof(name), "WeaponMagazineChild%d", i + 1);
+            child[i] = findNamed(mag, name);
+        }
+        const auto gunState = static_cast<std::uint32_t>(player->gunState);
+        const auto reloading = static_cast<std::uint32_t>(g_settings.reloadGunState);
+        if (gunState == reloading && st.lastGunState != reloading) {
+            b.freezeUntil = now + std::chrono::milliseconds(static_cast<int>(g_settings.freezeSeconds * 1000.0f));
+        }
+        st.lastGunState = gunState;
+        const auto capacity = std::max(capacityOf(gun), 1u);
+        const float scale = gunScale(root);
+
+        if (!st.dumped && now - st.equippedAt > std::chrono::seconds(2)) {
+            st.dumped = true;
+            logNote("Weapon node tree:");
+            dumpTree(root);
+        }
+
+        // the closed pose
+        if (!b.known) {
+            const bool idle = gunState == static_cast<std::uint32_t>(g_settings.idleGunState) && now - st.equippedAt > std::chrono::milliseconds(1500);
+            if (!idle) {
+                return;
+            }
+            b.rest = mag->local;
+            b.kids.clear();
+            forEachNode(mag, [&](RE::NiAVObject* object, int depth) {
+                if (depth > 0 && object->IsNode() && b.kids.size() < 40) {
+                    b.kids.emplace_back(object, object->local);
+                }
+                return true;
+            });
+            b.known = true;
+            b.live = gun.data->ammoCount;
+            b.lastAmmo = b.live;
+            note("Breech: closed pose remembered (%zu nodes below), %u of %u rounds in it", b.kids.size(), b.live, capacity);
+        }
+
+        // the rounds
+        auto ammo = gun.data->ammoCount;
+        if (b.open) {
+            if (ammo != 0) {
+                gun.data->ammoCount = 0;   // an open gun does not fire, and the game's own refill is undone
+            }
+            b.lastAmmo = 0;
+        } else {
+            if (ammo > b.lastAmmo && g_settings.blockReload) {
+                note("Game refill %u -> %u reverted", b.lastAmmo, ammo);
+                ammo = b.lastAmmo;
+                gun.data->ammoCount = ammo;
+            } else if (ammo < b.lastAmmo) {
+                b.spent = std::min(b.spent + (b.lastAmmo - ammo), capacity - std::min(ammo, capacity));
+                detail("Shot: %u rounds and %u fired cases in the gun", ammo, b.spent);
+            }
+            b.live = ammo;
+            b.lastAmmo = ammo;
+        }
+        st.lastAmmo = gun.data->ammoCount;
+
+        const auto close = [&](const char* how) {
+            b.open = false;
+            b.held = 0;
+            b.toggled = now;
+            gun.data->ammoCount = b.live;
+            b.lastAmmo = b.live;
+            st.lastAmmo = b.live;
+            playSound(3);
+            buzz(g_settings.gunHand, 2000);
+            note("CLOSE (%s): %u rounds, %u fired cases", how, b.live, b.spent);
+        };
+
+        // the reload button: a tap opens or closes
+        const bool buttonNow = (firing.buttons & buttonMask(g_settings.reloadButton)) != 0;
+        const bool buttonBefore = (firing.previousButtons & buttonMask(g_settings.reloadButton)) != 0;
+        if (buttonNow && !buttonBefore) {
+            st.buttonSince = now;
+        }
+        if (!buttonNow && buttonBefore && now - st.buttonSince < std::chrono::milliseconds(600) && now - b.toggled > std::chrono::milliseconds(400) &&
+            !menuOpen()) {
+            if (b.open) {
+                close("the button");
+            } else {
+                b.open = true;
+                b.opened = now;
+                b.toggled = now;
+                gun.data->ammoCount = 0;
+                b.lastAmmo = 0;
+                playSound(1);
+                buzz(g_settings.gunHand, 1200);
+                note("OPEN: %u rounds, %u fired cases", b.live, b.spent);
+            }
+        }
+        if (!b.driving) {
+            b.t = approach(b.t, b.open ? 1.0f : 0.0f, 7.0f * dt);
+        }
+
+        // the pose: ours while it is open or moving, and held still while the game plays its own reload
+        if (b.t > 0.0f || gunState == reloading || now < b.freezeUntil) {
+            mag->local = b.rest;
+            if (b.t > 0.0f) {
+                const float eased = b.t * b.t * (3.0f - 2.0f * b.t);
+                if (!played) {
+                    turnRows(mag->local.rotate, revolver ? 1 : 0, (revolver ? g_settings.cylinderSwing : g_settings.breakAngle) * 0.01745329f * eased);
+                }
+            }
+            for (auto& [object, local] : b.kids) {
+                if (looksLikeObject(object)) {
+                    object->local = local;
+                }
+            }
+            refreshSubtree(mag, RE::NiPoint3{});
+            if (played) {
+                const float eased = b.driving ? b.t : b.t * b.t * (3.0f - 2.0f * b.t);
+                posePlayed(root, eased);
+            }
+        }
+
+        // the gun's speed against the player (a jerk closes it)
+        const auto at = root->world.translate - player->GetPosition();
+        if (b.prevKnown) {
+            b.velocity = b.velocity * 0.5f + (at - b.prevAt) * (0.5f / dt);
+        }
+        b.prevAt = at;
+        b.prevKnown = true;
+
+        const auto barrel = axisOf(mag->world, 1);   // the cylinder's / the barrels' own line, forward
+        const auto breechNode = looksLikeObject(child[0]) ? child[0] : mag;
+        const auto breechAt = breechNode->world.translate - (revolver ? barrel * (2.0f * scale) : RE::NiPoint3{});
+        const bool fullyOpen = b.open && b.t >= 0.95f;
+
+        // muzzle up: everything falls out
+        if (fullyOpen && b.live + b.spent > 0 && barrel.z > (revolver ? 0.5f : 0.3f) && now - b.opened > std::chrono::milliseconds(350)) {
+            note("EMPTIED: %u rounds back to the pouch, %u fired cases gone", b.live, b.spent);
+            if (b.live > 0) {
+                hud("Патроны высыпались и вернулись в запас");
+            }
+            b.live = 0;
+            b.spent = 0;
+            playSound(4);
+            buzz(g_settings.gunHand, 1500);
+        }
+
+        // the free hand
+        const bool press = spare.valid && spare.grip && !spare.previousGrip;
+        const bool atBelt = spare.valid && inBelt(player, spare.palm);
+        const float toGun = spare.valid ? distance(spare.palm, breechAt) : 1e9f;
+        if (press && griphook::owned() && b.open) {
+            if (atBelt && b.held == 0) {
+                const auto inventory = gun.data->ammo ? inventoryCount(player, gun.data->ammo) : 0u;
+                const auto have = inventory > b.live ? inventory - b.live : 0u;
+                const auto room = capacity - std::min(capacity, b.live + b.spent);
+                const auto take = std::min(have, revolver ? room : std::min(room, 1u));
+                if (b.spent > 0 && room == 0) {
+                    hud("Сначала вытряхни гильзы: подними ствол вверх");
+                } else if (take == 0) {
+                    hud(have == 0 ? "Патронов нет" : "Заряжено полностью");
+                } else {
+                    b.held = take;
+                    playSound(4);
+                    buzz(freeIndex(), 1200);
+                    note("BELT: %u round(s) in the free hand", take);
+                }
+            } else if (played && !atBelt && b.held == 0 && distance(spare.palm, mag->world.translate) < 14.0f * scale) {
+                b.driving = true;
+                b.driveAngle0 = hingeAngle(root, spare.palm);
+                b.driveT0 = b.t;
+                buzz(freeIndex(), 800);
+                detail("The free hand takes the opening part at %.2f open", b.t);
+            } else if (!played && !atBelt && b.held == 0 && fullyOpen && toGun < 12.0f * scale) {
+                close("the free hand");
+            }
+        }
+        if (b.driving) {
+            if (!(spare.valid && spare.grip) || !b.open) {
+                b.driving = false;
+                if (b.open && b.t < 0.3f) {
+                    close("pushed shut by hand");
+                }
+            } else {
+                float turn = hingeAngle(root, spare.palm) - b.driveAngle0;
+                while (turn > 3.14159265f) turn -= 6.2831853f;
+                while (turn < -3.14159265f) turn += 6.2831853f;
+                const float before = b.t;
+                b.t = std::clamp(b.driveT0 + turn / std::max(g_play.openAngle, 0.1f), 0.0f, 1.0f);
+                if (b.t <= 0.05f && before > 0.05f) {
+                    b.driving = false;
+                    close("pushed shut by hand");
+                } else if (b.t >= 0.98f && before < 0.98f) {
+                    buzz(freeIndex(), 600);
+                }
+            }
+        }
+        if (b.held > 0 && !(spare.valid && spare.grip)) {
+            note("The rounds in the hand are put away");
+            b.held = 0;
+        }
+        if (b.held > 0 && fullyOpen && toGun < g_settings.breechRadius * scale) {
+            b.live += b.held;
+            note("LOAD: %u round(s) in, %u of %u in the gun", b.held, b.live, capacity);
+            b.held = 0;
+            playSound(0);
+            buzz(0, 2000);
+            buzz(1, 2000);
+            griphook::setOwned(false);
+        }
+        if (fullyOpen && b.held == 0 && now - b.opened > std::chrono::milliseconds(700)) {
+            const float jerk = revolver ? std::fabs(dot(b.velocity, axisOf(root->world, 0))) : b.velocity.z;
+            if (jerk > g_settings.flickSpeed * scale && !(barrel.z > 0.3f && b.live + b.spent > 0)) {
+                close("a jerk of the gun");
+            }
+        }
+
+        // what is seen in it, and the rounds carried in the hand
+        const auto show = [&](int index, bool on) {
+            if (looksLikeObject(child[index])) {
+                setCulled(child[index], !on);
+            }
+        };
+        const std::uint32_t filled = b.live + b.spent;
+        if (revolver) {
+            show(4, b.live > 0 || b.held > 0);   // the bullets
+            show(3, filled > 0);                 // the cases
+            show(2, b.held > 0);                 // the clip they come on
+        } else {
+            show(0, filled >= 1 || (b.held > 0 && filled == 0));
+            show(1, filled >= 2 || (b.held > 0 && filled == 1));
+        }
+        if (b.held > 0 && spare.valid) {
+            const auto y = normalized(axisOf(spare.wrist, 0));   // along the fingers
+            auto z = axisOf(spare.wrist, 2);
+            z = normalized(z - y * dot(z, y));
+            RE::NiTransform pose = identityTransform();
+            setRows(pose, cross(y, z), y, z);
+            pose.scale = scale;
+            pose.translate = spare.palm + y * ((revolver ? 2.0f : 0.0f) * scale);
+            if (revolver) {
+                placeNode(child[2], pose);
+                placeNode(child[4], pose);
+            } else {
+                placeNode(child[filled == 0 ? 0 : 1], pose);
+            }
+        }
+
+        // an open gun: the free hand's grip near it or at the belt is this plugin's (no second-hand hold, no ROCK grab)
+        if (!spare.grip) {
+            const bool mine = b.open && spare.valid && (atBelt || distance(spare.palm, root->world.translate) < g_settings.gunRadius);
+            st.armReason = mine ? (atBelt ? kArmBelt : kArmBlock) : kArmNone;
+            griphook::setArmed(mine);
         }
     }
 
