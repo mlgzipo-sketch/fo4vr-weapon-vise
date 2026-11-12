@@ -2049,9 +2049,9 @@ namespace
     void learnGrip(const Hand& hand) noexcept
     {
         static Clock::time_point since{};
-        static bool near = false;
+        static bool gripNear = false;
         if (!rocklink::connected() || rocklink::hasGrip() || !hand.valid || !hand.grip || griphook::owned()) {
-            near = false;
+            gripNear = false;
             return;
         }
         bool close = false;
@@ -2065,15 +2065,15 @@ namespace
         }
         const auto now = Clock::now();
         if (!close) {
-            near = false;
+            gripNear = false;
             return;
         }
-        if (!near) {
-            near = true;
+        if (!gripNear) {
+            gripNear = true;
             since = now;
         } else if (now - since > std::chrono::milliseconds(500)) {
             rocklink::captureGrip(freeIndex());
-            near = false;
+            gripNear = false;
         }
     }
 
