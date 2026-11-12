@@ -12,7 +12,10 @@ namespace rocklink
 
     // index: 0 right, 1 left (as the plugin's hands).
     // Takes ROCK's current finger joints of that hand as the grip pose (when ROCK has them all).
-    bool captureGrip(int index) noexcept;
+    // needCurl: only when the fingers are clearly closed compared with the last open pose seen (noteOpen).
+    bool captureGrip(int index, bool needCurl = false) noexcept;
+    // The hand's fingers as they are now, while nothing is gripped: the open pose captureGrip compares with.
+    void noteOpen(int index) noexcept;
     bool hasGrip() noexcept;
     // Every frame while on: the hand's fingers take the grip pose; off releases them to ROCK.
     void holdFingers(int index, bool on) noexcept;

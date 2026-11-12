@@ -6,6 +6,7 @@
 #include "ROCK/Client.h"
 #include "ROCK/Hands.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -27,6 +28,8 @@ namespace rocklink
         bool g_haveGrip{ false };
         api::Transform g_grip[api::hands::kFingerLocalTransformCount]{};
         bool g_holding[2]{};
+        bool g_haveOpen[2]{};
+        api::Transform g_open[2][api::hands::kFingerLocalTransformCount]{};
         int g_failures{ 0 };
         constexpr auto kGripFile = "Data/F4SE/Plugins/ManualReloadF_grip.bin";
 
@@ -115,21 +118,63 @@ namespace rocklink
     bool connected() noexcept { return g_hands && g_anim; }
     bool hasGrip() noexcept { return g_haveGrip; }
 
-    bool captureGrip(int index) noexcept
+    namespace
     {
-        if (!g_hands) return false;
-        api::hands::PresentedHandPose pose{};
-        const auto status = g_hands->getPresentedHandPose(g_client.owner(), handOf(index), &pose);
-        constexpr std::uint32_t all = (1u << api::hands::kFingerLocalTransformCount) - 1;
-        if (status != api::Status::Ok || !(pose.flags & static_cast<std::uint32_t>(api::hands::PresentedHandPoseFlag::FingerLocalsValid)) ||
-            (pose.fingerLocalTransformMask & all) != all) {
-            return false;
+        bool readFingers(int index, api::Transform (&out)[api::hands::kFingerLocalTransformCount]) noexcept
+        {
+            if (!g_hands) return false;
+            api::hands::PresentedHandPose pose{};
+            const auto status = g_hands->getPresentedHandPose(g_client.owner(), handOf(index), &pose);
+            constexpr std::uint32_t all = (1u << api::hands::kFingerLocalTransformCount) - 1;
+            if (status != api::Status::Ok || !(pose.flags & static_cast<std::uint32_t>(api::hands::PresentedHandPoseFlag::FingerLocalsValid)) ||
+                (pose.fingerLocalTransformMask & all) != all) {
+                return false;
+            }
+            std::memcpy(out, pose.fingerLocalTransforms, sizeof(out));
+            return true;
         }
+
+        // Sum over the joints of the angle between two poses (radians).
+        float bend(const api::Transform (&a)[api::hands::kFingerLocalTransformCount], const api::Transform (&b)[api::hands::kFingerLocalTransformCount]) noexcept
+        {
+            float total = 0.0f;
+            for (std::size_t j = 0; j < api::hands::kFingerLocalTransformCount; ++j) {
+                float trace = 0.0f;   // trace(A^T B) for row-major 3x3
+                for (int i = 0; i < 9; ++i) trace += a[j].rotate[i] * b[j].rotate[i];
+                const float c = (trace - 1.0f) * 0.5f;
+                total += std::acos(c > 1.0f ? 1.0f : (c < -1.0f ? -1.0f : c));
+            }
+            return total;
+        }
+    }
+
+    void noteOpen(int index) noexcept
+    {
+        if (index < 0 || index > 1 || g_holding[index]) return;
+        g_haveOpen[index] = readFingers(index, g_open[index]);
+    }
+
+    bool captureGrip(int index, bool needCurl) noexcept
+    {
+        if (index < 0 || index > 1) return false;
+        api::Transform fingers[api::hands::kFingerLocalTransformCount]{};
+        if (!readFingers(index, fingers)) return false;
+        if (needCurl) {
+            const float amount = g_haveOpen[index] ? bend(g_open[index], fingers) : 0.0f;
+            static int told = 0;
+            if (amount < 2.0f) {
+                if (told++ < 3) say("ROCK: the fingers are not closed enough to learn a grip (%.2f rad)", amount);
+                return false;
+            }
+            say("ROCK: closed fingers %.2f rad from the open hand", amount);
+        }
+        api::hands::PresentedHandPose pose{};
+        std::memcpy(pose.fingerLocalTransforms, fingers, sizeof(fingers));
         std::memcpy(g_grip, pose.fingerLocalTransforms, sizeof(g_grip));
         g_haveGrip = true;
         std::ofstream file(kGripFile, std::ios::binary | std::ios::trunc);
         file.write(reinterpret_cast<const char*>(g_grip), sizeof(g_grip));
-        say("ROCK: grip pose taken from the %s hand holding a magazine (saved)", index == 0 ? "right" : "left");
+        say("ROCK: grip pose taken from the %s hand (saved)", index == 0 ? "right" : "left");
         return true;
     }
 

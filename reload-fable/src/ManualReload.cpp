@@ -100,7 +100,7 @@ namespace
         float seatAt{ 0.3f };           // pushed this close to home: it clicks in
         float seatRelease{ 1.5f };      // let go this close to home: it clicks in, further out it falls
         float magGrabRadius{ 9.0f };    // the palm this close to a magazine that sticks out takes it
-        float grabUp{ 2.0f };           // the palm takes the magazine this far above its bottom
+        float grabUp{ 1.0f };           // the palm takes the magazine this far above its bottom
         float holdUp{ -0.5f };           // magazine from the belt: its bottom sits this far below the palm's middle
         float holdSide{ 0.0f };
         float holdForward{ 0.0f };
@@ -117,7 +117,7 @@ namespace
         float looseLifetime{ 90.0f };
         int   maxLoose{ 6 };
         bool  rockApi{ true };          // ROCK 1.0: the free hand's fingers take ROCK's own grip pose
-        bool  allGuns{ true };          // every gun with a magazine of group 1, not only the 10mm pistol
+        bool  allGuns{ false };         // every gun with a magazine of group 1, not only the 10mm pistol
         bool  nativeSound{ true };      // sounds played by the plugin (the script's Sound objects are not heard)
         int   soundFlags{ 16 };
         bool  showRound{ true };        // a cartridge is seen in the chamber / on top of the magazine while the slide is open
@@ -2044,14 +2044,25 @@ namespace
         return ui && ui->menuMode != 0;
     }
 
-    // ROCK's own grip on a loose magazine is the pose the fingers take on the slide and the magazine:
-    // taken once while the free hand holds one of our dropped magazines through ROCK.
-    void learnGrip(const Hand& hand) noexcept
+    // The pose the fingers take on the slide and the magazine is learned once from ROCK's own hand:
+    // either while the free hand holds one of our dropped magazines through ROCK, or from a fist made
+    // in the air (grip held away from the gun), compared with the open hand seen before.
+    void learnGrip(const Hand& hand, const RE::NiAVObject* root) noexcept
     {
         static Clock::time_point since{};
         static bool gripNear = false;
-        if (!rocklink::connected() || rocklink::hasGrip() || !hand.valid || !hand.grip || griphook::owned()) {
-            gripNear = false;
+        static bool fist = false;
+        if (!rocklink::connected() || rocklink::hasGrip() || !hand.valid) {
+            gripNear = fist = false;
+            return;
+        }
+        if (!hand.grip) {
+            rocklink::noteOpen(freeIndex());
+            gripNear = fist = false;
+            return;
+        }
+        if (griphook::owned()) {
+            gripNear = fist = false;
             return;
         }
         bool close = false;
@@ -2063,17 +2074,19 @@ namespace
                 break;
             }
         }
+        const bool inAir = !close && (!root || distance(hand.palm, root->world.translate) > g_settings.gunRadius + 10.0f);
         const auto now = Clock::now();
-        if (!close) {
-            gripNear = false;
+        if (!close && !inAir) {
+            gripNear = fist = false;
             return;
         }
-        if (!gripNear) {
+        if (!gripNear || fist != inAir) {
             gripNear = true;
+            fist = inAir;
             since = now;
-        } else if (now - since > std::chrono::milliseconds(500)) {
-            rocklink::captureGrip(freeIndex());
-            gripNear = false;
+        } else if (now - since > std::chrono::milliseconds(fist ? 800 : 500)) {
+            rocklink::captureGrip(freeIndex(), fist);
+            since = now + std::chrono::seconds(2);   // retry a failed fist only after a pause
         }
     }
 
@@ -2473,7 +2486,7 @@ namespace
         const bool holding = st.place == kRailHand || st.place == kHand || st.racking;
         rocklink::holdFingers(freeIndex(), holding);
         poseFingers(holding && !rocklink::hasGrip());
-        learnGrip(free);
+        learnGrip(free, root);
 
         looseMagazines(&gun, root);
 
