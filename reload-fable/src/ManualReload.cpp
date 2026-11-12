@@ -101,7 +101,7 @@ namespace
         float seatRelease{ 1.5f };      // let go this close to home: it clicks in, further out it falls
         float magGrabRadius{ 9.0f };    // the palm this close to a magazine that sticks out takes it
         float grabUp{ 2.0f };           // the palm takes the magazine this far above its bottom
-        float holdUp{ -0.5f };           // magazine from the belt: its bottom sits this far below the palm's middle
+        float holdUp{ 2.0f };           // magazine from the belt: its bottom sits this far below the palm's middle
         float holdSide{ 0.0f };
         float holdForward{ 0.0f };
         float holdRotX{ 90.0f };
@@ -110,7 +110,8 @@ namespace
         int   holdFlip{ 0 };            // 1 = the magazine from the belt is upside down in the hand: turn it
         float fingerCurl{ 0.35f };      // fingers around a magazine: 0 = fist, 1 = open
         float freezeSeconds{ 1.6f };
-        float slideGrabRadius{ 12.0f };
+        float slideGrabRadius{ 8.0f };
+        float slideGrabAt{ 0.3f };      // the hand takes the slide this part of its length from its rear end
         float rackTravel{ 5.0f };
         float slideLockAt{ 0.8f };
         float handRadius{ 16.0f };
@@ -153,7 +154,7 @@ namespace
             { "fHoldUp", 2, &s.holdUp }, { "fHoldSide", 2, &s.holdSide }, { "fHoldForward", 2, &s.holdForward },
             { "fHoldRotX", 2, &s.holdRotX }, { "fHoldRotY", 2, &s.holdRotY }, { "fHoldRotZ", 2, &s.holdRotZ },
             { "iHoldFlip", 1, &s.holdFlip }, { "fFingerCurl", 2, &s.fingerCurl }, { "fFreezeSeconds", 2, &s.freezeSeconds },
-            { "fSlideGrabRadius", 2, &s.slideGrabRadius }, { "fRackTravel", 2, &s.rackTravel }, { "fSlideLockAt", 2, &s.slideLockAt },
+            { "fSlideGrabRadius", 2, &s.slideGrabRadius }, { "fSlideGrabAt", 2, &s.slideGrabAt }, { "fRackTravel", 2, &s.rackTravel }, { "fSlideLockAt", 2, &s.slideLockAt },
             { "fHandRadius", 2, &s.handRadius }, { "fLooseLifetime", 2, &s.looseLifetime }, { "iMaxLoose", 1, &s.maxLoose },
             { "bAllGuns", 0, &s.allGuns }, { "bRockParts", 0, &s.rockParts }, { "bRockBeltHandover", 0, &s.rockBeltHandover },
             { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
@@ -1288,6 +1289,9 @@ namespace
         Clock::time_point  handoverAt{};                   // a magazine from the belt: when the grip is shown to ROCK
         bool               handoverDue{ false };
         bool               rockWasOnBolt{ false };
+        bool               magBoxUsed{ false };            // the magazine's size was taken from ROCK's box
+        bool               boltBoxUsed{ false };
+        Clock::time_point  seatedAt{};
         bool               rockWasOnMagazine{ false };
     };
     State g_state;
@@ -1438,7 +1442,7 @@ namespace
             return;
         }
         const auto& bound = bolt->worldBound;
-        if (bound.fRadius > 1.0f && bound.fRadius < 100.0f) {
+        if (!g_state.boltBoxUsed && bound.fRadius > 1.0f && bound.fRadius < 100.0f) {
             const bool first = !g_state.slideCenterKnown;
             g_state.slideCenter = relative(root->world, pointTransform(bound.center)).translate;
             g_state.slideCenterKnown = true;
@@ -1447,6 +1451,47 @@ namespace
                 g_state.slidePointKnown = true;
                 note("Slide: middle at (%.1f, %.1f, %.1f), radius %.1f", g_state.slideCenter.x, g_state.slideCenter.y, g_state.slideCenter.z, bound.fRadius);
             }
+        }
+    }
+
+    // ROCK measures every part of the drawn gun (boxes in the gun's frame): the real ends of the magazine and the
+    // place of the slide come from there, not from the nodes' origins or bounds (those are off, and change).
+    void useRockBoxes(RE::NiAVObject* root, RE::NiAVObject* bolt, bool atRest) noexcept
+    {
+        auto& st = g_state;
+        float lo[3]{}, hi[3]{};
+        if (!st.magBoxUsed && st.railKnown && rocklink::partBox(0, lo, hi)) {
+            st.magBoxUsed = true;
+            const RE::NiPoint3 middle{ (lo[0] + hi[0]) * 0.5f, (lo[1] + hi[1]) * 0.5f, (lo[2] + hi[2]) * 0.5f };
+            const float half[3]{ (hi[0] - lo[0]) * 0.5f, (hi[1] - lo[1]) * 0.5f, (hi[2] - lo[2]) * 0.5f };
+            const float a[3]{ std::fabs(st.axis.x), std::fabs(st.axis.y), std::fabs(st.axis.z) };
+            const int k = a[0] > a[1] && a[0] > a[2] ? 0 : (a[1] > a[2] ? 1 : 2);
+            const float halfLength = half[k] / std::max(a[k], 0.3f);
+            const float out = dot(middle - st.magRest.translate, st.axis);   // the middle, this far towards the way out
+            const float scale = st.magRest.scale > 0.0f ? st.magRest.scale : 1.0f;
+            if (halfLength > 1.5f && halfLength < 25.0f && std::fabs(out) < 30.0f) {
+                const float before = st.bottomAt;
+                st.bottomAt = -(out + halfLength) / scale;
+                const float top = (halfLength - out) / scale;
+                note("ROCK box of the magazine: (%.1f %.1f %.1f)..(%.1f %.1f %.1f); baseplate %.2f below the node (was %.2f), top %.2f above (node says %.2f)",
+                    lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], -st.bottomAt, -before, top, st.topAt);
+                if (std::fabs(top - st.topAt) > 2.5f) {
+                    // the node is not at the magazine (SMG and others): the box is the truth
+                    st.topAt = top;
+                    st.length = g_settings.railLength > 0.0f ? g_settings.railLength : std::min(2.0f * halfLength, top + 1.2f + std::max(0.0f, -out));
+                    note("  the top and the travel follow the box: top %.2f, travel %.2f", st.topAt, st.length);
+                }
+            }
+        }
+        if (!st.boltBoxUsed && atRest && looksLikeObject(bolt) && rocklink::partBox(1, lo, hi)) {
+            st.boltBoxUsed = true;
+            const float at = std::clamp(g_settings.slideGrabAt, 0.0f, 1.0f);
+            st.slideCenter = { (lo[0] + hi[0]) * 0.5f, lo[1] + (hi[1] - lo[1]) * at, (lo[2] + hi[2]) * 0.5f };
+            st.slideCenterKnown = true;
+            st.slidePointInBolt = relative(bolt->world, pointTransform(compose(root->world, pointTransform(st.slideCenter)).translate)).translate;
+            st.slidePointKnown = true;
+            note("ROCK box of the slide: (%.1f %.1f %.1f)..(%.1f %.1f %.1f); the hand takes it at (%.1f, %.1f, %.1f)", lo[0], lo[1], lo[2], hi[0], hi[1],
+                hi[2], st.slideCenter.x, st.slideCenter.y, st.slideCenter.z);
         }
     }
 
@@ -1770,6 +1815,7 @@ namespace
         st.place = kSeated;
         st.s = 0.0f;
         st.blendSeconds = 0.0f;
+        st.seatedAt = Clock::now();
         syncAmmo(gun);
         playSound(0);
         buzz(0, 2500);
@@ -1981,7 +2027,8 @@ namespace
         // the controller, not the drawn hand: ROCK moves the drawn hand onto whatever it holds
         const auto handLocal = relative(root->world, pointTransform(spare.wand.translate)).translate;
         const bool handBusy = st.place == kRailHand || st.place == kHand || (griphook::owned() && st.armReason != kArmSlide);
-        const bool rockTook = g_rock.onBolt && !st.rockWasOnBolt && spare.valid && spare.grip && !handBusy;
+        const bool rockTook = g_rock.onBolt && !st.rockWasOnBolt && spare.valid && spare.grip && !handBusy &&
+                              Clock::now() - st.seatedAt > std::chrono::milliseconds(700);
         st.rockWasOnBolt = g_rock.onBolt;
         if (!st.racking && spare.valid && spare.grip && ((!spare.previousGrip && !handBusy) || rockTook)) {
             const float toSlide = distance(spare.palm, slideGrabPoint(root, bolt));
@@ -2183,6 +2230,7 @@ namespace
         if (quiet && !st.railKnown && looksLikeObject(magazine)) {
             learnRail(root, magazine);
         }
+        useRockBoxes(root, bolt, quiet && gun.data->ammoCount > 0);
         if (frozen && st.idleKnown) {
             for (std::size_t i = 0; i < parts.size(); ++i) {
                 if (looksLikeObject(parts[i])) {
@@ -2534,7 +2582,8 @@ namespace
             link.gun = true;
             link.freeHand = freeIndex();
             link.exclusive = st.place != kSeated || st.armReason == kArmSlide || st.racking;
-            link.keepTargets = free.grip;
+            const bool justSeated = now - st.seatedAt < std::chrono::milliseconds(700);   // the hand must not jump from the magazine to the slide
+            link.keepTargets = free.grip && !justSeated;
             link.chamber = st.chamber ? 2 : 1;
             const bool magOut = draw && (st.place == kRailAuto || st.place == kRailHand || st.place == kHand) && looksLikeObject(magazine);
             link.magazine.node = kMovingParts[0];
@@ -2547,7 +2596,7 @@ namespace
             }
             if (looksLikeObject(bolt)) {
                 link.bolt.node = kMovingParts[1];
-                link.bolt.grab = st.slidePointKnown;
+                link.bolt.grab = st.slidePointKnown && !justSeated;
                 link.bolt.point[0] = st.slidePointInBolt.x;
                 link.bolt.point[1] = st.slidePointInBolt.y;
                 link.bolt.point[2] = st.slidePointInBolt.z;

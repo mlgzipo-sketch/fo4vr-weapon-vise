@@ -50,4 +50,6 @@ namespace rocklink
     bool connect(LogFn log, bool enabled) noexcept;
     bool connected() noexcept;
     Result frame(const Frame& frame) noexcept;
+    // The box of the drawn gun's magazine (0) or slide / bolt (1) as ROCK measured it, in the gun root's frame.
+    bool partBox(int which, float lo[3], float hi[3]) noexcept;
 }

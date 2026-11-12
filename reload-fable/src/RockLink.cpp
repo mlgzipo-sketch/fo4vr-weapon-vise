@@ -44,6 +44,8 @@ namespace rocklink
         std::string g_namesFor;          // the node names the keys were looked up for
         bool g_dumped{ false };
         int g_dumpTries{ 0 };
+        struct Box { bool known{ false }; float lo[3]{}; float hi[3]{}; };
+        Box g_boxes[2];                  // 0 the magazine, 1 the slide / bolt (the biggest of its colliders)
         std::string g_lastGrip;
         std::string g_lastDrive;
         std::uint32_t g_lastStatus[8]{ 999, 999, 999, 999, 999, 999, 999, 999 };
@@ -163,8 +165,18 @@ namespace rocklink
                 return false;
             }
             say("ROCK parts of this weapon (%u colliders): kind (7 magazine, 8 magwell, 9 bolt, 10 slide, 11 charging handle), roles, node, box", count);
+            float best[2]{ 0.0f, 0.0f };
             for (std::uint32_t i = 0; i < count && i < parts::kMaxEvidenceDetails; ++i) {
                 const auto& d = details[i];
+                const int which = d.partKind == 7 ? 0 : ((d.partKind >= 9 && d.partKind <= 11) ? 1 : -1);
+                if (which >= 0 && d.localBoundsGame.valid) {
+                    const auto& b = d.localBoundsGame;
+                    const float volume = (b.max.x - b.min.x) * (b.max.y - b.min.y) * (b.max.z - b.min.z);
+                    if (volume > best[which]) {
+                        best[which] = volume;
+                        g_boxes[which] = { true, { b.min.x, b.min.y, b.min.z }, { b.max.x, b.max.y, b.max.z } };
+                    }
+                }
                 char name[65]{};
                 std::memcpy(name, d.sourceName, 64);
                 say("  part %u: kind %u action %u reload %u support %u socket %u body %u node '%s' box (%.1f %.1f %.1f)..(%.1f %.1f %.1f)%s", i, d.partKind,
@@ -191,6 +203,7 @@ namespace rocklink
             g_key = 0;
             g_dumped = false;
             g_dumpTries = 0;
+            g_boxes[0] = g_boxes[1] = {};
         }
 
         void setTargets(const Frame& f) noexcept
@@ -378,6 +391,7 @@ namespace rocklink
             g_registered = false;
             g_dumped = false;
             g_dumpTries = 0;
+            g_boxes[0] = g_boxes[1] = {};
             for (auto& status : g_lastStatus) {
                 status = 999;
             }
@@ -422,5 +436,15 @@ namespace rocklink
             say("ROCK: free hand grip: %s", text);
         }
         return result;
+    }
+
+    bool partBox(int which, float lo[3], float hi[3]) noexcept
+    {
+        if (which < 0 || which > 1 || !g_boxes[which].known) {
+            return false;
+        }
+        std::memcpy(lo, g_boxes[which].lo, sizeof(g_boxes[which].lo));
+        std::memcpy(hi, g_boxes[which].hi, sizeof(g_boxes[which].hi));
+        return true;
     }
 }
