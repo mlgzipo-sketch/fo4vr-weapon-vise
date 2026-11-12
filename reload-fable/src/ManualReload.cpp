@@ -3416,6 +3416,12 @@ namespace
 
         const bool unrecorded = g_settings.autoRecord && gun.weapon && gun.data && gun.data->ammo && !hasRecording(gun.weapon->GetFormID());
         if (g_settings.recordAnim || unrecorded || g_rec.active) {
+            static Clock::time_point toldAt{};
+            if (now - toldAt > std::chrono::seconds(10)) {
+                toldAt = now;
+                note("IDLE: recording mode (bRecordAnim %d, not recorded yet %d, a take running %d): the game reloads by itself",
+                    g_settings.recordAnim ? 1 : 0, unrecorded ? 1 : 0, g_rec.active ? 1 : 0);
+            }
             if (unrecorded && !st.recordTold) {
                 st.recordTold = true;
                 hud("Этот ствол ещё не записан: выстрели хотя бы раз и перезаряди как обычно, мод запишет анимацию");
@@ -3453,6 +3459,23 @@ namespace
             return;
         }
         if (!st.managed || !looksLikeObject(root)) {
+            if (st.managed && !st.dumped && now - st.equippedAt > std::chrono::seconds(2)) {
+                st.dumped = true;   // why nothing happens: the drawn gun has no WeaponMagazine node where it is looked for
+                auto* fp = player->firstPerson3D.get();
+                note("IDLE: the gun is reloaded by hand but its model is not found (first person 3D %s, third person %s); nodes named Weapon*:",
+                    looksLikeObject(fp) ? "present" : "MISSING", looksLikeObject(player->Get3D()) ? "present" : "MISSING");
+                int shown = 0;
+                for (auto* top : { fp, player->Get3D() }) {
+                    forEachNode(top, [&](RE::NiAVObject* object, int depth) {
+                        const auto name = nodeName(object);
+                        if (shown < 40 && name.rfind("Weapon", 0) == 0) {
+                            ++shown;
+                            note("  %s (depth %d, culled %d)", name.c_str(), depth, (object->flags.flags & 1ull) ? 1 : 0);
+                        }
+                        return depth < 40;
+                    });
+                }
+            }
             if (st.managed) {
                 putAway("the gun is not drawn");
             } else {
@@ -4046,6 +4069,10 @@ namespace
 
     void FRIK_CALL onFrikFrame(std::uint32_t, void*) noexcept
     {
+        static std::uint64_t frames = 0;
+        if (++frames % 5400 == 1) {
+            logNote("frame update is running");
+        }
         __try {
             update();
         } __except (1) {
