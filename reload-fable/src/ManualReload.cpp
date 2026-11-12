@@ -125,7 +125,9 @@ namespace
         bool  realInHand{ false };      // a magazine out of the well is a real object ROCK holds (always so with bCore2)
         bool  core2{ true };            // 0.12 core: parts move along their way by the palm on them (no grab point), a magazine out of the gun is ROCK's
         float contactMargin{ 2.5f };
-        float catchSide{ 1.5f };        // core2: a magazine is caught by the well only this close to its line (from below, not from the side)
+        float catchSide{ 2.0f };
+        float catchAhead{ 3.0f };       // core2: ..and from this far below the mouth (the gun's collision keeps a real magazine out of the well)
+        float pushFactor{ 0.45f };      // core2: an open palm moves the slide only this part of the hand's motion (it slips; the grip takes it fully)        // core2: a magazine is caught by the well only this close to its line (from below, not from the side)
         int   markButton{ 32 };         // the free hand's stick click: writes a numbered mark and the whole state to the log
         bool  traceState{ true };       // every change of what the plugin thinks (where the magazine is, the slide, who holds what)    // the palm this close to a part's box touches it (gun units)
         bool  recordedBolt{ true };     // the bolt / slide moves along the recorded way (a bolt action lifts, then goes back)
@@ -175,7 +177,7 @@ namespace
             { "fSlideGrabRadius", 2, &s.slideGrabRadius }, { "fSlideGrabAt", 2, &s.slideGrabAt }, { "fSlideGrabHigh", 2, &s.slideGrabHigh }, { "fRackTravel", 2, &s.rackTravel }, { "fSlideLockAt", 2, &s.slideLockAt },
             { "fHandRadius", 2, &s.handRadius }, { "fLooseLifetime", 2, &s.looseLifetime }, { "iMaxLoose", 1, &s.maxLoose },
             { "bAllGuns", 0, &s.allGuns }, { "bRockParts", 0, &s.rockParts }, { "bRockBeltHandover", 0, &s.rockBeltHandover },
-            { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bBreech", 0, &s.breech }, { "bRecordAnim", 0, &s.recordAnim }, { "bAutoRecord", 0, &s.autoRecord }, { "bRecordedBolt", 0, &s.recordedBolt }, { "bRealInHand", 0, &s.realInHand }, { "bCore2", 0, &s.core2 }, { "fContactMargin", 2, &s.contactMargin }, { "iMarkButton", 1, &s.markButton }, { "fCatchSide", 2, &s.catchSide }, { "bTraceState", 0, &s.traceState }, { "fCylinderSwing", 2, &s.cylinderSwing },
+            { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bBreech", 0, &s.breech }, { "bRecordAnim", 0, &s.recordAnim }, { "bAutoRecord", 0, &s.autoRecord }, { "bRecordedBolt", 0, &s.recordedBolt }, { "bRealInHand", 0, &s.realInHand }, { "bCore2", 0, &s.core2 }, { "fContactMargin", 2, &s.contactMargin }, { "iMarkButton", 1, &s.markButton }, { "fCatchSide", 2, &s.catchSide }, { "fCatchAhead", 2, &s.catchAhead }, { "fPushFactor", 2, &s.pushFactor }, { "bTraceState", 0, &s.traceState }, { "fCylinderSwing", 2, &s.cylinderSwing },
             { "fBreakAngle", 2, &s.breakAngle }, { "fFlickSpeed", 2, &s.flickSpeed }, { "fBreechRadius", 2, &s.breechRadius }, { "bRockPlacesHeld", 0, &s.rockPlacesHeld }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
             { "fChamberForward", 2, &s.chamberForward }, { "fRoundUp", 2, &s.roundUp }, { "fRoundRotX", 2, &s.roundRotX },
             { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale },
@@ -2165,14 +2167,16 @@ namespace
                     node.scale = gunScale(root) * st.magRest.scale;
                     float side = 0.0f;
                     const float top = alongRail(root, topOf(node), &side) + st.topAt * st.magRest.scale;
-                    const bool upright = dot(axisOf(node, 2), axisWorld(root)) < (g_settings.core2 ? -0.8f : -0.5f);
+                    const float tilt = dot(axisOf(node, 2), axisWorld(root));
+                    const bool upright = tilt < (g_settings.core2 ? -0.7f : -0.5f);
                     const float mouth = st.length;
                     const float sideMax = g_settings.core2 ? g_settings.catchSide : g_settings.wellSide;
                     const float below = g_settings.core2 ? 1.5f : 3.0f;
-                    if (upright && side <= sideMax && top <= mouth + g_settings.captureAhead && top >= mouth - below) {
+                    const float ahead = g_settings.core2 ? g_settings.catchAhead : g_settings.captureAhead;
+                    if (upright && side <= sideMax && top <= mouth + ahead && top >= mouth - below) {
                         st.rounds = loose.rounds;
                         st.place = kRailHand;
-                        st.s = std::clamp(top, 0.0f, mouth + g_settings.captureAhead);
+                        st.s = std::clamp(top, 0.0f, mouth + ahead);
                         st.driveS0 = st.s;
                         st.driveAlong0 = alongRail(root, node.translate);
                         st.magInWand = relative(free.wand, node);
@@ -2194,6 +2198,12 @@ namespace
                         buzz(freeIndex(), 900);
                         note("CATCH: the well has the real magazine %08X (%u rounds), %.1f out, %.1f off the line", id, st.rounds, st.s, side);
                         continue;
+                    }
+                    static Clock::time_point missTold{};
+                    if (top < mouth + ahead + 6.0f && side < sideMax + 6.0f && now - missTold > std::chrono::milliseconds(400)) {
+                        missTold = now;   // near the well and not taken: why
+                        note("NEAR WELL: magazine %08X top %.1f below the mouth (catch from %.1f), %.1f off the line (max %.1f), upright %.2f (needs < %.2f)",
+                            id, top - mouth, ahead, side, sideMax, -tilt, g_settings.core2 ? 0.7f : 0.5f);
                     }
                 }
             }
@@ -2760,6 +2770,85 @@ namespace
         return playedAt(p, p.bolt, time);
     }
 
+    // core2: the recorded way measured by how far the bolt really goes, not by time. The game's animation pulls the
+    // slide back in a third of its take and holds it there: by time, most of the hand's way would move nothing, and the
+    // rest would throw the slide. Here 0..1 is the distance along the way (turns count by a point 3 units off the
+    // axis), ending where the slide is furthest back (a bolt action keeps its whole way).
+    struct BoltArc
+    {
+        std::uint32_t weapon{ 0 };
+        std::size_t   frames{ 0 };
+        std::vector<float> s;      // time fraction of each sample
+        std::vector<float> u;      // distance fraction of each sample
+    };
+    BoltArc g_arc;
+
+    void buildArc() noexcept
+    {
+        auto& a = g_arc;
+        const auto& p = g_play;
+        if (a.weapon == p.weapon && a.frames == p.frames.size() && !a.s.empty()) {
+            return;
+        }
+        a = BoltArc{};
+        a.weapon = p.weapon;
+        a.frames = p.frames.size();
+        constexpr int kSamples = 240;
+        const RE::NiPoint3 probes[3]{ { 0.0f, 0.0f, 0.0f }, { 3.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 3.0f } };
+        std::vector<std::array<RE::NiPoint3, 3>> at(kSamples + 1);
+        for (int i = 0; i <= kSamples; ++i) {
+            const auto t = boltAt(static_cast<float>(i) / kSamples);
+            for (int k = 0; k < 3; ++k) {
+                at[i][k] = compose(t, pointTransform(probes[k])).translate;
+            }
+        }
+        // where the slide is furthest from rest (by its origin)
+        int last = kSamples;
+        if (p.boltTurn <= 0.35f) {
+            float far = 0.0f;
+            for (int i = 0; i <= kSamples; ++i) {
+                far = std::max(far, distance(at[i][0], at[0][0]));
+            }
+            for (int i = 0; i <= kSamples; ++i) {
+                if (distance(at[i][0], at[0][0]) >= far * 0.98f) {
+                    last = std::max(i, 1);
+                    break;
+                }
+            }
+        }
+        std::vector<float> length(last + 1, 0.0f);
+        for (int i = 1; i <= last; ++i) {
+            float step = 0.0f;
+            for (int k = 0; k < 3; ++k) {
+                step = std::max(step, distance(at[i][k], at[i - 1][k]));
+            }
+            length[i] = length[i - 1] + step;
+        }
+        const float total = std::max(length[last], 0.001f);
+        for (int i = 0; i <= last; ++i) {
+            a.s.push_back(static_cast<float>(i) / kSamples);
+            a.u.push_back(length[i] / total);
+        }
+        note("CORE2: the slide's way is %.1f long; it is furthest back at %.0f%% of the recorded time", total, 100.0f * last / kSamples);
+    }
+
+    RE::NiTransform boltArc(float u) noexcept
+    {
+        buildArc();
+        const auto& a = g_arc;
+        u = std::clamp(u, 0.0f, 1.0f);
+        if (a.u.size() < 2) {
+            return boltAt(u);
+        }
+        const auto it = std::lower_bound(a.u.begin(), a.u.end(), u);
+        const std::size_t j = std::clamp<std::size_t>(static_cast<std::size_t>(it - a.u.begin()), 1, a.u.size() - 1);
+        const float u0 = a.u[j - 1], u1 = a.u[j];
+        const float f = u1 > u0 ? (u - u0) / (u1 - u0) : 0.0f;
+        return boltAt(a.s[j - 1] + (a.s[j] - a.s[j - 1]) * f);
+    }
+
+    RE::NiTransform boltWay(float s) noexcept { return g_settings.core2 ? boltArc(s) : boltAt(s); }
+
     bool boltPathFor(const Gun& gun) noexcept
     {
         if (!gun.weapon) {
@@ -2802,13 +2891,13 @@ namespace
             auto wayPoint = [&](float s) {
                 s = std::clamp(s, 0.0f, 1.0f);
                 if (path) {
-                    return compose(boltAt(s), pointTransform(st.handInBolt)).translate;
+                    return compose(boltWay(s), pointTransform(st.handInBolt)).translate;
                 }
                 return st.handInBolt + RE::NiPoint3{ 0.0f, -s * travel, 0.0f };
             };
             auto shiftNow = [&]() {
                 if (path) {
-                    return boltAt(s0).translate - boltAt(0.0f).translate;
+                    return boltWay(s0).translate - boltWay(0.0f).translate;
                 }
                 return RE::NiPoint3{ 0.0f, -st.rackPull, 0.0f };
             };
@@ -2824,7 +2913,7 @@ namespace
             auto anchor = [&]() {
                 // the hand's point on the part, kept as the part moves: the way the hand goes is this point's way
                 if (path) {
-                    st.handInBolt = relative(boltAt(s0), pointTransform(handLocal)).translate;
+                    st.handInBolt = relative(boltWay(s0), pointTransform(handLocal)).translate;
                 } else {
                     st.handInBolt = handLocal + RE::NiPoint3{ 0.0f, s0 * travel, 0.0f };
                 }
@@ -2855,8 +2944,11 @@ namespace
                     const auto moved = handLocal - st.prevHandLocal;
                     float ds = dot(moved, tangent) / tt;
                     ds = std::clamp(ds, -0.4f, 0.4f);
-                    if (st.pushing && dot(moved, moved) > 36.0f) {
-                        ds = 0.0f;   // a jump of the tracking, not a push
+                    if (st.pushing) {
+                        ds *= std::clamp(g_settings.pushFactor, 0.0f, 1.0f);   // an open palm slips on it
+                        if (dot(moved, moved) > 36.0f) {
+                            ds = 0.0f;   // a jump of the tracking, not a push
+                        }
                     }
                     const float lo = st.slideLocked ? lockAt / travel : 0.0f;
                     st.rackPull = std::clamp(s0 + ds, lo, 1.0f) * travel;
@@ -2959,7 +3051,7 @@ namespace
         }
         if (path) {
             if (st.rackPull > 0.0f || st.racking) {
-                auto recorded = boltAt(st.rackPull / travel);
+                auto recorded = boltWay(st.rackPull / travel);
                 recorded.scale = bolt->world.scale / scale;
                 bolt->local = relative(bolt->parent->world, compose(root->world, recorded));
                 refreshSubtree(bolt, RE::NiPoint3{});
@@ -3851,7 +3943,7 @@ namespace
                 }
                 const auto carried = compose(free.wand, st.magInWand);
                 const float target = st.driveS0 + (alongRail(root, carried.translate) - st.driveAlong0);
-                const float limit = st.length + g_settings.captureAhead + 1.0f;
+                const float limit = st.length + (g_settings.core2 ? g_settings.catchAhead : g_settings.captureAhead) + 1.0f;
                 if (target > limit) {
                     // clear of the well: from here it goes with the hand
                     if (g_settings.holdPoseOnExit && !g_rock.onMagazine) {
@@ -4076,7 +4168,7 @@ namespace
                     if (toMag > 0.0f && looksLikeObject(bolt) && st.slideBoxKnown) {
                         const float pull = st.rackPull;
                         const auto shift = g_settings.recordedBolt && g_play.parsed && g_play.boltKnown && g_play.weapon == gun.weapon->GetFormID()
-                                               ? boltAt(pull / std::max(g_settings.rackTravel, 0.1f)).translate - boltAt(0.0f).translate
+                                               ? boltWay(pull / std::max(g_settings.rackTravel, 0.1f)).translate - boltWay(0.0f).translate
                                                : RE::NiPoint3{ 0.0f, -pull, 0.0f };
                         toSlide = inBox(st.slideLo, st.slideHi, inGun(root, free.palm) - shift, g_settings.contactMargin) ? 0.5f : 1e9f;
                     }
