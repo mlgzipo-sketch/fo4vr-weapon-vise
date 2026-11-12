@@ -1292,6 +1292,9 @@ namespace
         bool               rockWasOnBolt{ false };
         RE::NiPoint3       sideInNode{};                   // the magazine's middle line off the node's own Z line, in the node's frame
         RE::NiPoint3       sideInGun{};                    // ..the same in the gun's frame
+        RE::NiPoint3       prevDrawnAt{};                  // last frame: the magazine in the hand and its parent node,
+        RE::NiPoint3       prevParentAt{};                 // to tell ROCK where they will be when it uses the pose
+        bool               prevDriveKnown{ false };
         Clock::time_point  forceTargets{};                 // until then ROCK is told what may be taken even with the hand closed
         bool               magBoxUsed{ false };            // the magazine's size was taken from ROCK's box
         bool               boltBoxUsed{ false };
@@ -1501,6 +1504,10 @@ namespace
             const float at = std::clamp(g_settings.slideGrabAt, 0.0f, 1.0f);
             const float high = std::clamp(g_settings.slideGrabHigh, 0.0f, 1.0f);
             st.slideCenter = { (lo[0] + hi[0]) * 0.5f, lo[1] + (hi[1] - lo[1]) * at, lo[2] + (hi[2] - lo[2]) * high };
+            float handle[3]{};
+            if (rocklink::boltHandle(handle)) {
+                st.slideCenter = { handle[0], handle[1], handle[2] };   // a charging handle: the hand goes to the handle itself
+            }
             st.slideCenterKnown = true;
             st.slidePointInBolt = relative(bolt->world, pointTransform(compose(root->world, pointTransform(st.slideCenter)).translate)).translate;
             st.slidePointKnown = true;
@@ -2187,7 +2194,13 @@ namespace
             hideRound();
             // a gun this plugin does not reload yet: ROCK is only asked what parts it has (for the log)
             rocklink::Frame link{};
-            link.gun = !st.managed && gun.weapon && gun.data && looksLikeObject(weaponRoot(player));
+            auto* otherRoot = !st.managed && gun.weapon && gun.data ? weaponRoot(player) : nullptr;
+            link.gun = looksLikeObject(otherRoot);
+            if (link.gun && !st.dumped && now - st.equippedAt > std::chrono::seconds(2)) {
+                st.dumped = true;   // the nodes of guns not reloaded by hand yet: what the next mechanisms are built from
+                logNote("Weapon node tree (not handled yet):");
+                dumpTree(otherRoot);
+            }
             link.freeHand = freeIndex();
             link.magazine.node = kMovingParts[0];
             link.bolt.node = kMovingParts[1];
@@ -2609,8 +2622,25 @@ namespace
             link.magazine.point[2] = st.bottomAt + g_settings.grabUp;
             link.magazine.radius = g_settings.magGrabRadius;
             if (magOut && looksLikeObject(magazine->parent)) {
+                // ROCK uses this pose a frame later, against the gun as it stands then: with a magazine carried in the
+                // hand both are moved ahead by one frame's travel, or the hand ROCK draws on it trails and shakes
+                auto target = drawn;
+                auto parentWorld = magazine->parent->world;
+                if (st.place == kHand && st.prevDriveKnown) {
+                    const auto magStep = drawn.translate - st.prevDrawnAt;
+                    const auto parentStep = parentWorld.translate - st.prevParentAt;
+                    if (dot(magStep, magStep) < 36.0f && dot(parentStep, parentStep) < 36.0f) {
+                        target.translate += magStep;
+                        parentWorld.translate += parentStep;
+                    }
+                }
+                st.prevDrawnAt = drawn.translate;
+                st.prevParentAt = magazine->parent->world.translate;
+                st.prevDriveKnown = true;
                 link.magazine.drive = true;
-                link.magazine.parentLocal = toLinkPose(relative(magazine->parent->world, drawn));
+                link.magazine.parentLocal = toLinkPose(relative(parentWorld, target));
+            } else {
+                st.prevDriveKnown = false;
             }
             if (looksLikeObject(bolt)) {
                 link.bolt.node = kMovingParts[1];

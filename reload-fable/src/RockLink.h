@@ -52,4 +52,6 @@ namespace rocklink
     Result frame(const Frame& frame) noexcept;
     // The box of the drawn gun's magazine (0) or slide / bolt (1) as ROCK measured it, in the gun root's frame.
     bool partBox(int which, float lo[3], float hi[3]) noexcept;
+    // The middle of the bolt's handle where it sticks out of one side of the gun (the gun root's frame); false for a slide.
+    bool boltHandle(float point[3]) noexcept;
 }

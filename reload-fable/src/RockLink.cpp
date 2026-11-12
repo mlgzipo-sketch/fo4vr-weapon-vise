@@ -45,6 +45,9 @@ namespace rocklink
         bool g_dumped{ false };
         int g_dumpTries{ 0 };
         struct Box { bool known{ false }; float lo[3]{}; float hi[3]{}; };
+        std::uint32_t g_boltBody{ parts::kNoBody };
+        bool g_handleKnown{ false };
+        float g_handle[3]{};
         Box g_boxes[2];                  // 0 the magazine, 1 the slide / bolt (the biggest of its colliders)
         std::string g_lastGrip;
         std::string g_lastDrive;
@@ -155,6 +158,62 @@ namespace rocklink
                 magazines, g_magazineKey, f.bolt.node ? f.bolt.node : "-", bolts, g_boltKey);
         }
 
+        // A bolt with a handle out of one side of the gun (pipe guns, combat rifle and shotgun, SMG): the handle's
+        // middle, from the points of the bolt's collider that stick out. A pistol slide has none.
+        void findHandle() noexcept
+        {
+            g_handleKnown = false;
+            const auto& b = g_boxes[1];
+            if (!b.known) {
+                return;
+            }
+            const float size[3]{ b.hi[0] - b.lo[0], b.hi[1] - b.lo[1], b.hi[2] - b.lo[2] };
+            const float middle[3]{ (b.lo[0] + b.hi[0]) * 0.5f, (b.lo[1] + b.hi[1]) * 0.5f, (b.lo[2] + b.hi[2]) * 0.5f };
+            const float biggest = size[0] > size[1] ? (size[0] > size[2] ? size[0] : size[2]) : (size[1] > size[2] ? size[1] : size[2]);
+            const float lean = -b.lo[0] - b.hi[0];   // above 0: it reaches further to the gun's left (-x)
+            if (biggest < 4.5f) {
+                std::memcpy(g_handle, middle, sizeof(g_handle));
+                g_handleKnown = true;
+                say("ROCK: the bolt is a small handle: taken at its middle (%.1f %.1f %.1f)", g_handle[0], g_handle[1], g_handle[2]);
+                return;
+            }
+            if (std::fabs(lean) < 1.0f) {
+                return;
+            }
+            const float edge = lean > 0.0f ? b.lo[0] : b.hi[0];
+            g_handle[0] = edge + (lean > 0.0f ? 0.7f : -0.7f);
+            g_handle[1] = middle[1];
+            g_handle[2] = middle[2];
+            const char* how = "the box";
+            std::vector<api::Point3> points(parts::kMaxEvidencePoints);
+            std::uint32_t count = 0;
+            if (g_boltBody != parts::kNoBody &&
+                g_parts->copyEvidencePoints(g_client.owner(), kSlot, g_boltBody, points.data(), parts::kMaxEvidencePoints, &count) == api::Status::Ok) {
+                float sum[3]{};
+                int used = 0;
+                bool inside = count > 0;
+                for (std::uint32_t i = 0; i < count && i < parts::kMaxEvidencePoints; ++i) {
+                    const float p[3]{ points[i].x, points[i].y, points[i].z };
+                    for (int k = 0; k < 3; ++k) {
+                        inside = inside && p[k] > b.lo[k] - 0.6f && p[k] < b.hi[k] + 0.6f;
+                    }
+                    if (std::fabs(p[0] - edge) < 1.3f) {
+                        for (int k = 0; k < 3; ++k) sum[k] += p[k];
+                        ++used;
+                    }
+                }
+                if (inside && used >= 2) {
+                    for (int k = 0; k < 3; ++k) g_handle[k] = sum[k] / static_cast<float>(used);
+                    how = "the collider's points";
+                } else {
+                    say("ROCK: the bolt collider's %u points were not usable (inside the box %d, at the edge %d)", count, inside ? 1 : 0, used);
+                }
+            }
+            g_handleKnown = true;
+            say("ROCK: the bolt's handle sticks out to the %s: taken at (%.1f %.1f %.1f), from %s", lean > 0.0f ? "left" : "right", g_handle[0], g_handle[1],
+                g_handle[2], how);
+        }
+
         // What ROCK knows of the weapon's parts: the base for holding other guns right.
         bool dumpEvidence() noexcept
         {
@@ -174,6 +233,7 @@ namespace rocklink
                     const float volume = (b.max.x - b.min.x) * (b.max.y - b.min.y) * (b.max.z - b.min.z);
                     if (volume > best[which]) {
                         best[which] = volume;
+                        if (which == 1) g_boltBody = d.bodyId;
                         g_boxes[which] = { true, { b.min.x, b.min.y, b.min.z }, { b.max.x, b.max.y, b.max.z } };
                     }
                 }
@@ -184,6 +244,7 @@ namespace rocklink
                     d.localBoundsGame.min.z, d.localBoundsGame.max.x, d.localBoundsGame.max.y, d.localBoundsGame.max.z,
                     d.localBoundsGame.valid ? "" : " (no box)");
             }
+            findHandle();
             return true;
         }
 
@@ -204,6 +265,8 @@ namespace rocklink
             g_dumped = false;
             g_dumpTries = 0;
             g_boxes[0] = g_boxes[1] = {};
+            g_handleKnown = false;
+            g_boltBody = parts::kNoBody;
         }
 
         void setTargets(const Frame& f) noexcept
@@ -392,6 +455,8 @@ namespace rocklink
             g_dumped = false;
             g_dumpTries = 0;
             g_boxes[0] = g_boxes[1] = {};
+            g_handleKnown = false;
+            g_boltBody = parts::kNoBody;
             for (auto& status : g_lastStatus) {
                 status = 999;
             }
@@ -445,6 +510,15 @@ namespace rocklink
         }
         std::memcpy(lo, g_boxes[which].lo, sizeof(g_boxes[which].lo));
         std::memcpy(hi, g_boxes[which].hi, sizeof(g_boxes[which].hi));
+        return true;
+    }
+
+    bool boltHandle(float point[3]) noexcept
+    {
+        if (!g_handleKnown) {
+            return false;
+        }
+        std::memcpy(point, g_handle, sizeof(g_handle));
         return true;
     }
 }
