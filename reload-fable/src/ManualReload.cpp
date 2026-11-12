@@ -3465,7 +3465,8 @@ namespace
                 note("IDLE: the gun is reloaded by hand but its model is not found (first person 3D %s, third person %s); nodes named Weapon*:",
                     looksLikeObject(fp) ? "present" : "MISSING", looksLikeObject(player->Get3D()) ? "present" : "MISSING");
                 int shown = 0;
-                for (auto* top : { fp, player->Get3D() }) {
+                RE::NiAVObject* tops[2]{ fp, player->Get3D() };
+                for (auto* top : tops) {
                     forEachNode(top, [&](RE::NiAVObject* object, int depth) {
                         const auto name = nodeName(object);
                         if (shown < 40 && name.rfind("Weapon", 0) == 0) {
