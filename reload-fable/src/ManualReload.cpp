@@ -1310,8 +1310,17 @@ namespace
                 }
                 GunCal cal{};
                 float v[12]{};
-                const int n = std::sscanf(line.c_str() + bar + 1, "%f %f %f %f %f %f %f %f %f %f %f %f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6],
-                    &v[7], &v[8], &v[9], &v[10], &v[11]);
+                int n = 0;
+                const char* at = line.c_str() + bar + 1;
+                while (n < 12) {
+                    char* end = nullptr;
+                    const float value = std::strtof(at, &end);
+                    if (end == at) {
+                        break;
+                    }
+                    v[n++] = value;
+                    at = end;
+                }
                 if (n < 6) {
                     continue;
                 }
