@@ -122,6 +122,11 @@ namespace
         bool  rockParts{ true };        // ROCK 1.0 holds the free hand on the magazine and the slide (its hand and fingers)
         bool  rockBeltHandover{ true }; // a magazine from the belt: the grip is shown to ROCK so that it closes the hand on it
         bool  rockPlacesHeld{ true };   // a magazine ROCK holds in the hand is drawn where ROCK has it (one attachment, not two)
+        bool  breech{ true };           // revolvers and the break-action shotgun are opened and loaded by hand
+        float cylinderSwing{ -80.0f };  // how far a revolver's cylinder swings out (degrees; minus = to the gun's left)
+        float breakAngle{ -35.0f };     // how far a break-action gun opens (degrees; minus = barrels down)
+        float flickSpeed{ 150.0f };     // the gun jerked this fast (game units a second) closes it
+        float breechRadius{ 6.0f };     // rounds this close to the open breech go in
         bool  holdPoseOnExit{ false };  // a magazine pulled out of the well turns to the pose of one from the belt
         bool  nativeSound{ true };      // sounds played by the plugin (the script's Sound objects are not heard)
         int   soundFlags{ 16 };
@@ -159,7 +164,8 @@ namespace
             { "fSlideGrabRadius", 2, &s.slideGrabRadius }, { "fSlideGrabAt", 2, &s.slideGrabAt }, { "fSlideGrabHigh", 2, &s.slideGrabHigh }, { "fRackTravel", 2, &s.rackTravel }, { "fSlideLockAt", 2, &s.slideLockAt },
             { "fHandRadius", 2, &s.handRadius }, { "fLooseLifetime", 2, &s.looseLifetime }, { "iMaxLoose", 1, &s.maxLoose },
             { "bAllGuns", 0, &s.allGuns }, { "bRockParts", 0, &s.rockParts }, { "bRockBeltHandover", 0, &s.rockBeltHandover },
-            { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bRockPlacesHeld", 0, &s.rockPlacesHeld }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
+            { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bBreech", 0, &s.breech }, { "fCylinderSwing", 2, &s.cylinderSwing },
+            { "fBreakAngle", 2, &s.breakAngle }, { "fFlickSpeed", 2, &s.flickSpeed }, { "fBreechRadius", 2, &s.breechRadius }, { "bRockPlacesHeld", 0, &s.rockPlacesHeld }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
             { "fChamberForward", 2, &s.chamberForward }, { "fRoundUp", 2, &s.roundUp }, { "fRoundRotX", 2, &s.roundRotX },
             { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale },
         };
@@ -801,6 +807,22 @@ namespace
         return pose;
     }
 
+    // The nodes above must reach as far as a part carried away from the gun, or it is culled with them.
+    void reachAncestors(RE::NiAVObject* node, const RE::NiPoint3& point) noexcept
+    {
+        const float reach = node->worldBound.fRadius > 0.0f && node->worldBound.fRadius < 1000.0f ? node->worldBound.fRadius : 10.0f;
+        RE::NiAVObject* up = node->parent;
+        for (int i = 0; i < 8 && looksLikeObject(up); ++i) {
+            auto& bound = up->worldBound;
+            const float needed = distance(bound.center, point) + reach;
+            if (bound.fRadius > 0.0f && bound.fRadius < needed && needed < 400.0f) {
+                bound.fRadius = needed;
+            }
+            auto* next = up->parent;
+            up = looksLikeObject(next) ? next : nullptr;
+        }
+    }
+
     void placeNode(RE::NiAVObject* node, const RE::NiTransform& world) noexcept
     {
         if (!looksLikeObject(node)) {
@@ -827,18 +849,21 @@ namespace
             }
             return true;
         });
-        // the nodes above must reach as far as the magazine, or it is culled with them when the gun is out of view
-        const float reach = node->worldBound.fRadius > 0.0f && node->worldBound.fRadius < 1000.0f ? node->worldBound.fRadius : 10.0f;
-        RE::NiAVObject* up = node->parent;
-        for (int i = 0; i < 8 && looksLikeObject(up); ++i) {
-            auto& bound = up->worldBound;
-            const float needed = distance(bound.center, world.translate) + reach;
-            if (bound.fRadius > 0.0f && bound.fRadius < needed && needed < 400.0f) {
-                bound.fRadius = needed;
+        reachAncestors(node, world.translate);
+    }
+
+    // A node somebody else has placed away from the gun (ROCK holds the magazine): its bounds are brought along,
+    // or it is culled as soon as it leaves the gun's own bound.
+    void carryBounds(RE::NiAVObject* node, const RE::NiPoint3& middle) noexcept
+    {
+        forEachNode(node, [&](RE::NiAVObject* object, int) {
+            auto& bound = object->worldBound;
+            if (bound.fRadius > 0.0f && bound.fRadius < 1000.0f) {
+                bound.center = middle;
             }
-            auto* next = up->parent;
-            up = looksLikeObject(next) ? next : nullptr;
-        }
+            return true;
+        });
+        reachAncestors(node, middle);
     }
 
     // Recomputes the world transforms below `node` from its parent, then moves the subtree by `shift`.
@@ -1212,8 +1237,31 @@ namespace
         RE::NiMatrix3 rotation{};
     };
 
+    // Guns that open instead of taking a magazine: a revolver's cylinder swings out, a break-action gun folds.
+    struct Breech
+    {
+        int               mech{ 0 };        // 0 none, 1 revolver, 2 break action
+        bool              checked{ false };
+        bool              known{ false };   // the closed pose is remembered
+        RE::NiTransform   rest{};
+        std::vector<std::pair<RE::NiAVObject*, RE::NiTransform>> kids;   // the nodes below, as they stand closed
+        bool              open{ false };
+        float             t{ 0.0f };        // 0 closed .. 1 open
+        std::uint32_t     live{ 0 };        // rounds in it
+        std::uint32_t     spent{ 0 };       // fired cases in it
+        std::uint32_t     held{ 0 };        // rounds in the free hand
+        std::uint32_t     lastAmmo{ 0xFFFFFFFF };
+        Clock::time_point toggled{};
+        Clock::time_point opened{};
+        Clock::time_point freezeUntil{};
+        RE::NiPoint3      prevAt{};
+        bool              prevKnown{ false };
+        RE::NiPoint3      velocity{};
+    };
+
     struct State
     {
+        Breech             breech{};
         RE::TESObjectWEAP* weapon{ nullptr };
         bool               managed{ false };
         std::uint32_t      lastAmmo{ 0xFFFFFFFF };
@@ -2146,6 +2194,270 @@ namespace
         return ui && ui->menuMode != 0;
     }
 
+    // ------------------------------------------------------------ revolvers and break actions
+
+    // Turns the rows (the node's own axes as its parent sees them) about one of the parent's axes.
+    void turnRows(RE::NiMatrix3& rotation, int axis, float angle) noexcept
+    {
+        const float c = std::cos(angle);
+        const float sn = std::sin(angle);
+        auto m = toMat(rotation);
+        for (auto& row : m) {
+            const float x = row[0], y = row[1], z = row[2];
+            if (axis == 1) {
+                row[0] = x * c + z * sn;
+                row[2] = -x * sn + z * c;
+            } else {
+                row[1] = y * c - z * sn;
+                row[2] = y * sn + z * c;
+            }
+        }
+        rotation = fromMat(m);
+    }
+
+    // The reload button opens and closes the gun. Open, with the muzzle up, everything falls out of it. Rounds
+    // come from the belt in the free hand (a full clip for a revolver, one shell at a time for a break action)
+    // and go in at the breech. The free hand on the gun, or a jerk of the gun, closes it.
+    void updateBreech(RE::PlayerCharacter* player, const Gun& gun, RE::NiAVObject* root, Clock::time_point now, float dt) noexcept
+    {
+        auto& st = g_state;
+        auto& b = st.breech;
+        const auto& spare = g_hands[freeIndex()];
+        const auto& firing = g_hands[g_settings.gunHand];
+        hideRound();
+        looseMagazines(nullptr, nullptr);
+        rocklink::Frame link{};
+        link.gun = true;
+        link.freeHand = freeIndex();
+        link.magazine.node = kMovingParts[0];
+        link.bolt.node = kMovingParts[1];
+        g_rock = rocklink::frame(link);
+
+        auto* mag = findNamed(root, kMovingParts[0]);
+        if (!looksLikeObject(mag) || !looksLikeObject(mag->parent)) {
+            return;
+        }
+        const bool revolver = b.mech == 1;
+        std::array<RE::NiAVObject*, 5> child{};
+        for (int i = 0; i < 5; ++i) {
+            char name[32]{};
+            std::snprintf(name, sizeof(name), "WeaponMagazineChild%d", i + 1);
+            child[i] = findNamed(mag, name);
+        }
+        const auto gunState = static_cast<std::uint32_t>(player->gunState);
+        const auto reloading = static_cast<std::uint32_t>(g_settings.reloadGunState);
+        if (gunState == reloading && st.lastGunState != reloading) {
+            b.freezeUntil = now + std::chrono::milliseconds(static_cast<int>(g_settings.freezeSeconds * 1000.0f));
+        }
+        st.lastGunState = gunState;
+        const auto capacity = std::max(capacityOf(gun), 1u);
+        const float scale = gunScale(root);
+
+        if (!st.dumped && now - st.equippedAt > std::chrono::seconds(2)) {
+            st.dumped = true;
+            logNote("Weapon node tree:");
+            dumpTree(root);
+        }
+
+        // the closed pose
+        if (!b.known) {
+            const bool idle = gunState == static_cast<std::uint32_t>(g_settings.idleGunState) && now - st.equippedAt > std::chrono::milliseconds(1500);
+            if (!idle) {
+                return;
+            }
+            b.rest = mag->local;
+            b.kids.clear();
+            forEachNode(mag, [&](RE::NiAVObject* object, int depth) {
+                if (depth > 0 && object->IsNode() && b.kids.size() < 40) {
+                    b.kids.emplace_back(object, object->local);
+                }
+                return true;
+            });
+            b.known = true;
+            b.live = gun.data->ammoCount;
+            b.lastAmmo = b.live;
+            note("Breech: closed pose remembered (%zu nodes below), %u of %u rounds in it", b.kids.size(), b.live, capacity);
+        }
+
+        // the rounds
+        auto ammo = gun.data->ammoCount;
+        if (b.open) {
+            if (ammo != 0) {
+                gun.data->ammoCount = 0;   // an open gun does not fire, and the game's own refill is undone
+            }
+            b.lastAmmo = 0;
+        } else {
+            if (ammo > b.lastAmmo && g_settings.blockReload) {
+                note("Game refill %u -> %u reverted", b.lastAmmo, ammo);
+                ammo = b.lastAmmo;
+                gun.data->ammoCount = ammo;
+            } else if (ammo < b.lastAmmo) {
+                b.spent = std::min(b.spent + (b.lastAmmo - ammo), capacity - std::min(ammo, capacity));
+                detail("Shot: %u rounds and %u fired cases in the gun", ammo, b.spent);
+            }
+            b.live = ammo;
+            b.lastAmmo = ammo;
+        }
+        st.lastAmmo = gun.data->ammoCount;
+
+        const auto close = [&](const char* how) {
+            b.open = false;
+            b.held = 0;
+            b.toggled = now;
+            gun.data->ammoCount = b.live;
+            b.lastAmmo = b.live;
+            st.lastAmmo = b.live;
+            playSound(3);
+            buzz(g_settings.gunHand, 2000);
+            note("CLOSE (%s): %u rounds, %u fired cases", how, b.live, b.spent);
+        };
+
+        // the reload button: a tap opens or closes
+        const bool buttonNow = (firing.buttons & buttonMask(g_settings.reloadButton)) != 0;
+        const bool buttonBefore = (firing.previousButtons & buttonMask(g_settings.reloadButton)) != 0;
+        if (buttonNow && !buttonBefore) {
+            st.buttonSince = now;
+        }
+        if (!buttonNow && buttonBefore && now - st.buttonSince < std::chrono::milliseconds(600) && now - b.toggled > std::chrono::milliseconds(400) &&
+            !menuOpen()) {
+            if (b.open) {
+                close("the button");
+            } else {
+                b.open = true;
+                b.opened = now;
+                b.toggled = now;
+                gun.data->ammoCount = 0;
+                b.lastAmmo = 0;
+                playSound(1);
+                buzz(g_settings.gunHand, 1200);
+                note("OPEN: %u rounds, %u fired cases", b.live, b.spent);
+            }
+        }
+        b.t = approach(b.t, b.open ? 1.0f : 0.0f, 7.0f * dt);
+
+        // the pose: ours while it is open or moving, and held still while the game plays its own reload
+        if (b.t > 0.0f || gunState == reloading || now < b.freezeUntil) {
+            mag->local = b.rest;
+            if (b.t > 0.0f) {
+                const float eased = b.t * b.t * (3.0f - 2.0f * b.t);
+                turnRows(mag->local.rotate, revolver ? 1 : 0, (revolver ? g_settings.cylinderSwing : g_settings.breakAngle) * 0.01745329f * eased);
+            }
+            for (auto& [object, local] : b.kids) {
+                if (looksLikeObject(object)) {
+                    object->local = local;
+                }
+            }
+            refreshSubtree(mag, RE::NiPoint3{});
+        }
+
+        // the gun's speed against the player (a jerk closes it)
+        const auto at = root->world.translate - player->GetPosition();
+        if (b.prevKnown) {
+            b.velocity = b.velocity * 0.5f + (at - b.prevAt) * (0.5f / dt);
+        }
+        b.prevAt = at;
+        b.prevKnown = true;
+
+        const auto barrel = axisOf(mag->world, 1);   // the cylinder's / the barrels' own line, forward
+        const auto breechNode = looksLikeObject(child[0]) ? child[0] : mag;
+        const auto breechAt = breechNode->world.translate - (revolver ? barrel * (2.0f * scale) : RE::NiPoint3{});
+        const bool fullyOpen = b.open && b.t >= 0.95f;
+
+        // muzzle up: everything falls out
+        if (fullyOpen && b.live + b.spent > 0 && barrel.z > (revolver ? 0.5f : 0.3f) && now - b.opened > std::chrono::milliseconds(350)) {
+            note("EMPTIED: %u rounds back to the pouch, %u fired cases gone", b.live, b.spent);
+            if (b.live > 0) {
+                hud("Патроны высыпались и вернулись в запас");
+            }
+            b.live = 0;
+            b.spent = 0;
+            playSound(4);
+            buzz(g_settings.gunHand, 1500);
+        }
+
+        // the free hand
+        const bool press = spare.valid && spare.grip && !spare.previousGrip;
+        const bool atBelt = spare.valid && inBelt(player, spare.palm);
+        const float toGun = spare.valid ? distance(spare.palm, breechAt) : 1e9f;
+        if (press && griphook::owned() && b.open) {
+            if (atBelt && b.held == 0) {
+                const auto inventory = gun.data->ammo ? inventoryCount(player, gun.data->ammo) : 0u;
+                const auto have = inventory > b.live ? inventory - b.live : 0u;
+                const auto room = capacity - std::min(capacity, b.live + b.spent);
+                const auto take = std::min(have, revolver ? room : std::min(room, 1u));
+                if (b.spent > 0 && room == 0) {
+                    hud("Сначала вытряхни гильзы: подними ствол вверх");
+                } else if (take == 0) {
+                    hud(have == 0 ? "Патронов нет" : "Заряжено полностью");
+                } else {
+                    b.held = take;
+                    playSound(4);
+                    buzz(freeIndex(), 1200);
+                    note("BELT: %u round(s) in the free hand", take);
+                }
+            } else if (!atBelt && b.held == 0 && fullyOpen && toGun < 12.0f * scale) {
+                close("the free hand");
+            }
+        }
+        if (b.held > 0 && !(spare.valid && spare.grip)) {
+            note("The rounds in the hand are put away");
+            b.held = 0;
+        }
+        if (b.held > 0 && fullyOpen && toGun < g_settings.breechRadius * scale) {
+            b.live += b.held;
+            note("LOAD: %u round(s) in, %u of %u in the gun", b.held, b.live, capacity);
+            b.held = 0;
+            playSound(0);
+            buzz(0, 2000);
+            buzz(1, 2000);
+            griphook::setOwned(false);
+        }
+        if (fullyOpen && b.held == 0 && now - b.opened > std::chrono::milliseconds(700)) {
+            const float jerk = revolver ? std::fabs(dot(b.velocity, axisOf(root->world, 0))) : b.velocity.z;
+            if (jerk > g_settings.flickSpeed * scale && !(barrel.z > 0.3f && b.live + b.spent > 0)) {
+                close("a jerk of the gun");
+            }
+        }
+
+        // what is seen in it, and the rounds carried in the hand
+        const auto show = [&](int index, bool on) {
+            if (looksLikeObject(child[index])) {
+                setCulled(child[index], !on);
+            }
+        };
+        const std::uint32_t filled = b.live + b.spent;
+        if (revolver) {
+            show(4, b.live > 0 || b.held > 0);   // the bullets
+            show(3, filled > 0);                 // the cases
+            show(2, b.held > 0);                 // the clip they come on
+        } else {
+            show(0, filled >= 1 || (b.held > 0 && filled == 0));
+            show(1, filled >= 2 || (b.held > 0 && filled == 1));
+        }
+        if (b.held > 0 && spare.valid) {
+            const auto y = normalized(axisOf(spare.wrist, 0));   // along the fingers
+            auto z = axisOf(spare.wrist, 2);
+            z = normalized(z - y * dot(z, y));
+            RE::NiTransform pose = identityTransform();
+            setRows(pose, cross(y, z), y, z);
+            pose.scale = scale;
+            pose.translate = spare.palm + y * ((revolver ? 2.0f : 0.0f) * scale);
+            if (revolver) {
+                placeNode(child[2], pose);
+                placeNode(child[4], pose);
+            } else {
+                placeNode(child[filled == 0 ? 0 : 1], pose);
+            }
+        }
+
+        // an open gun: the free hand's grip near it or at the belt is this plugin's (no second-hand hold, no ROCK grab)
+        if (!spare.grip) {
+            const bool mine = b.open && spare.valid && (atBelt || distance(spare.palm, root->world.translate) < g_settings.gunRadius);
+            st.armReason = mine ? (atBelt ? kArmBelt : kArmBlock) : kArmNone;
+            griphook::setArmed(mine);
+        }
+    }
+
     void update() noexcept
     {
         auto* player = RE::PlayerCharacter::GetSingleton();
@@ -2183,7 +2495,31 @@ namespace
                 capacityOf(gun), total, magModel.c_str(), kind, st.managed ? "reloaded by hand" : "not handled (no magazine of group 1)");
         }
 
+        if (!st.managed && !st.breech.checked && g_settings.breech && gun.weapon && gun.data) {
+            if (auto* drawnRoot = weaponRoot(player); looksLikeObject(drawnRoot)) {
+                st.breech.checked = true;
+                bool cylinder = false;
+                bool shells = false;
+                forEachNode(drawnRoot, [&](RE::NiAVObject* object, int) {
+                    const auto name = nodeName(object);
+                    cylinder = cylinder || name.find("Cylinder") != std::string::npos;
+                    shells = shells || name.find("ShotgunShell") != std::string::npos || name.find("BarrelCatch") != std::string::npos;
+                    return true;
+                });
+                st.breech.mech = cylinder ? 1 : (shells ? 2 : 0);
+                if (st.breech.mech != 0 && looksLikeObject(findNamed(drawnRoot, kMovingParts[0]))) {
+                    st.managed = true;
+                    note("This gun opens: %s, reloaded by hand", st.breech.mech == 1 ? "a revolver (the cylinder swings out)" : "a break action");
+                } else {
+                    st.breech.mech = 0;
+                }
+            }
+        }
         auto* root = st.managed ? weaponRoot(player) : nullptr;
+        if (st.managed && st.breech.mech != 0 && looksLikeObject(root)) {
+            updateBreech(player, gun, root, now, dt);
+            return;
+        }
         if (!st.managed || !looksLikeObject(root)) {
             if (st.managed) {
                 putAway("the gun is not drawn");
@@ -2550,6 +2886,10 @@ namespace
                 }
                 if (!leave) {
                     placeNode(magazine, drawn);
+                } else {
+                    const auto& w = magazine->world;
+                    carryBounds(magazine, w.translate + (axisOf(w, 0) * st.sideInNode.x + axisOf(w, 1) * st.sideInNode.y +
+                                                         axisOf(w, 2) * ((st.topAt + st.bottomAt) * 0.5f)) * w.scale);
                 }
             } else {
                 setCulled(magazine, true);
