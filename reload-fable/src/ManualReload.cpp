@@ -122,6 +122,7 @@ namespace
         bool  rockParts{ true };        // ROCK 1.0 holds the free hand on the magazine and the slide (its hand and fingers)
         bool  rockBeltHandover{ true }; // a magazine from the belt: the grip is shown to ROCK so that it closes the hand on it
         bool  rockPlacesHeld{ true };   // a magazine ROCK holds in the hand is drawn where ROCK has it (one attachment, not two)
+        bool  realInHand{ true };       // a magazine out of the well is a real object ROCK holds (not a part of the gun drawn at the hand)
         bool  recordedBolt{ true };     // the bolt / slide moves along the recorded way (a bolt action lifts, then goes back)
         bool  autoRecord{ true };       // a gun whose reload is not recorded yet is left to the game for one reload, which is recorded
         bool  recordAnim{ false };      // the plugin keeps its hands off and writes down how the game's own reload moves every part
@@ -167,7 +168,7 @@ namespace
             { "fSlideGrabRadius", 2, &s.slideGrabRadius }, { "fSlideGrabAt", 2, &s.slideGrabAt }, { "fSlideGrabHigh", 2, &s.slideGrabHigh }, { "fRackTravel", 2, &s.rackTravel }, { "fSlideLockAt", 2, &s.slideLockAt },
             { "fHandRadius", 2, &s.handRadius }, { "fLooseLifetime", 2, &s.looseLifetime }, { "iMaxLoose", 1, &s.maxLoose },
             { "bAllGuns", 0, &s.allGuns }, { "bRockParts", 0, &s.rockParts }, { "bRockBeltHandover", 0, &s.rockBeltHandover },
-            { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bBreech", 0, &s.breech }, { "bRecordAnim", 0, &s.recordAnim }, { "bAutoRecord", 0, &s.autoRecord }, { "bRecordedBolt", 0, &s.recordedBolt }, { "fCylinderSwing", 2, &s.cylinderSwing },
+            { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bBreech", 0, &s.breech }, { "bRecordAnim", 0, &s.recordAnim }, { "bAutoRecord", 0, &s.autoRecord }, { "bRecordedBolt", 0, &s.recordedBolt }, { "bRealInHand", 0, &s.realInHand }, { "fCylinderSwing", 2, &s.cylinderSwing },
             { "fBreakAngle", 2, &s.breakAngle }, { "fFlickSpeed", 2, &s.flickSpeed }, { "fBreechRadius", 2, &s.breechRadius }, { "bRockPlacesHeld", 0, &s.rockPlacesHeld }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
             { "fChamberForward", 2, &s.chamberForward }, { "fRoundUp", 2, &s.roundUp }, { "fRoundRotX", 2, &s.roundRotX },
             { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale },
@@ -1349,7 +1350,10 @@ namespace
         Clock::time_point  handoverAt{};                   // a magazine from the belt: when the grip is shown to ROCK
         bool               handoverDue{ false };
         bool               rockWasOnBolt{ false };
-        bool               boltAction{ false };            // the recording turns the bolt up first: worked by hand after every shot
+        bool               boltAction{ false };
+        std::int32_t       handToken{ 0 };                 // a real magazine on its way into the free hand
+        bool               handTokenDropped{ false };      // ..let go before it came: it just falls
+        bool               handStash{ false };             // ..let go at the belt / over the shoulder: it goes back            // the recording turns the bolt up first: worked by hand after every shot
         RE::NiPoint3       handInBolt{};                   // the hand against the bolt when taken (recorded path)
         RE::NiPoint3       sideInNode{};                   // the magazine's middle line off the node's own Z line, in the node's frame
         RE::NiPoint3       sideInGun{};                    // ..the same in the gun's frame
@@ -1823,6 +1827,25 @@ namespace
             }
             g_loose[mag.ref] = loose;
             note("Magazine %08X is out: %u rounds", mag.ref, loose.rounds);
+            auto& st = g_state;
+            if (st.handToken != 0 && mag.token == st.handToken) {
+                st.handToken = 0;
+                if (st.handTokenDropped) {
+                    if (st.handStash) {
+                        deleteMagazine(mag.ref);
+                        hud("Магазин убран, патроны вернулись в запас");
+                    }
+                } else if (st.place == kHand) {
+                    // the real one is in the palm: the gun's own magazine is hidden, ROCK closes the hand on the real one
+                    st.place = kGone;
+                    st.rounds = 0;
+                    st.velocityValid = false;
+                    griphook::setOwned(false);
+                    note("HAND: magazine %08X is now held as a real object (ROCK)", mag.ref);
+                } else {
+                    deleteMagazine(mag.ref);   // it was already pushed into the well
+                }
+            }
         }
     }
 
@@ -2053,8 +2076,40 @@ namespace
             const float age = std::chrono::duration<float>(now - loose.born).count();
             if (gun && looksLikeObject(root) && st.railKnown && st.place == kGone && !adopt && loose.kind == st.kind && age > 0.3f &&
                 free.valid && free.grip && distance(mag3D->world.translate, free.palm) < g_settings.handRadius) {
-                adopt = id;
-                adoptPose = mag3D->world;
+                if (!g_settings.realInHand) {
+                    adopt = id;
+                    adoptPose = mag3D->world;
+                } else {
+                    // a real magazine in the hand: the mouth of the well takes its top, then it moves only along the well
+                    auto node = compose(mag3D->world, inverse(st.looseInNode));
+                    node.scale = gunScale(root) * st.magRest.scale;
+                    float side = 0.0f;
+                    const float top = alongRail(root, topOf(node), &side) + st.topAt * st.magRest.scale;
+                    const bool upright = dot(axisOf(node, 2), axisWorld(root)) < -0.5f;
+                    const float mouth = st.length;
+                    if (upright && side <= g_settings.wellSide && top <= mouth + g_settings.captureAhead && top >= mouth - 3.0f) {
+                        st.rounds = loose.rounds;
+                        st.place = kRailHand;
+                        st.s = std::clamp(top, 0.0f, mouth + g_settings.captureAhead);
+                        st.driveS0 = st.s;
+                        st.driveAlong0 = alongRail(root, node.translate);
+                        st.magInWand = relative(free.wand, node);
+                        st.wristInMag = relative(node, free.wrist);
+                        st.mustLeave = false;
+                        st.velocityValid = false;
+                        st.dropActive = false;
+                        startBlend(node, 0.12f);
+                        gone.push_back(id);
+                        PendingCommand command;
+                        command.type = kDelete;
+                        command.ref = id;
+                        pushCommand(command);
+                        griphook::setOwned(true);
+                        buzz(freeIndex(), 900);
+                        note("CATCH: the well has the real magazine %08X (%u rounds), %.1f out, %.1f off the line", id, st.rounds, st.s, side);
+                        continue;
+                    }
+                }
             }
             const bool nearPlayer = handDistance < 60.0f;
             if (age > g_settings.looseLifetime && !nearPlayer) {
@@ -2648,11 +2703,11 @@ namespace
         // the controller, not the drawn hand: ROCK moves the drawn hand onto whatever it holds
         const auto handLocal = relative(root->world, pointTransform(spare.wand.translate)).translate;
         const bool handBusy = st.place == kRailHand || st.place == kHand || (griphook::owned() && st.armReason != kArmSlide);
-        const bool rockTook = g_rock.onBolt && !st.rockWasOnBolt && spare.valid && spare.grip && !handBusy &&
+        const bool rockTook = g_rock.onBolt && !st.rockWasOnBolt && spare.valid && spare.grip && !handBusy && st.place != kRailAuto &&
                               Clock::now() - st.seatedAt > std::chrono::milliseconds(700);
         st.rockWasOnBolt = g_rock.onBolt;
         if (!st.racking && spare.valid && spare.grip && ((!spare.previousGrip && !handBusy) || rockTook)) {
-            const float toSlide = distance(spare.palm, slideGrabPoint(root, bolt));
+            const float toSlide = st.place != kRailAuto ? distance(spare.palm, slideGrabPoint(root, bolt)) : 1e9f;
             const float toMag = st.place == kRailAuto && st.railKnown ? distance(spare.palm, grabPoint(root)) : 1e9f;
             if (rockTook || (toSlide < g_settings.slideGrabRadius && toSlide <= toMag)) {
                 st.racking = true;
@@ -3371,7 +3426,12 @@ namespace
                     st.lastBelt = now;
                     st.handoverAt = now + std::chrono::milliseconds(60);
                     st.forceTargets = now + std::chrono::milliseconds(50);   // ROCK learns of the magazine before it sees the grip
-                    st.handoverDue = g_settings.rockBeltHandover;
+                    st.handoverDue = g_settings.rockBeltHandover && !g_settings.realInHand;
+                    if (g_settings.realInHand) {
+                        st.handToken = spawnLoose(pose, rounds, "from the belt into the hand");
+                        st.handTokenDropped = false;
+                        griphook::setOwned(true);
+                    }
                     playSound(4);
                     buzz(freeIndex(), 1200);
                     note("BELT: a magazine with %u rounds in the free hand (%u in the pouch)", rounds, inventory);
@@ -3434,6 +3494,13 @@ namespace
                     unpinHand();
                     playSound(1);
                     note("OUT: the magazine left the well in the free hand (%u rounds)", st.rounds);
+                    if (g_settings.realInHand) {
+                        // drawn at the hand only until the real one is there; then ROCK holds the real one
+                        st.handToken = spawnLoose(compose(free.wand, st.magInWand), st.rounds, "out of the well into the hand");
+                        st.handTokenDropped = false;
+                        st.handoverDue = false;
+                        griphook::setOwned(true);
+                    }
                     break;
                 }
                 const float before = st.s;
@@ -3449,6 +3516,18 @@ namespace
         case kHand:
             {
                 const auto target = compose(free.wand, st.magInWand);
+                if (st.handToken) {
+                    setFresh(st.handToken, target);
+                }
+                if (st.handToken && (!free.valid || !free.grip)) {
+                    // let go before the real one came: it appears where the hand is and falls (or goes back to the pouch)
+                    st.handTokenDropped = true;
+                    st.handStash = inBelt(player, free.palm) || overShoulder(player, free.palm);
+                    st.place = kGone;
+                    st.rounds = 0;
+                    note("The magazine is let go before the real one came (%s)", st.handStash ? "put away" : "it falls");
+                    break;
+                }
                 if (!free.valid || !free.grip) {
                     const auto pose = st.lastDrawnValid ? st.lastDrawn : target;
                     if (inBelt(player, free.palm)) {
@@ -3610,7 +3689,8 @@ namespace
         if (!free.grip) {
             int reason = kArmNone;
             if (free.valid) {
-                const float toSlide = looksLikeObject(bolt) ? distance(free.palm, slideGrabPoint(root, bolt)) : 1e9f;
+                // a magazine sticking out comes first: the slide is not taken until it is dealt with
+                const float toSlide = looksLikeObject(bolt) && st.place != kRailAuto ? distance(free.palm, slideGrabPoint(root, bolt)) : 1e9f;
                 const float toMag = st.place == kRailAuto && st.railKnown ? distance(free.palm, grabPoint(root)) : 1e9f;
                 if (toMag < g_settings.magGrabRadius && toMag <= toSlide) {
                     reason = kArmRail;
@@ -3667,7 +3747,7 @@ namespace
             }
             if (looksLikeObject(bolt)) {
                 link.bolt.node = kMovingParts[1];
-                link.bolt.grab = st.slidePointKnown && !justSeated;
+                link.bolt.grab = st.slidePointKnown && !justSeated && st.place != kRailAuto;   // a magazine sticking out comes first
                 link.bolt.point[0] = st.slidePointInBolt.x;
                 link.bolt.point[1] = st.slidePointInBolt.y;
                 link.bolt.point[2] = st.slidePointInBolt.z;
