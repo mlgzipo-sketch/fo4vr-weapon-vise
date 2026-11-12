@@ -37,6 +37,8 @@ add_library(ManualReloadF SHARED
   src/ManualReload.cpp
   src/GripHook.cpp
   src/GripHook.h
+  src/RockLink.cpp
+  src/RockLink.h
 )
 target_compile_features(ManualReloadF PRIVATE cxx_std_23)
 target_compile_definitions(ManualReloadF PRIVATE

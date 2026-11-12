@@ -20,6 +20,7 @@
 #include "api/openvr.h"
 
 #include "GripHook.h"
+#include "RockLink.h"
 
 #include <algorithm>
 #include <array>
@@ -115,6 +116,7 @@ namespace
         float handRadius{ 16.0f };
         float looseLifetime{ 90.0f };
         int   maxLoose{ 6 };
+        bool  rockApi{ true };          // ROCK 1.0: the free hand's fingers take ROCK's own grip pose
         bool  allGuns{ true };          // every gun with a magazine of group 1, not only the 10mm pistol
         bool  nativeSound{ true };      // sounds played by the plugin (the script's Sound objects are not heard)
         int   soundFlags{ 16 };
@@ -151,7 +153,7 @@ namespace
             { "iHoldFlip", 1, &s.holdFlip }, { "fFingerCurl", 2, &s.fingerCurl }, { "fFreezeSeconds", 2, &s.freezeSeconds },
             { "fSlideGrabRadius", 2, &s.slideGrabRadius }, { "fRackTravel", 2, &s.rackTravel }, { "fSlideLockAt", 2, &s.slideLockAt },
             { "fHandRadius", 2, &s.handRadius }, { "fLooseLifetime", 2, &s.looseLifetime }, { "iMaxLoose", 1, &s.maxLoose },
-            { "bAllGuns", 0, &s.allGuns }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
+            { "bRockApi", 0, &s.rockApi }, { "bAllGuns", 0, &s.allGuns }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
             { "fChamberForward", 2, &s.chamberForward }, { "fRoundUp", 2, &s.roundUp }, { "fRoundRotX", 2, &s.roundRotX },
             { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale },
         };
@@ -1714,6 +1716,8 @@ namespace
     {
         unpinHand();
         poseFingers(false);
+        rocklink::holdFingers(0, false);
+        rocklink::holdFingers(1, false);
     }
 
     void startEject(const Gun& gun, bool hold, Clock::time_point now) noexcept
@@ -2038,6 +2042,39 @@ namespace
         }
         const auto* ui = RE::UI::GetSingleton();
         return ui && ui->menuMode != 0;
+    }
+
+    // ROCK's own grip on a loose magazine is the pose the fingers take on the slide and the magazine:
+    // taken once while the free hand holds one of our dropped magazines through ROCK.
+    void learnGrip(const Hand& hand) noexcept
+    {
+        static Clock::time_point since{};
+        static bool near = false;
+        if (!rocklink::connected() || rocklink::hasGrip() || !hand.valid || !hand.grip || griphook::owned()) {
+            near = false;
+            return;
+        }
+        bool close = false;
+        for (const auto& [id, loose] : g_loose) {
+            auto* ref = lookupRef(id);
+            auto* model = ref ? ref->Get3D() : nullptr;
+            if (looksLikeObject(model) && distance(model->worldBound.center, hand.palm) < 8.0f) {
+                close = true;
+                break;
+            }
+        }
+        const auto now = Clock::now();
+        if (!close) {
+            near = false;
+            return;
+        }
+        if (!near) {
+            near = true;
+            since = now;
+        } else if (now - since > std::chrono::milliseconds(500)) {
+            rocklink::captureGrip(freeIndex());
+            near = false;
+        }
     }
 
     void update() noexcept
@@ -2433,7 +2470,10 @@ namespace
                 unpinHand();
             }
         }
-        poseFingers(st.place == kRailHand || st.place == kHand || st.racking);
+        const bool holding = st.place == kRailHand || st.place == kHand || st.racking;
+        rocklink::holdFingers(freeIndex(), holding);
+        poseFingers(holding && !rocklink::hasGrip());
+        learnGrip(free);
 
         looseMagazines(&gun, root);
 
@@ -2518,6 +2558,7 @@ namespace
         if (g_vr) {
             griphook::install(&hookLog, g_settings.hideGrip);
         }
+        rocklink::connect(&hookLog, g_settings.rockApi);
         // a loaded save: magazines of the last session are gone or unknown
         releaseHand();
         griphook::setArmed(false);
