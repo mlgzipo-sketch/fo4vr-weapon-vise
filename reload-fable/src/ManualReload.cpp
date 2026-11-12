@@ -125,6 +125,7 @@ namespace
         bool  realInHand{ false };      // a magazine out of the well is a real object ROCK holds (always so with bCore2)
         bool  core2{ true };            // 0.12 core: parts move along their way by the palm on them (no grab point), a magazine out of the gun is ROCK's
         float contactMargin{ 2.5f };
+        float catchSide{ 1.5f };        // core2: a magazine is caught by the well only this close to its line (from below, not from the side)
         int   markButton{ 32 };         // the free hand's stick click: writes a numbered mark and the whole state to the log
         bool  traceState{ true };       // every change of what the plugin thinks (where the magazine is, the slide, who holds what)    // the palm this close to a part's box touches it (gun units)
         bool  recordedBolt{ true };     // the bolt / slide moves along the recorded way (a bolt action lifts, then goes back)
@@ -174,7 +175,7 @@ namespace
             { "fSlideGrabRadius", 2, &s.slideGrabRadius }, { "fSlideGrabAt", 2, &s.slideGrabAt }, { "fSlideGrabHigh", 2, &s.slideGrabHigh }, { "fRackTravel", 2, &s.rackTravel }, { "fSlideLockAt", 2, &s.slideLockAt },
             { "fHandRadius", 2, &s.handRadius }, { "fLooseLifetime", 2, &s.looseLifetime }, { "iMaxLoose", 1, &s.maxLoose },
             { "bAllGuns", 0, &s.allGuns }, { "bRockParts", 0, &s.rockParts }, { "bRockBeltHandover", 0, &s.rockBeltHandover },
-            { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bBreech", 0, &s.breech }, { "bRecordAnim", 0, &s.recordAnim }, { "bAutoRecord", 0, &s.autoRecord }, { "bRecordedBolt", 0, &s.recordedBolt }, { "bRealInHand", 0, &s.realInHand }, { "bCore2", 0, &s.core2 }, { "fContactMargin", 2, &s.contactMargin }, { "iMarkButton", 1, &s.markButton }, { "bTraceState", 0, &s.traceState }, { "fCylinderSwing", 2, &s.cylinderSwing },
+            { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bBreech", 0, &s.breech }, { "bRecordAnim", 0, &s.recordAnim }, { "bAutoRecord", 0, &s.autoRecord }, { "bRecordedBolt", 0, &s.recordedBolt }, { "bRealInHand", 0, &s.realInHand }, { "bCore2", 0, &s.core2 }, { "fContactMargin", 2, &s.contactMargin }, { "iMarkButton", 1, &s.markButton }, { "fCatchSide", 2, &s.catchSide }, { "bTraceState", 0, &s.traceState }, { "fCylinderSwing", 2, &s.cylinderSwing },
             { "fBreakAngle", 2, &s.breakAngle }, { "fFlickSpeed", 2, &s.flickSpeed }, { "fBreechRadius", 2, &s.breechRadius }, { "bRockPlacesHeld", 0, &s.rockPlacesHeld }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
             { "fChamberForward", 2, &s.chamberForward }, { "fRoundUp", 2, &s.roundUp }, { "fRoundRotX", 2, &s.roundRotX },
             { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale },
@@ -2164,9 +2165,11 @@ namespace
                     node.scale = gunScale(root) * st.magRest.scale;
                     float side = 0.0f;
                     const float top = alongRail(root, topOf(node), &side) + st.topAt * st.magRest.scale;
-                    const bool upright = dot(axisOf(node, 2), axisWorld(root)) < -0.5f;
+                    const bool upright = dot(axisOf(node, 2), axisWorld(root)) < (g_settings.core2 ? -0.8f : -0.5f);
                     const float mouth = st.length;
-                    if (upright && side <= g_settings.wellSide && top <= mouth + g_settings.captureAhead && top >= mouth - 3.0f) {
+                    const float sideMax = g_settings.core2 ? g_settings.catchSide : g_settings.wellSide;
+                    const float below = g_settings.core2 ? 1.5f : 3.0f;
+                    if (upright && side <= sideMax && top <= mouth + g_settings.captureAhead && top >= mouth - below) {
                         st.rounds = loose.rounds;
                         st.place = kRailHand;
                         st.s = std::clamp(top, 0.0f, mouth + g_settings.captureAhead);
@@ -3627,7 +3630,8 @@ namespace
         const bool quiet = !frozen && st.place == kSeated && st.s <= 0.0f && gunState == static_cast<std::uint32_t>(g_settings.idleGunState) &&
                            !st.racking && st.rackPull <= 0.0f && !st.slideLocked && now - st.lastShot > std::chrono::milliseconds(600) &&
                            now - st.equippedAt > std::chrono::milliseconds(1500) && now - st.lastDrive > std::chrono::milliseconds(700);
-        if (quiet && gun.data->ammoCount > 0) {
+        if (quiet && gun.data->ammoCount > 0 && !(g_settings.core2 && st.idleKnown)) {
+            // core2: taken once, with the gun at rest after it is drawn; later the game's own reload may have moved the parts
             bool all = true;
             for (std::size_t i = 0; i < parts.size(); ++i) {
                 if (looksLikeObject(parts[i])) {
@@ -3643,6 +3647,10 @@ namespace
             learnRail(root, magazine);
         }
         useRockBoxes(root, bolt, quiet && gun.data->ammoCount > 0);
+        if (g_settings.core2 && st.idleKnown && looksLikeObject(magazine) && st.place == kSeated) {
+            magazine->local = st.idle[0];   // seated: always where it sits at rest (the game's reload moves it away)
+            refreshSubtree(magazine, RE::NiPoint3{});
+        }
         if (frozen && st.idleKnown) {
             for (std::size_t i = 0; i < parts.size(); ++i) {
                 if (looksLikeObject(parts[i])) {
@@ -3858,6 +3866,7 @@ namespace
                     unpinHand();
                     playSound(1);
                     note("OUT: the magazine left the well in the free hand (%u rounds)", st.rounds);
+                    st.forceTargets = now + std::chrono::milliseconds(1500);   // ROCK is told the gun's magazine is no longer to be held
                     if (realHand()) {
                         // drawn at the hand only until the real one is there; then ROCK holds the real one
                         st.handToken = spawnLoose(compose(free.wand, st.magInWand), st.rounds, "out of the well into the hand");
@@ -4095,7 +4104,7 @@ namespace
             link.freeHand = freeIndex();
             link.exclusive = st.place != kSeated || st.armReason == kArmSlide || st.racking;
             const bool justSeated = now - st.seatedAt < std::chrono::milliseconds(700);   // the hand must not jump from the magazine to the slide
-            link.keepTargets = free.grip && !justSeated && now > st.forceTargets;
+            link.keepTargets = free.grip && !justSeated && now > st.forceTargets && !(g_settings.core2 && st.handRef && !st.grabDone);
             link.chamber = st.chamber ? 2 : 1;
             const bool magOut = draw && (st.place == kRailAuto || st.place == kRailHand || st.place == kHand) && looksLikeObject(magazine);
             link.magazine.node = kMovingParts[0];

@@ -595,10 +595,12 @@ namespace rocklink
         }
         api::grab::ForceReleaseRequest request{};
         request.hand = rockHand(hand);
-        request.targetFormId = refFormId;
-        request.flags = static_cast<std::uint32_t>(api::grab::ForceReleaseFlag::RequireMatchingTarget);
+        (void)refFormId;   // the hand lets go of whatever it holds (a part grip of the gun has no reference of its own)
+        request.flags = static_cast<std::uint32_t>(api::grab::ForceReleaseFlag::ImmediateCollisionRestore);
         std::uint64_t id = 0;
-        return g_grab->requestForceRelease(g_client.owner(), &request, &id) == api::Status::Ok;
+        const auto status = g_grab->requestForceRelease(g_client.owner(), &request, &id);
+        say("ROCK: force release of the %s hand: status %u", hand == 0 ? "right" : "left", static_cast<unsigned>(status));
+        return status == api::Status::Ok;
     }
 }
 
