@@ -121,6 +121,7 @@ namespace
         bool  allGuns{ true };         // every gun with a magazine of group 1, not only the 10mm pistol
         bool  rockParts{ true };        // ROCK 1.0 holds the free hand on the magazine and the slide (its hand and fingers)
         bool  rockBeltHandover{ true }; // a magazine from the belt: the grip is shown to ROCK so that it closes the hand on it
+        bool  rockPlacesHeld{ true };   // a magazine ROCK holds in the hand is drawn where ROCK has it (one attachment, not two)
         bool  holdPoseOnExit{ false };  // a magazine pulled out of the well turns to the pose of one from the belt
         bool  nativeSound{ true };      // sounds played by the plugin (the script's Sound objects are not heard)
         int   soundFlags{ 16 };
@@ -158,7 +159,7 @@ namespace
             { "fSlideGrabRadius", 2, &s.slideGrabRadius }, { "fSlideGrabAt", 2, &s.slideGrabAt }, { "fSlideGrabHigh", 2, &s.slideGrabHigh }, { "fRackTravel", 2, &s.rackTravel }, { "fSlideLockAt", 2, &s.slideLockAt },
             { "fHandRadius", 2, &s.handRadius }, { "fLooseLifetime", 2, &s.looseLifetime }, { "iMaxLoose", 1, &s.maxLoose },
             { "bAllGuns", 0, &s.allGuns }, { "bRockParts", 0, &s.rockParts }, { "bRockBeltHandover", 0, &s.rockBeltHandover },
-            { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
+            { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bRockPlacesHeld", 0, &s.rockPlacesHeld }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
             { "fChamberForward", 2, &s.chamberForward }, { "fRoundUp", 2, &s.roundUp }, { "fRoundRotX", 2, &s.roundRotX },
             { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale },
         };
@@ -2534,7 +2535,22 @@ namespace
                 setCulled(magazine, false);
             } else if (draw) {
                 setCulled(magazine, false);
-                placeNode(magazine, drawn);
+                // in the hand and held by ROCK: ROCK has already put the node where it was told a frame ago and has its
+                // hand on that very pose; placing it again here would give the magazine a second, slightly different, hold
+                bool leave = false;
+                if (st.place == kHand && g_rock.onMagazine) {
+                    const auto apart = relative(drawn, magazine->world).translate;
+                    const float off = std::sqrt(dot(apart, apart));
+                    leave = g_settings.rockPlacesHeld && off < 25.0f;
+                    static int tick = 0;
+                    if (++tick % 90 == 0) {
+                        detail("Held magazine: ROCK has it (%.2f, %.2f, %.2f) from where the controller puts it (%.2f apart)%s", apart.x, apart.y, apart.z,
+                            off, leave ? "" : ": too far, placed by the plugin");
+                    }
+                }
+                if (!leave) {
+                    placeNode(magazine, drawn);
+                }
             } else {
                 setCulled(magazine, true);
             }
