@@ -3769,15 +3769,18 @@ namespace
         };
 
         // the ejector rod (zones file: box + route "ejector"): pushed along its way by the hand, it throws out what is in
-        if (const auto box = st.zoneBoxes.find("ejector"), way = st.zoneRoutes.find("ejector");
-            fullyOpen && spare.valid && box != st.zoneBoxes.end() && way != st.zoneRoutes.end() && way->second.size() >= 2) {
-            RE::NiPoint3 at{};
-            const bool touch = handIn(box->second, 1.5f, &at);
+        const auto ejectBox = st.zoneBoxes.find("ejector");
+        const auto ejectWay = st.zoneRoutes.find("ejector");
+        if (fullyOpen && spare.valid && ejectBox != st.zoneBoxes.end() && ejectWay != st.zoneRoutes.end() && ejectWay->second.size() >= 2) {
+            const auto& box = ejectBox;
+            const auto& way = ejectWay;
+            RE::NiPoint3 rod{};
+            const bool touch = handIn(box->second, 1.5f, &rod);
             if (touch) {
                 const auto run = way->second.back() - way->second.front();
                 const float length = std::sqrt(dot(run, run));
                 if (b.ejectTouch && length > 0.1f) {
-                    b.ejectPushed = std::max(0.0f, b.ejectPushed + dot(at - b.ejectPrev, run * (1.0f / length)));
+                    b.ejectPushed = std::max(0.0f, b.ejectPushed + dot(rod - b.ejectPrev, run * (1.0f / length)));
                     if (b.ejectPushed > 0.6f * length && b.live + b.spent > 0) {
                         note("EJECTOR: pushed %.1f of %.1f: %u rounds back to the pouch, %u fired cases out", b.ejectPushed, length, b.live, b.spent);
                         if (b.live > 0) {
@@ -3791,7 +3794,7 @@ namespace
                         buzz(g_settings.gunHand, 1500);
                     }
                 }
-                b.ejectPrev = at;
+                b.ejectPrev = rod;
             } else {
                 b.ejectPushed = 0.0f;
             }
