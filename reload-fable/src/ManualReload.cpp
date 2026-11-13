@@ -1465,6 +1465,7 @@ namespace
         bool               grabDone{ false };
         float              exitAt{ 0.0f };
         Clock::time_point  stopReloadUntil{};             // the game's reload of an empty gun is being cut short
+        bool               zonesEarly{ false };            // ..read once before ROCK's boxes came
         bool               zonesChecked{ false };          // ManualReloadF_zones/<weapon>.txt read (or written) for this gun
         bool               zonesFromFile{ false };
         float              zoneCatchSide{ -1.0f };
@@ -1808,6 +1809,7 @@ namespace
         }
         std::string line;
         int used = 0;
+        st.chambers.clear();
         while (std::getline(in, line)) {
             std::vector<std::string> words;
             std::string word;
@@ -3583,6 +3585,19 @@ namespace
             note("Breech: closed pose remembered (%zu nodes below), %u of %u rounds in it", b.kids.size(), b.live, capacity);
         }
 
+        // the game's own reload: its animation moves the opening part off where it stands closed (in VR the gun's
+        // state does not always say "reloading"), or at the latest the game refills the gun
+        bool gameReloaded = false;
+        if (!b.open && b.t <= 0.0f && gunState != 0 && now - b.toggled > std::chrono::milliseconds(800) && now >= b.freezeUntil) {
+            const float moved = distance(mag->local.translate, b.rest.translate);
+            const float turned = 1.0f - std::min({ dot(axisOf(mag->local, 0), axisOf(b.rest, 0)), dot(axisOf(mag->local, 1), axisOf(b.rest, 1)),
+                                                 dot(axisOf(mag->local, 2), axisOf(b.rest, 2)) });
+            if (moved > 0.3f || turned > 0.003f) {
+                gameReloaded = true;
+                detail("The game moves the opening part (%.2f off, turn %.4f): its reload began", moved, turned);
+            }
+        }
+
         // the rounds
         auto ammo = gun.data->ammoCount;
         if (b.open) {
@@ -3595,6 +3610,7 @@ namespace
                 note("Game refill %u -> %u reverted", b.lastAmmo, ammo);
                 ammo = b.lastAmmo;
                 gun.data->ammoCount = ammo;
+                gameReloaded = true;
             } else if (ammo < b.lastAmmo) {
                 b.spent = std::min(b.spent + (b.lastAmmo - ammo), capacity - std::min(ammo, capacity));
                 detail("Shot: %u rounds and %u fired cases in the gun", ammo, b.spent);
@@ -3636,7 +3652,7 @@ namespace
                 buzz(g_settings.gunHand, 1200);
                 note("OPEN: %u rounds, %u fired cases", b.live, b.spent);
             }
-        } else if (reloadStarted && !b.open && b.known && !menuOpen()) {
+        } else if ((reloadStarted || gameReloaded) && !b.open && b.known && !menuOpen()) {
             // the game's own reload began (its button, however it was pressed): the gun opens instead
             b.open = true;
             b.opened = now;
@@ -4130,6 +4146,11 @@ namespace
             learnRail(root, magazine);
         }
         useRockBoxes(root, bolt, quiet && gun.data->ammoCount > 0);
+        if (g_settings.core2 && !st.zonesEarly && st.railKnown && gun.weapon) {
+            // the zones file at once (the hand finds the parts from the start); read again after ROCK's boxes come
+            st.zonesEarly = true;
+            zonesFor(gun.weapon->GetFormID(), false);
+        }
         if (g_settings.core2 && !st.zonesChecked && st.magBoxKnown && (st.slideBoxKnown || !looksLikeObject(bolt))) {
             st.zonesChecked = true;
             zonesFor(gun.weapon->GetFormID());
