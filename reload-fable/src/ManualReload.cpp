@@ -1344,6 +1344,8 @@ namespace
         bool              pushing{ false };   // the open palm is against the opening part
         float             pushAngle{ 0.0f };
         RE::NiTransform   restInRoot{};       // the opening part closed, in the gun root's frame (zones are drawn there)
+        RE::NiTransform   drawnLocal{};       // ..as drawn last frame (opened): ROCK's collision follows it
+        bool              drawn{ false };
     };
 
     struct State
@@ -3520,6 +3522,10 @@ namespace
         link.freeHand = freeIndex();
         link.magazine.node = kMovingParts[0];
         link.bolt.node = kMovingParts[1];
+        if (b.drawn) {
+            link.magazine.drive = true;   // ROCK's collision of the opening part goes where it is drawn
+            link.magazine.parentLocal = toLinkPose(b.drawnLocal);
+        }
         g_rock = rocklink::frame(link);
 
         auto* mag = findNamed(root, kMovingParts[0]);
@@ -3652,16 +3658,12 @@ namespace
                 buzz(g_settings.gunHand, 1200);
                 note("OPEN: %u rounds, %u fired cases", b.live, b.spent);
             }
-        } else if ((reloadStarted || gameReloaded) && !b.open && b.known && !menuOpen()) {
-            // the game's own reload began (its button, however it was pressed): the gun opens instead
-            b.open = true;
-            b.opened = now;
-            b.toggled = now + std::chrono::milliseconds(800);   // the release of that same press does not close it
-            gun.data->ammoCount = 0;
-            b.lastAmmo = 0;
-            playSound(1);
-            buzz(g_settings.gunHand, 1200);
-            note("OPEN (the game's reload began): %u rounds, %u fired cases", b.live, b.spent);
+        } else if ((reloadStarted || gameReloaded) && !b.open && b.known) {
+            // the game's own reload began (an empty gun reloads by itself): held shut, the hand opens it
+            if (now >= b.freezeUntil) {
+                note("The game's reload of the closed gun is held still: open it by hand");
+            }
+            b.freezeUntil = now + std::chrono::milliseconds(static_cast<int>(std::max(g_settings.freezeSeconds, 1.0f) * 1000.0f));
         }
         if (!b.driving && !b.pushing) {
             b.t = approach(b.t, b.open ? 1.0f : 0.0f, 7.0f * dt);
@@ -3692,6 +3694,10 @@ namespace
                 mag->local = relative(mag->parent->world, compose(root->world, posed));
                 refreshSubtree(mag, RE::NiPoint3{});
             }
+            b.drawnLocal = mag->local;
+            b.drawn = b.t > 0.0f;
+        } else {
+            b.drawn = false;
         }
 
         // the gun's speed against the player (a jerk closes it)
@@ -3746,6 +3752,13 @@ namespace
         const bool press = spare.valid && spare.grip && !spare.previousGrip;
         const bool atBelt = spare.valid && inBelt(player, spare.palm);
         const float toGun = spare.valid ? distance(spare.palm, breechAt) : 1e9f;
+        if (press && griphook::owned() && !b.open && hinged && b.held == 0 && touchesPart(14.0f)) {
+            b.driving = true;   // the closed gun taken by its opening part: turning it opens the gun
+            b.driveAngle0 = hingeAngle(root, spare.palm);
+            b.driveT0 = 0.0f;
+            buzz(freeIndex(), 600);
+            detail("The free hand takes the closed opening part");
+        }
         if (press && griphook::owned() && b.open) {
             if (atBelt && b.held == 0) {
                 const auto inventory = gun.data->ammo ? inventoryCount(player, gun.data->ammo) : 0u;
@@ -3773,7 +3786,7 @@ namespace
             }
         }
         if (b.driving) {
-            if (!(spare.valid && spare.grip) || !b.open) {
+            if (!(spare.valid && spare.grip)) {
                 b.driving = false;
                 if (b.open && b.t < 0.3f) {
                     close("pushed shut by hand");
@@ -3784,7 +3797,16 @@ namespace
                 while (turn < -3.14159265f) turn += 6.2831853f;
                 const float before = b.t;
                 b.t = std::clamp(b.driveT0 + turn / std::max(g_play.openAngle, 0.1f), 0.0f, 1.0f);
-                if (b.t <= 0.05f && before > 0.05f) {
+                if (!b.open && b.t > 0.15f) {
+                    b.open = true;   // turned open by hand
+                    b.opened = now;
+                    b.toggled = now;
+                    gun.data->ammoCount = 0;
+                    b.lastAmmo = 0;
+                    playSound(1);
+                    buzz(g_settings.gunHand, 1200);
+                    note("OPEN (by hand): %u rounds, %u fired cases", b.live, b.spent);
+                } else if (b.open && b.t <= 0.05f && before > 0.05f) {
                     b.driving = false;
                     close("pushed shut by hand");
                 } else if (b.t >= 0.98f && before < 0.98f) {
@@ -3880,7 +3902,8 @@ namespace
 
         // an open gun: the free hand's grip near it or at the belt is this plugin's (no second-hand hold, no ROCK grab)
         if (!spare.grip) {
-            const bool mine = b.open && spare.valid && (atBelt || distance(spare.palm, root->world.translate) < g_settings.gunRadius);
+            const bool mine = spare.valid && ((b.open && (atBelt || distance(spare.palm, root->world.translate) < g_settings.gunRadius)) ||
+                                              (!b.open && hinged && touchesPart(0.0f)));   // closed: only on the opening part
             st.armReason = mine ? (atBelt ? kArmBelt : kArmBlock) : kArmNone;
             griphook::setArmed(mine);
         }
