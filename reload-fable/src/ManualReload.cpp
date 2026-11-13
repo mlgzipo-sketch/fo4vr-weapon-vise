@@ -384,7 +384,9 @@ namespace
     constexpr int kLaserCellKind = 19;     // MRF_MagLaserCell
     constexpr int kSyringerKind = 20;      // MRF_MagSyringer
     constexpr int kFusionCoreKind = 21;    // MRF_MagFusionCore
-    constexpr std::array<const char*, 22> kMagModels{
+    constexpr std::uint32_t kMinigun = 0x0001F669;
+    constexpr int kMinigunKind = 22;       // MRF_MagMinigun: a box of 5mm stands for the drum (the game has no drum model of its own)
+    constexpr std::array<const char*, 23> kMagModels{
         "weapons\\10mmpistol\\10mmmag01.nif", "weapons\\10mmpistol\\10mmmaglarge.nif",
         "weapons\\machinegun\\mgmagstraight.nif", "weapons\\machinegun\\mgmagdrum.nif",
         "weapons\\combatshotgun\\combatriflemagmedium.nif", "weapons\\combatshotgun\\combatriflemaglarge.nif",
@@ -396,7 +398,7 @@ namespace
         "weapons\\combatshotgun\\drummag.nif",
         "ammo\\308\\308smallmag.nif", "ammo\\308\\308mediummag.nif", "ammo\\308\\308largemag.nif",
         "weapons\\laserweapons\\fusioncell.nif", "weapons\\handmade\\magazines\\syringermag.nif",
-        "ammo\\fusioncore\\fusioncore.nif",
+        "ammo\\fusioncore\\fusioncore.nif", "ammo\\5mm\\5mmammo.nif",
     };
 
     // The magazine the equipped gun wears: its magazine mod's model, looked up in kMagModels (-1: none of ours).
@@ -1329,7 +1331,7 @@ namespace
     // Guns that open instead of taking a magazine: a revolver's cylinder swings out, a break-action gun folds.
     struct Breech
     {
-        int               mech{ 0 };        // 0 none, 1 revolver, 2 break action
+        int               mech{ 0 };        // 0 none, 1 revolver, 2 break action, 3 one big round at a breech (Fat Man, missile launcher)
         bool              checked{ false };
         bool              known{ false };   // the closed pose is remembered
         RE::NiTransform   rest{};
@@ -1354,6 +1356,7 @@ namespace
         RE::NiTransform   restInRoot{};       // the opening part closed, in the gun root's frame (zones are drawn there)
         RE::NiTransform   drawnLocal{};       // ..as drawn last frame (opened): ROCK's collision follows it
         bool              drawn{ false };
+        Clock::time_point unlatchedAt{};             // the free hand last pressed the latch (zones file: box latch)
         RE::NiPoint3      prevForward{}, prevSide{};   // the gun's turn last frame (a flick of the wrist closes it)
         bool              turnKnown{ false };
         float             ejectPushed{ 0.0f };          // how far the hand has pushed the ejector rod
@@ -1469,6 +1472,15 @@ namespace
         std::unordered_map<std::string, std::vector<RE::NiPoint3>> zoneRoutes;   // zones file: "route NAME x y z .."
         ArcFit             slideFit{};                     // the slide's way: a turn first (a bolt handle lifted), then straight
         ArcFit             zoneHinge{};                    // zones file "route cylinder/barrels/breech": the opening part's turn
+        bool               singleShot{ false };            // zones file "socket nuke/missile": one big round goes in at the breech
+        RE::NiPoint3       breechMouth{};                  // ..where it goes in (gun root frame)
+        float              breechReach{ 6.0f };
+        bool               crankKnown{ false };            // zones file "route crank": a full circle (the laser musket)
+        RE::NiPoint3       crankCenter{}, crankAxis{}, crankStart{};
+        bool               crankRestKnown{ false };
+        RE::NiTransform    crankRest{};                    // the crank (WeaponMagazine) in the gun root frame at rest
+        bool               crankHeld{ false };
+        float              crankAngle{ 0.0f }, crankPrev{ 0.0f }, crankTurned{ 0.0f };
         bool               magBoxKnown{ false };
         RE::NiPoint3       magLo{}, magHi{};
         bool               pushing{ false };               // the open palm moves the slide / bolt
@@ -1758,18 +1770,63 @@ namespace
         std::snprintf(path, sizeof(path), "Data/F4SE/Plugins/ManualReloadF_zones/%08X.txt", weapon);
         std::ifstream in(path);
         st.hasZonesFile = static_cast<bool>(in);
-        std::string line;
-        while (in && std::getline(in, line)) {
+        std::vector<std::string> lines;
+        std::unordered_map<std::string, RE::NiPoint3> boxMiddle;
+        for (std::string line; in && std::getline(in, line);) {
+            std::istringstream words(line);
+            std::string head, name, word;
+            words >> head >> name;
+            RE::NiPoint3 lo{}, hi{};
+            if (head == "box" && words >> word >> lo.x >> lo.y >> lo.z >> word >> hi.x >> hi.y >> hi.z) {
+                boxMiddle[name] = (lo + hi) * 0.5f;
+            } else if (head == "socket" && (name == "nuke" || name == "missile") && words >> word >> lo.x >> lo.y >> lo.z) {
+                st.singleShot = true;
+                st.breechMouth = lo;
+                float side = 0.0f;
+                while (words >> word) {
+                    if (word == "side" && words >> side) {
+                        st.breechReach = std::clamp(side, 3.0f, 10.0f);
+                    }
+                }
+                note("ZONES: one %s goes in at (%.1f %.1f %.1f), reach %.1f", name.c_str(), lo.x, lo.y, lo.z, st.breechReach);
+            }
+            lines.push_back(line);
+        }
+        for (const auto& line : lines) {
             std::istringstream words(line);
             std::string head, name;
             words >> head >> name;
-            if (head != "route" || (name != "cylinder" && name != "barrels" && name != "breech")) {
+            if (head != "route" || (name != "cylinder" && name != "barrels" && name != "breech" && name != "crank")) {
                 continue;
             }
             std::vector<RE::NiPoint3> pts;
             float x, y, z;
             while (words >> x >> y >> z) {
                 pts.push_back(RE::NiPoint3{ x, y, z });
+            }
+            if (name == "crank") {
+                if (pts.size() >= 5) {
+                    const std::size_t n = distance(pts.front(), pts.back()) < 0.5f ? pts.size() - 1 : pts.size();
+                    RE::NiPoint3 c{};
+                    for (std::size_t i = 0; i < n; ++i) c = c + pts[i];
+                    c = c * (1.0f / static_cast<float>(n));
+                    const auto axis = normalized(cross(pts[0] - c, pts[n / 4] - c));
+                    if (dot(axis, axis) > 0.5f) {
+                        st.crankKnown = true;
+                        st.crankCenter = c;
+                        st.crankAxis = axis;
+                        st.crankStart = pts[0];
+                        note("ZONES: crank turns about (%.2f %.2f %.2f) at (%.1f %.1f %.1f), handle radius %.1f", axis.x, axis.y, axis.z, c.x, c.y, c.z,
+                            distance(pts[0], c));
+                    }
+                }
+                continue;
+            }
+            // the way starts where the part stands closed: a route drawn from the open end is turned round
+            if (const auto box = boxMiddle.find(name); box != boxMiddle.end() && pts.size() >= 2 &&
+                                                       distance(pts.back(), box->second) < distance(pts.front(), box->second)) {
+                std::reverse(pts.begin(), pts.end());
+                note("ZONES: route %s was drawn from its open end: turned round", name.c_str());
             }
             std::vector<float> at(pts.size(), 0.0f);
             float total = 0.0f;
@@ -3530,6 +3587,89 @@ namespace
         rotation = fromMat(m);
     }
 
+    // The laser musket: the free hand takes the crank's handle and winds it round; each full turn charges one more shot.
+    void updateCrank(RE::PlayerCharacter* player, const Gun& gun, RE::NiAVObject* root, Clock::time_point now) noexcept
+    {
+        auto& st = g_state;
+        const auto& spare = g_hands[freeIndex()];
+        rocklink::Frame link{};
+        link.gun = true;
+        link.freeHand = freeIndex();
+        link.magazine.node = kMovingParts[0];
+        link.bolt.node = kMovingParts[1];
+        g_rock = rocklink::frame(link);
+
+        auto* crank = findNamed(root, kMovingParts[0]);
+        if (!looksLikeObject(crank) || !looksLikeObject(crank->parent)) {
+            return;
+        }
+        if (!st.crankRestKnown) {
+            if (now - st.equippedAt < std::chrono::milliseconds(1500)) {
+                return;
+            }
+            st.crankRest = relative(root->world, crank->world);
+            st.crankRestKnown = true;
+            note("Crank: rest pose remembered, %u of %u charges", gun.data->ammoCount, capacityOf(gun));
+        }
+        const auto inRoot = [&](const RE::NiPoint3& p) { return relative(root->world, pointTransform(p)).translate; };
+        const auto& axis = st.crankAxis;
+        const auto e1 = normalized((st.crankStart - st.crankCenter) - axis * dot(st.crankStart - st.crankCenter, axis));
+        const auto e2 = cross(axis, e1);
+        const auto handAngle = [&](const RE::NiPoint3& p) {
+            const auto v = inRoot(p) - st.crankCenter;
+            return std::atan2(dot(v, e2), dot(v, e1));
+        };
+        const auto handle = rotateAbout(st.crankStart - st.crankCenter, axis, st.crankAngle) + st.crankCenter;
+        const float scale = gunScale(root);
+        const bool near = spare.valid && distance(inRoot(spare.palm), handle) < 4.5f;
+        const bool press = spare.valid && spare.grip && !spare.previousGrip;
+        if (!spare.grip) {
+            st.armReason = near ? kArmBlock : kArmNone;
+            griphook::setArmed(near);   // the grip on the handle is ours, not a second-hand hold
+        }
+        if (press && near && griphook::owned()) {
+            st.crankHeld = true;
+            st.crankPrev = handAngle(spare.palm);
+            buzz(freeIndex(), 700);
+            detail("Crank: the free hand takes the handle");
+        }
+        if (st.crankHeld && !(spare.valid && spare.grip)) {
+            st.crankHeld = false;
+            detail("Crank: let go after %.0f deg", st.crankTurned * 57.29578f);
+        }
+        if (st.crankHeld) {
+            const float a = handAngle(spare.palm);
+            float turn = a - st.crankPrev;
+            while (turn > 3.14159265f) turn -= 6.2831853f;
+            while (turn < -3.14159265f) turn += 6.2831853f;
+            st.crankPrev = a;
+            st.crankAngle += turn;
+            st.crankTurned += std::fabs(turn);
+            if (std::fabs(turn) > 0.15f) {
+                buzz(freeIndex(), 300);
+            }
+            if (st.crankTurned >= 6.2831853f) {
+                st.crankTurned -= 6.2831853f;
+                const auto capacity = std::max(capacityOf(gun), 1u);
+                const auto inventory = gun.data->ammo ? inventoryCount(player, gun.data->ammo) : 0u;
+                if (gun.data->ammoCount < capacity && inventory > gun.data->ammoCount) {
+                    gun.data->ammoCount += 1;
+                    playSound(0);
+                    buzz(freeIndex(), 1500);
+                    buzz(g_settings.gunHand, 1500);
+                    note("CRANK: one more charge, %u of %u", gun.data->ammoCount, capacity);
+                } else {
+                    hud(inventory <= gun.data->ammoCount ? "Нет батарей" : "Заряжено полностью");
+                    note("CRANK: a full turn, nothing to charge (%u of %u, %u cells)", gun.data->ammoCount, capacity, inventory);
+                }
+            }
+        }
+        const auto posed = turnedPose(st.crankRest, axis, st.crankCenter, st.crankAngle, RE::NiPoint3{});
+        crank->local = relative(crank->parent->world, compose(root->world, posed));
+        refreshSubtree(crank, RE::NiPoint3{});
+        (void)scale;
+    }
+
     // The reload button opens and closes the gun. Open, with the muzzle up, everything falls out of it. Rounds
     // come from the belt in the free hand (a full clip for a revolver, one shell at a time for a break action)
     // and go in at the breech. The free hand on the gun, or a jerk of the gun, closes it.
@@ -3557,6 +3697,7 @@ namespace
             return;
         }
         const bool revolver = b.mech == 1;
+        const bool single = b.mech == 3;   // a mini nuke / a missile: nothing is left in it after the shot
         const bool played = gun.weapon && loadPlayed(gun.weapon->GetFormID());
         const bool zoneHinge = !played && st.zoneHinge.arc;   // no recording: the turn drawn in Blender
         if (zoneHinge) {
@@ -3642,7 +3783,7 @@ namespace
                 gun.data->ammoCount = ammo;
                 gameReloaded = true;
             } else if (ammo < b.lastAmmo) {
-                b.spent = std::min(b.spent + (b.lastAmmo - ammo), capacity - std::min(ammo, capacity));
+                b.spent = single ? 0u : std::min(b.spent + (b.lastAmmo - ammo), capacity - std::min(ammo, capacity));
                 detail("Shot: %u rounds and %u fired cases in the gun", ammo, b.spent);
             }
             b.live = ammo;
@@ -3773,6 +3914,19 @@ namespace
             return distance(spare.palm, mag->world.translate) < fallback * scale;
         };
 
+        // the latch (zones file: box latch): a closed break action opens only after the free hand pressed it;
+        // until then a hand on the barrels just holds the gun (ROCK's two-handed hold)
+        const auto latchBox = st.zoneBoxes.find("latch");
+        const bool hasLatch = latchBox != st.zoneBoxes.end() && !revolver;
+        if (hasLatch && !b.open && spare.valid && handIn(latchBox->second, g_settings.contactMargin, nullptr)) {
+            if (now - b.unlatchedAt > std::chrono::milliseconds(1500)) {
+                buzz(freeIndex(), 700);
+                detail("The latch is pressed");
+            }
+            b.unlatchedAt = now;
+        }
+        const bool unlatched = !hasLatch || now - b.unlatchedAt < std::chrono::milliseconds(1500);
+
         // the ejector rod (zones file: box + route "ejector"): pushed along its way by the hand, it throws out what is in
         const auto ejectBox = st.zoneBoxes.find("ejector");
         const auto ejectWay = st.zoneRoutes.find("ejector");
@@ -3807,7 +3961,7 @@ namespace
         }
 
         // muzzle up: everything falls out
-        if (fullyOpen && b.live + b.spent > 0 && barrel.z > (revolver ? 0.5f : 0.3f) && now - b.opened > std::chrono::milliseconds(350)) {
+        if (!single && fullyOpen && b.live + b.spent > 0 && barrel.z > (revolver ? 0.5f : 0.3f) && now - b.opened > std::chrono::milliseconds(350)) {
             note("EMPTIED: %u rounds back to the pouch, %u fired cases gone", b.live, b.spent);
             if (b.live > 0) {
                 hud("Патроны высыпались и вернулись в запас");
@@ -3822,7 +3976,7 @@ namespace
         const bool press = spare.valid && spare.grip && !spare.previousGrip;
         const bool atBelt = spare.valid && inBelt(player, spare.palm);
         const float toGun = spare.valid ? distance(spare.palm, breechAt) : 1e9f;
-        if (press && griphook::owned() && !b.open && hinged && b.held == 0 && touchesPart(14.0f)) {
+        if (press && griphook::owned() && !b.open && hinged && unlatched && b.held == 0 && touchesPart(14.0f)) {
             b.driving = true;   // the closed gun taken by its opening part: turning it opens the gun
             b.driveAngle0 = hingeAngle(root, spare.palm);
             b.driveT0 = 0.0f;
@@ -3915,7 +4069,9 @@ namespace
             b.held = 0;
         }
         bool atChamber = toGun < g_settings.breechRadius * scale;
-        if (!st.chambers.empty() && spare.valid) {
+        if (single && spare.valid) {
+            atChamber = distance(relative(root->world, pointTransform(spare.palm)).translate, st.breechMouth) < st.breechReach;
+        } else if (!st.chambers.empty() && spare.valid) {
             const auto palm = palmOnPart(spare.palm);
             float nearest = 1e9f;
             for (const auto& c : st.chambers) {
@@ -3942,6 +4098,18 @@ namespace
         b.prevForward = forwardNow;
         b.prevSide = sideNow;
         b.turnKnown = true;
+        if (hasLatch && !b.open && !b.driving && unlatched && now - b.unlatchedAt < std::chrono::milliseconds(1500) && b.unlatchedAt != Clock::time_point{} &&
+            -flick > g_settings.flickTurn) {
+            b.open = true;   // the latch pressed and the muzzle snapped down: the barrels fall open
+            b.t = 1.0f;
+            b.opened = now;
+            b.toggled = now;
+            gun.data->ammoCount = 0;
+            b.lastAmmo = 0;
+            playSound(1);
+            buzz(g_settings.gunHand, 1200);
+            note("OPEN (latch and a flick down, %.1f/s): %u rounds, %u fired cases", -flick, b.live, b.spent);
+        }
         if (fullyOpen && b.held == 0 && !b.driving && now - b.opened > std::chrono::milliseconds(600)) {
             const float jerk = revolver ? std::fabs(dot(b.velocity, axisOf(root->world, 0))) : b.velocity.z;
             if ((jerk > g_settings.flickSpeed * scale || flick > g_settings.flickTurn) && !(barrel.z > 0.3f && b.live + b.spent > 0)) {
@@ -3957,7 +4125,9 @@ namespace
             }
         };
         const std::uint32_t filled = b.live + b.spent;
-        if (revolver) {
+        if (single) {
+            // the round is part of the gun's model: nothing to show or hide
+        } else if (revolver) {
             show(4, b.live > 0 || b.held > 0);   // the bullets
             show(3, filled > 0);                 // the cases
             show(2, b.held > 0);                 // the clip they come on
@@ -3965,7 +4135,7 @@ namespace
             show(0, filled >= 1 || (b.held > 0 && filled == 0));
             show(1, filled >= 2 || (b.held > 0 && filled == 1));
         }
-        if (b.held > 0 && spare.valid) {
+        if (b.held > 0 && spare.valid && !single) {
             const auto y = normalized(axisOf(spare.wrist, 0));   // along the fingers
             auto z = axisOf(spare.wrist, 2);
             z = normalized(z - y * dot(z, y));
@@ -3984,7 +4154,7 @@ namespace
         // an open gun: the free hand's grip near it or at the belt is this plugin's (no second-hand hold, no ROCK grab)
         if (!spare.grip) {
             const bool mine = spare.valid && ((b.open && (atBelt || distance(spare.palm, root->world.translate) < g_settings.gunRadius)) ||
-                                              (!b.open && hinged && touchesPart(0.0f)));   // closed: only on the opening part
+                                              (!b.open && hinged && unlatched && touchesPart(0.0f)));   // closed: only on the opening part, unlatched
             st.armReason = mine ? (atBelt ? kArmBelt : kArmBlock) : kArmNone;
             griphook::setArmed(mine);
         }
@@ -4105,6 +4275,10 @@ namespace
                 kind = kFusionCoreKind;   // the gatling laser: its fusion core is the magazine
                 magModel = "Ammo\\FusionCore\\FusionCore.nif";
             }
+            if (kind < 0 && gun.weapon && gun.weapon->GetFormID() == kMinigun) {
+                kind = kMinigunKind;   // the minigun: its drum comes off and a new one goes on
+                magModel = "Ammo\\5mm\\5mmAmmo.nif";
+            }
             const bool pistol10 = gun.weapon && gun.data && gun.weapon->GetFormID() == k10mmPistol;
             st.managed = gun.weapon && gun.data && (pistol10 || (kind >= 0 && g_settings.allGuns));
             st.equippedAt = now;
@@ -4112,7 +4286,7 @@ namespace
             st.chamber = total > 0;
             st.rounds = total > 0 ? total - 1 : 0;
             st.kind = kind >= 0 ? kind : (capacityOf(gun) > 12 ? 1 : 0);
-            st.cellFed = kind == kLaserCellKind || kind == kSyringerKind || kind == kFusionCoreKind;   // nothing to rack
+            st.cellFed = kind == kLaserCellKind || kind == kSyringerKind || kind == kFusionCoreKind || kind == kMinigunKind;   // nothing to rack
             note("Equipped weapon %08X, capacity %u, rounds %u, magazine '%s' (kind %d): %s", gun.weapon ? gun.weapon->GetFormID() : 0u,
                 capacityOf(gun), total, magModel.c_str(), kind, st.managed ? "reloaded by hand" : "not handled (no magazine of group 1)");
             if (gun.weapon) {
@@ -4150,13 +4324,20 @@ namespace
                     shells = shells || name.find("ShotgunShell") != std::string::npos || name.find("BarrelCatch") != std::string::npos;
                     return true;
                 });
-                st.breech.mech = cylinder ? 1 : (shells ? 2 : 0);
+                st.breech.mech = cylinder ? 1 : (shells ? 2 : (st.singleShot && st.zoneHinge.arc ? 3 : 0));
                 if (st.breech.mech != 0 && looksLikeObject(findNamed(drawnRoot, kMovingParts[0]))) {
                     st.managed = true;
-                    note("This gun opens: %s, reloaded by hand", st.breech.mech == 1 ? "a revolver (the cylinder swings out)" : "a break action");
+                    note("This gun opens: %s, reloaded by hand",
+                        st.breech.mech == 1 ? "a revolver (the cylinder swings out)" : (st.breech.mech == 2 ? "a break action" : "one big round at the breech"));
                 } else {
                     st.breech.mech = 0;
                 }
+            }
+        }
+        if (!st.managed && st.crankKnown && g_settings.breech && gun.weapon && gun.data) {
+            if (auto* crankRoot = weaponRoot(player); looksLikeObject(crankRoot)) {
+                updateCrank(player, gun, crankRoot, now);
+                return;
             }
         }
         auto* root = st.managed ? weaponRoot(player) : nullptr;
