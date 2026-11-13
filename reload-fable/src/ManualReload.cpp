@@ -1389,7 +1389,11 @@ namespace
         Clock::time_point  grabTriedAt{};
         int                grabTries{ 0 };
         bool               grabDone{ false };
-        float              exitAt{ 0.0f };                 // core2: out this far along the well and the magazine has left it
+        float              exitAt{ 0.0f };
+        bool               zonesChecked{ false };          // ManualReloadF_zones/<weapon>.txt read (or written) for this gun
+        bool               zonesFromFile{ false };
+        float              zoneCatchSide{ -1.0f };
+        float              zoneCatchAhead{ -1.0f };                 // core2: out this far along the well and the magazine has left it
     };
     State g_state;
     rocklink::Result g_rock;   // what ROCK answered last frame
@@ -1641,6 +1645,81 @@ namespace
             return distance(palm, grabPoint(root)) < g_settings.magGrabRadius;
         }
         return inBox(st.magLo, st.magHi, inGun(root, palm) - st.axis * st.s, g_settings.contactMargin);
+    }
+
+    // ------------------------------------------------------------ core2: the zones, editable (Blender) per gun
+    // Data/F4SE/Plugins/ManualReloadF_zones/<weapon>.txt, in the gun root's frame (game units):
+    //   magazine lo x y z hi x y z     the box the palm touches to take / push the magazine (seated)
+    //   slide lo x y z hi x y z        ..the slide / bolt (at rest)
+    //   well side S ahead A            the well catches a magazine this close to its line, from A below the mouth
+    //   well mouth x y z axis x y z    (written for reference: where the magazine's top leaves the well, the way out)
+    // Written from what ROCK measured when there is no file; read instead of it when there is.
+    void zonesFor(std::uint32_t weapon) noexcept
+    {
+        auto& st = g_state;
+        char path[160];
+        std::snprintf(path, sizeof(path), "Data/F4SE/Plugins/ManualReloadF_zones/%08X.txt", weapon);
+        std::ifstream in(path);
+        if (!in) {
+            std::error_code ignored;
+            std::filesystem::create_directories("Data/F4SE/Plugins/ManualReloadF_zones", ignored);
+            std::ofstream out(path);
+            if (!out) {
+                return;
+            }
+            const auto mouth = st.magRest.translate + st.axis * st.length + RE::NiPoint3{ 0.0f, 0.0f, 0.0f };
+            char text[256];
+            out << "; ManualReloadF zones of weapon " << std::hex << weapon << std::dec << ", gun root frame (game units). Edit, or move the cubes in Blender.\n";
+            std::snprintf(text, sizeof(text), "magazine lo %.3f %.3f %.3f hi %.3f %.3f %.3f\n", st.magLo.x, st.magLo.y, st.magLo.z, st.magHi.x, st.magHi.y, st.magHi.z);
+            out << text;
+            if (st.slideBoxKnown) {
+                std::snprintf(text, sizeof(text), "slide lo %.3f %.3f %.3f hi %.3f %.3f %.3f\n", st.slideLo.x, st.slideLo.y, st.slideLo.z, st.slideHi.x, st.slideHi.y,
+                    st.slideHi.z);
+                out << text;
+            }
+            std::snprintf(text, sizeof(text), "well side %.3f ahead %.3f\n", g_settings.catchSide, g_settings.catchAhead);
+            out << text;
+            std::snprintf(text, sizeof(text), "well mouth %.3f %.3f %.3f axis %.4f %.4f %.4f\n", mouth.x, mouth.y, mouth.z, st.axis.x, st.axis.y, st.axis.z);
+            out << text;
+            note("ZONES: %s written from ROCK's boxes (edit it, or in Blender)", path);
+            return;
+        }
+        std::string line;
+        int used = 0;
+        while (std::getline(in, line)) {
+            std::vector<std::string> words;
+            std::string word;
+            for (const char c : line) {
+                if (c == ' ' || c == '\t' || c == '\r') {
+                    if (!word.empty()) words.push_back(word), word.clear();
+                } else {
+                    word += c;
+                }
+            }
+            if (!word.empty()) words.push_back(word);
+            if (words.empty() || words[0][0] == ';') {
+                continue;
+            }
+            auto num = [&](std::size_t i) { return i < words.size() ? std::strtof(words[i].c_str(), nullptr) : 0.0f; };
+            if ((words[0] == "magazine" || words[0] == "slide") && words.size() >= 9 && words[1] == "lo" && words[5] == "hi") {
+                const RE::NiPoint3 lo{ std::min(num(2), num(6)), std::min(num(3), num(7)), std::min(num(4), num(8)) };
+                const RE::NiPoint3 hi{ std::max(num(2), num(6)), std::max(num(3), num(7)), std::max(num(4), num(8)) };
+                if (words[0] == "magazine") {
+                    st.magLo = lo, st.magHi = hi, st.magBoxKnown = true;
+                } else {
+                    st.slideLo = lo, st.slideHi = hi, st.slideBoxKnown = true;
+                }
+                ++used;
+            } else if (words[0] == "well" && words.size() >= 5 && words[1] == "side" && words[3] == "ahead") {
+                st.zoneCatchSide = num(2);
+                st.zoneCatchAhead = num(4);
+                ++used;
+            }
+        }
+        st.zonesFromFile = used > 0;
+        note("ZONES: %s read, %d zones (magazine (%.1f %.1f %.1f)..(%.1f %.1f %.1f), slide (%.1f %.1f %.1f)..(%.1f %.1f %.1f), well side %.1f ahead %.1f)", path, used,
+            st.magLo.x, st.magLo.y, st.magLo.z, st.magHi.x, st.magHi.y, st.magHi.z, st.slideLo.x, st.slideLo.y, st.slideLo.z, st.slideHi.x, st.slideHi.y,
+            st.slideHi.z, st.zoneCatchSide, st.zoneCatchAhead);
     }
 
     // ------------------------------------------------------------ magazines as real objects
@@ -2172,9 +2251,9 @@ namespace
                     const float tilt = dot(axisOf(node, 2), axisWorld(root));
                     const bool upright = tilt < (g_settings.core2 ? -0.7f : -0.5f);
                     const float mouth = st.length;
-                    const float sideMax = g_settings.core2 ? g_settings.catchSide : g_settings.wellSide;
+                    const float sideMax = g_settings.core2 ? (st.zoneCatchSide > 0.0f ? st.zoneCatchSide : g_settings.catchSide) : g_settings.wellSide;
                     const float below = g_settings.core2 ? 1.5f : 3.0f;
-                    const float ahead = g_settings.core2 ? g_settings.catchAhead : g_settings.captureAhead;
+                    const float ahead = g_settings.core2 ? (st.zoneCatchAhead > 0.0f ? st.zoneCatchAhead : g_settings.catchAhead) : g_settings.captureAhead;
                     if (upright && side <= sideMax && top <= mouth + ahead && top >= mouth - below) {
                         st.rounds = loose.rounds;
                         st.place = kRailHand;
@@ -3742,6 +3821,10 @@ namespace
             learnRail(root, magazine);
         }
         useRockBoxes(root, bolt, quiet && gun.data->ammoCount > 0);
+        if (g_settings.core2 && !st.zonesChecked && st.magBoxKnown && (st.slideBoxKnown || !looksLikeObject(bolt))) {
+            st.zonesChecked = true;
+            zonesFor(gun.weapon->GetFormID());
+        }
         if (g_settings.core2 && st.idleKnown && looksLikeObject(magazine) && st.place == kSeated) {
             magazine->local = st.idle[0];   // seated: always where it sits at rest (the game's reload moves it away)
             refreshSubtree(magazine, RE::NiPoint3{});
