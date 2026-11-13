@@ -35,7 +35,7 @@ IDS = {'MRF_Mag10mm': 0x800, 'MRF_Mag10mmLarge': 0x801, 'MRF_SndIn': 0x802, 'MRF
        'MRF_MagPipeShort': 0x817, 'MRF_MagPipe': 0x818, 'MRF_MagPipeDrum': 0x819,
        'MRF_MagCombatShotgunSmall': 0x81A, 'MRF_MagCombatShotgun': 0x81B, 'MRF_MagCombatShotgunDrum': 0x81C,
        'MRF_MagHuntingSmall': 0x81D, 'MRF_MagHuntingMedium': 0x81E, 'MRF_MagHuntingLarge': 0x81F,
-       'MRF_MagLaserCell': 0x820}
+       'MRF_MagLaserCell': 0x820, 'MRF_MagSyringer': 0x821, 'MRF_MagFusionCore': 0x822}
 recs = {}
 def add(tag, edid, subs):
     fid = OWN | IDS[edid]
@@ -62,7 +62,9 @@ MODELS = [('10mm', 'Weapons\\10mmPistol\\10mmMag01.nif', '10mm Magazine'),
           ('HuntingSmall', 'Ammo\\308\\308SmallMag.nif', 'Hunting Rifle Magazine'),
           ('HuntingMedium', 'Ammo\\308\\308MediumMag.nif', 'Hunting Rifle Medium Magazine'),
           ('HuntingLarge', 'Ammo\\308\\308LargeMag.nif', 'Hunting Rifle Large Magazine'),
-          ('LaserCell', 'Weapons\\LaserWeapons\\FusionCell.nif', 'Laser Gun Fusion Cell')]
+          ('LaserCell', 'Weapons\\LaserWeapons\\FusionCell.nif', 'Laser Gun Fusion Cell'),
+          ('Syringer', 'Weapons\\HandMade\\Magazines\\SyringerMag.nif', 'Syringer Magazine'),
+          ('FusionCore', 'Ammo\\FusionCore\\FusionCore.nif', 'Gatling Laser Fusion Core')]
 mags = [add('MISC', 'MRF_Mag' + k, [sub('OBND', b'\0' * 12), sub('FULL', zstr(name)), sub('MODL', zstr(model)),
                                     sub('DATA', struct.pack('<If', 0, 0.0))]) for k, model, name in MODELS]
 
