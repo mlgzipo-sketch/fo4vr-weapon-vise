@@ -1667,7 +1667,8 @@ namespace
             if (!out) {
                 return;
             }
-            const auto mouth = st.magRest.translate + st.axis * st.length + RE::NiPoint3{ 0.0f, 0.0f, 0.0f };
+            const float scale = st.magRest.scale > 0.0f ? st.magRest.scale : 1.0f;
+            const auto mouth = st.magRest.translate + st.axis * (st.length - st.topAt * scale);   // the magazine's top as it leaves the well
             char text[256];
             out << "; ManualReloadF zones of weapon " << std::hex << weapon << std::dec << ", gun root frame (game units). Edit, or move the cubes in Blender.\n";
             std::snprintf(text, sizeof(text), "magazine lo %.3f %.3f %.3f hi %.3f %.3f %.3f\n", st.magLo.x, st.magLo.y, st.magLo.z, st.magHi.x, st.magHi.y, st.magHi.z);
@@ -1710,6 +1711,17 @@ namespace
                     st.slideLo = lo, st.slideHi = hi, st.slideBoxKnown = true;
                 }
                 ++used;
+            } else if (words[0] == "well" && words.size() >= 9 && words[1] == "mouth" && words[5] == "axis") {
+                const RE::NiPoint3 mouth{ num(2), num(3), num(4) };
+                const RE::NiPoint3 axis{ num(6), num(7), num(8) };
+                if (dot(axis, axis) > 0.25f) {
+                    st.axis = normalized(axis);
+                    const float scale = st.magRest.scale > 0.0f ? st.magRest.scale : 1.0f;
+                    st.length = std::max(2.0f, dot(mouth - st.magRest.translate, st.axis) + st.topAt * scale);
+                    note("ZONES: the well's mouth at (%.1f %.1f %.1f), way out (%.2f %.2f %.2f): the magazine leaves it after %.1f", mouth.x, mouth.y, mouth.z,
+                        st.axis.x, st.axis.y, st.axis.z, st.length);
+                    ++used;
+                }
             } else if (words[0] == "well" && words.size() >= 5 && words[1] == "side" && words[3] == "ahead") {
                 st.zoneCatchSide = num(2);
                 st.zoneCatchAhead = num(4);
