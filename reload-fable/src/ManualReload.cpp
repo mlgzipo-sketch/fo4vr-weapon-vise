@@ -3621,13 +3621,13 @@ namespace
         };
         const auto handle = rotateAbout(st.crankStart - st.crankCenter, axis, st.crankAngle) + st.crankCenter;
         const float scale = gunScale(root);
-        const bool near = spare.valid && distance(inRoot(spare.palm), handle) < 4.5f;
+        const bool onHandle = spare.valid && distance(inRoot(spare.palm), handle) < 4.5f;
         const bool press = spare.valid && spare.grip && !spare.previousGrip;
         if (!spare.grip) {
-            st.armReason = near ? kArmBlock : kArmNone;
-            griphook::setArmed(near);   // the grip on the handle is ours, not a second-hand hold
+            st.armReason = onHandle ? kArmBlock : kArmNone;
+            griphook::setArmed(onHandle);   // the grip on the handle is ours, not a second-hand hold
         }
-        if (press && near && griphook::owned()) {
+        if (press && onHandle && griphook::owned()) {
             st.crankHeld = true;
             st.crankPrev = handAngle(spare.palm);
             buzz(freeIndex(), 700);
