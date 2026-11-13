@@ -35,6 +35,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -1257,6 +1258,66 @@ namespace
         RE::NiMatrix3 rotation{};
     };
 
+    // A way drawn in Blender whose first points lie on a circle: that part turns (about `axis` through `pivot`, by
+    // `angle`, over the first `arcAt` of the way), the rest of the way is a straight move.
+    struct ArcFit
+    {
+        bool         arc{ false };
+        RE::NiPoint3 axis{}, pivot{};
+        float        angle{ 0.0f };
+        float        arcAt{ 0.0f };
+        std::size_t  k{ 0 };
+    };
+
+    RE::NiPoint3 rotateAbout(const RE::NiPoint3& v, const RE::NiPoint3& axis, float angle) noexcept
+    {
+        const float c = std::cos(angle), s = std::sin(angle);
+        return v * c + cross(axis, v) * s + axis * (dot(axis, v) * (1.0f - c));
+    }
+
+    ArcFit fitArc(const std::vector<RE::NiPoint3>& p, const std::vector<float>& at) noexcept
+    {
+        ArcFit fit{};
+        for (std::size_t k = p.size() - 1; p.size() >= 3 && k >= 2; --k) {
+            const auto a = p[0], b = p[k / 2], c = p[k];
+            const auto ab = b - a, ac = c - a;
+            const auto nrm = cross(ab, ac);
+            const float n2 = dot(nrm, nrm);
+            if (n2 < 1e-4f) {
+                continue;
+            }
+            const auto center = a + (cross(nrm, ab) * dot(ac, ac) + cross(ac, nrm) * dot(ab, ab)) * (1.0f / (2.0f * n2));
+            const float r = distance(a, center);
+            const auto axis = normalized(nrm);
+            bool ok = r > 0.3f && r < 60.0f;
+            for (std::size_t i = 0; ok && i <= k; ++i) {
+                ok = std::fabs(distance(p[i], center) - r) < 0.08f * r + 0.05f && std::fabs(dot(p[i] - a, axis)) < 0.1f;
+            }
+            if (!ok) {
+                continue;
+            }
+            const auto u = a - center, v = c - center;
+            fit.angle = std::atan2(dot(cross(u, v), axis), dot(u, v));
+            fit.axis = fit.angle < 0.0f ? axis * -1.0f : axis;
+            fit.angle = std::fabs(fit.angle);
+            fit.pivot = center;
+            fit.arc = fit.angle > 0.05f;
+            fit.arcAt = k < at.size() ? at[k] : 1.0f;
+            fit.k = k;
+            return fit;
+        }
+        return fit;
+    }
+
+    // `rest` (a part, gun root frame) turned about axis/pivot by angle, then moved by lin.
+    RE::NiTransform turnedPose(const RE::NiTransform& rest, const RE::NiPoint3& axis, const RE::NiPoint3& pivot, float angle, const RE::NiPoint3& lin) noexcept
+    {
+        RE::NiTransform out = rest;
+        out.translate = rotateAbout(rest.translate - pivot, axis, angle) + pivot + lin;
+        setRows(out, rotateAbout(axisOf(rest, 0), axis, angle), rotateAbout(axisOf(rest, 1), axis, angle), rotateAbout(axisOf(rest, 2), axis, angle));
+        return out;
+    }
+
     // Guns that open instead of taking a magazine: a revolver's cylinder swings out, a break-action gun folds.
     struct Breech
     {
@@ -1388,6 +1449,8 @@ namespace
         std::vector<float> routeAt;                        // ..each point's share of the way's length (0..1)
         std::unordered_map<std::string, std::pair<RE::NiPoint3, RE::NiPoint3>> zoneBoxes;   // zones file: "box NAME lo .. hi .."
         std::vector<RE::NiPoint3> chambers;                // zones file: "point chamberN x y z" (the closed gun)
+        ArcFit             slideFit{};                     // the slide's way: a turn first (a bolt handle lifted), then straight
+        ArcFit             zoneHinge{};                    // zones file "route cylinder/barrels/breech": the opening part's turn
         bool               magBoxKnown{ false };
         RE::NiPoint3       magLo{}, magHi{};
         bool               pushing{ false };               // the open palm moves the slide / bolt
@@ -1667,6 +1730,47 @@ namespace
     //   well mouth x y z axis x y z    (written for reference: where the magazine's top leaves the well, the way out)
     //   slide route x y z x y z ...   the slide / charging handle's way (first point at rest), instead of the recorded one
     // Written from what ROCK measured when there is no file; read instead of it when there is.
+    // At equip: the opening part's turn drawn in Blender (route cylinder / barrels / breech), so a gun opens by
+    // hand even with no recording of the game's reload.
+    void loadZoneRoutes(std::uint32_t weapon) noexcept
+    {
+        auto& st = g_state;
+        char path[160];
+        std::snprintf(path, sizeof(path), "Data/F4SE/Plugins/ManualReloadF_zones/%08X.txt", weapon);
+        std::ifstream in(path);
+        std::string line;
+        while (in && std::getline(in, line)) {
+            std::istringstream words(line);
+            std::string head, name;
+            words >> head >> name;
+            if (head != "route" || (name != "cylinder" && name != "barrels" && name != "breech")) {
+                continue;
+            }
+            std::vector<RE::NiPoint3> pts;
+            float x, y, z;
+            while (words >> x >> y >> z) {
+                pts.push_back(RE::NiPoint3{ x, y, z });
+            }
+            std::vector<float> at(pts.size(), 0.0f);
+            float total = 0.0f;
+            for (std::size_t i = 1; i < pts.size(); ++i) {
+                total += distance(pts[i], pts[i - 1]);
+                at[i] = total;
+            }
+            for (auto& a : at) {
+                a = total > 0.0f ? a / total : 0.0f;
+            }
+            const auto fit = fitArc(pts, at);
+            if (fit.arc && fit.angle > 0.2f) {
+                st.zoneHinge = fit;
+                note("ZONES: %s opens %.0f deg about (%.2f %.2f %.2f) at (%.1f %.1f %.1f) (route from Blender)", name.c_str(), fit.angle * 57.29578f, fit.axis.x,
+                    fit.axis.y, fit.axis.z, fit.pivot.x, fit.pivot.y, fit.pivot.z);
+            } else {
+                note("ZONES: route %s is not a turn (%zu points): ignored", name.c_str(), pts.size());
+            }
+        }
+    }
+
     void zonesFor(std::uint32_t weapon, bool mayWrite = true) noexcept
     {
         auto& st = g_state;
@@ -1763,7 +1867,13 @@ namespace
                     for (auto& at : st.routeAt) {
                         at /= total;
                     }
-                    note("ZONES: the slide's way from the file: %zu points, %.1f long", st.route.size(), total);
+                    st.slideFit = fitArc(st.route, st.routeAt);
+                    if (st.slideFit.arc && st.slideFit.angle > 0.35f) {
+                        st.boltAction = true;
+                    }
+                    note("ZONES: the slide's way from the file: %zu points, %.1f long; turns %.0f deg about (%.2f %.2f %.2f) at (%.1f %.1f %.1f) over the first %.0f%%",
+                        st.route.size(), total, st.slideFit.angle * 57.29578f, st.slideFit.axis.x, st.slideFit.axis.y, st.slideFit.axis.z, st.slideFit.pivot.x,
+                        st.slideFit.pivot.y, st.slideFit.pivot.z, st.slideFit.arcAt * 100.0f);
                     ++used;
                 } else {
                     st.route.clear();
@@ -3009,6 +3119,39 @@ namespace
         return st.route[j - 1] + (st.route[j] - st.route[j - 1]) * f - st.route[0];
     }
 
+    // Where the slide's way has the part at u: turned by `angle`, moved by `lin`.
+    void routeMotion(float u, float& angle, RE::NiPoint3& lin) noexcept
+    {
+        const auto& st = g_state;
+        const auto& f = st.slideFit;
+        u = std::clamp(u, 0.0f, 1.0f);
+        if (f.arc && f.arcAt > 0.0f && u <= f.arcAt) {
+            angle = f.angle * u / f.arcAt;
+            lin = {};
+            return;
+        }
+        angle = f.arc ? f.angle : 0.0f;
+        lin = routeShift(u) - (f.arc ? st.route[f.k] - st.route[0] : RE::NiPoint3{});
+    }
+
+    RE::NiPoint3 routeApply(float u, const RE::NiPoint3& p) noexcept
+    {
+        float angle;
+        RE::NiPoint3 lin;
+        routeMotion(u, angle, lin);
+        const auto& f = g_state.slideFit;
+        return f.arc ? rotateAbout(p - f.pivot, f.axis, angle) + f.pivot + lin : p + lin;
+    }
+
+    RE::NiPoint3 routeInverse(float u, const RE::NiPoint3& p) noexcept
+    {
+        float angle;
+        RE::NiPoint3 lin;
+        routeMotion(u, angle, lin);
+        const auto& f = g_state.slideFit;
+        return f.arc ? rotateAbout(p - lin - f.pivot, f.axis, -angle) + f.pivot : p - lin;
+    }
+
     bool boltPathFor(const Gun& gun) noexcept
     {
         if (!gun.weapon) {
@@ -3052,7 +3195,7 @@ namespace
             auto wayPoint = [&](float s) {
                 s = std::clamp(s, 0.0f, 1.0f);
                 if (route) {
-                    return st.handInBolt + routeShift(s);
+                    return routeApply(s, st.handInBolt);
                 }
                 if (path) {
                     return compose(boltWay(s), pointTransform(st.handInBolt)).translate;
@@ -3071,7 +3214,7 @@ namespace
             const auto palmLocal = inGun(root, spare.palm);
             bool onSlide = false;
             if (spare.valid) {
-                onSlide = st.slideBoxKnown ? inBox(st.slideLo, st.slideHi, palmLocal - shiftNow(), g_settings.contactMargin)
+                onSlide = st.slideBoxKnown ? inBox(st.slideLo, st.slideHi, route ? routeInverse(s0, palmLocal) : palmLocal - shiftNow(), g_settings.contactMargin)
                                            : distance(spare.palm, slideGrabPoint(root, bolt)) < g_settings.slideGrabRadius;
             }
             const bool magFirst = st.place == kRailAuto && palmOnMagazine(root, spare.palm);   // a magazine sticking out comes first
@@ -3080,7 +3223,7 @@ namespace
             auto anchor = [&]() {
                 // the hand's point on the part, kept as the part moves: the way the hand goes is this point's way
                 if (route) {
-                    st.handInBolt = handLocal - routeShift(s0);
+                    st.handInBolt = routeInverse(s0, handLocal);
                 } else if (path) {
                     st.handInBolt = relative(boltWay(s0), pointTransform(handLocal)).translate;
                 } else {
@@ -3219,8 +3362,16 @@ namespace
             note("RACK: slide home, chamber %s, magazine %u", st.chamber ? "loaded" : "empty", st.rounds);
         }
         if (route) {
-            if (st.rackPull > 0.0f || st.racking) {
-                refreshSubtree(bolt, directionToWorld(root->world, routeShift(st.rackPull / travel)) * scale);
+            if ((st.rackPull > 0.0f || st.racking) && looksLikeObject(bolt->parent)) {
+                // the bolt stands at rest here (set before): turn it and move it along the way
+                const auto rest = relative(root->world, bolt->world);
+                float angle;
+                RE::NiPoint3 lin;
+                routeMotion(st.rackPull / travel, angle, lin);
+                const auto& f = st.slideFit;
+                const auto posed = f.arc ? turnedPose(rest, f.axis, f.pivot, angle, lin) : turnedPose(rest, RE::NiPoint3{ 0.0f, 0.0f, 1.0f }, RE::NiPoint3{}, 0.0f, lin);
+                bolt->local = relative(bolt->parent->world, compose(root->world, posed));
+                refreshSubtree(bolt, RE::NiPoint3{});
             }
         } else if (path) {
             if (st.rackPull > 0.0f || st.racking) {
@@ -3375,6 +3526,13 @@ namespace
         }
         const bool revolver = b.mech == 1;
         const bool played = gun.weapon && loadPlayed(gun.weapon->GetFormID());
+        const bool zoneHinge = !played && st.zoneHinge.arc;   // no recording: the turn drawn in Blender
+        if (zoneHinge) {
+            g_play.axis = st.zoneHinge.axis;
+            g_play.pivot = st.zoneHinge.pivot;
+            g_play.openAngle = st.zoneHinge.angle;
+        }
+        const bool hinged = played || zoneHinge;
         std::array<RE::NiAVObject*, 5> child{};
         for (int i = 0; i < 5; ++i) {
             char name[32]{};
@@ -3383,7 +3541,11 @@ namespace
         }
         const auto gunState = static_cast<std::uint32_t>(player->gunState);
         const auto reloading = static_cast<std::uint32_t>(g_settings.reloadGunState);
-        if (gunState == reloading && st.lastGunState != reloading) {
+        const bool reloadStarted = gunState == reloading && st.lastGunState != reloading;
+        if (gunState != st.lastGunState) {
+            detail("gunState %u -> %u", st.lastGunState, gunState);
+        }
+        if (reloadStarted) {
             b.freezeUntil = now + std::chrono::milliseconds(static_cast<int>(g_settings.freezeSeconds * 1000.0f));
         }
         st.lastGunState = gunState;
@@ -3474,6 +3636,16 @@ namespace
                 buzz(g_settings.gunHand, 1200);
                 note("OPEN: %u rounds, %u fired cases", b.live, b.spent);
             }
+        } else if (reloadStarted && !b.open && b.known && !menuOpen()) {
+            // the game's own reload began (its button, however it was pressed): the gun opens instead
+            b.open = true;
+            b.opened = now;
+            b.toggled = now + std::chrono::milliseconds(800);   // the release of that same press does not close it
+            gun.data->ammoCount = 0;
+            b.lastAmmo = 0;
+            playSound(1);
+            buzz(g_settings.gunHand, 1200);
+            note("OPEN (the game's reload began): %u rounds, %u fired cases", b.live, b.spent);
         }
         if (!b.driving && !b.pushing) {
             b.t = approach(b.t, b.open ? 1.0f : 0.0f, 7.0f * dt);
@@ -3484,7 +3656,7 @@ namespace
             mag->local = b.rest;
             if (b.t > 0.0f) {
                 const float eased = b.t * b.t * (3.0f - 2.0f * b.t);
-                if (!played) {
+                if (!hinged) {
                     turnRows(mag->local.rotate, revolver ? 1 : 0, (revolver ? g_settings.cylinderSwing : g_settings.breakAngle) * 0.01745329f * eased);
                 }
             }
@@ -3497,6 +3669,12 @@ namespace
             if (played) {
                 const float eased = b.driving ? b.t : b.t * b.t * (3.0f - 2.0f * b.t);
                 posePlayed(root, eased);
+            } else if (zoneHinge && b.t > 0.0f) {
+                // turned about the hinge drawn in Blender, from where it stands closed
+                const float eased = b.driving ? b.t : b.t * b.t * (3.0f - 2.0f * b.t);
+                const auto posed = turnedPose(b.restInRoot, st.zoneHinge.axis, st.zoneHinge.pivot, st.zoneHinge.angle * eased, RE::NiPoint3{});
+                mag->local = relative(mag->parent->world, compose(root->world, posed));
+                refreshSubtree(mag, RE::NiPoint3{});
             }
         }
 
@@ -3568,13 +3746,13 @@ namespace
                     buzz(freeIndex(), 1200);
                     note("BELT: %u round(s) in the free hand", take);
                 }
-            } else if (played && !atBelt && b.held == 0 && touchesPart(14.0f)) {
+            } else if (hinged && !atBelt && b.held == 0 && touchesPart(14.0f)) {
                 b.driving = true;
                 b.driveAngle0 = hingeAngle(root, spare.palm);
                 b.driveT0 = b.t;
                 buzz(freeIndex(), 800);
                 detail("The free hand takes the opening part at %.2f open", b.t);
-            } else if (!played && !atBelt && b.held == 0 && fullyOpen && toGun < 12.0f * scale) {
+            } else if (!hinged && !atBelt && b.held == 0 && fullyOpen && toGun < 12.0f * scale) {
                 close("the free hand");
             }
         }
@@ -3599,7 +3777,7 @@ namespace
             }
         }
         // the open palm pushes it shut (no grip needed): only a move towards closed carries it
-        const bool touching = played && b.open && !b.driving && b.held == 0 && spare.valid && !spare.grip && !atBelt &&
+        const bool touching = hinged && b.open && !b.driving && b.held == 0 && spare.valid && !spare.grip && !atBelt &&
                               touchesPart(8.0f);
         if (touching) {
             const float angle = hingeAngle(root, spare.palm);
@@ -3808,9 +3986,12 @@ namespace
             st.kind = kind >= 0 ? kind : (capacityOf(gun) > 12 ? 1 : 0);
             note("Equipped weapon %08X, capacity %u, rounds %u, magazine '%s' (kind %d): %s", gun.weapon ? gun.weapon->GetFormID() : 0u,
                 capacityOf(gun), total, magModel.c_str(), kind, st.managed ? "reloaded by hand" : "not handled (no magazine of group 1)");
+            if (gun.weapon) {
+                loadZoneRoutes(gun.weapon->GetFormID());
+            }
         }
 
-        const bool unrecorded = g_settings.autoRecord && gun.weapon && gun.data && gun.data->ammo && !hasRecording(gun.weapon->GetFormID());
+        const bool unrecorded = g_settings.autoRecord && gun.weapon && gun.data && gun.data->ammo && !hasRecording(gun.weapon->GetFormID()) && !st.zoneHinge.arc;
         if (g_settings.recordAnim || unrecorded || g_rec.active) {
             static Clock::time_point toldAt{};
             if (now - toldAt > std::chrono::seconds(10)) {
@@ -4396,7 +4577,9 @@ namespace
                     toMag = st.place == kRailAuto && st.railKnown && palmOnMagazine(root, free.palm) ? 0.0f : 1e9f;
                     if (toMag > 0.0f && looksLikeObject(bolt) && st.slideBoxKnown) {
                         const float pull = st.rackPull;
-                        const auto shift = hasRoute() ? routeShift(pull / std::max(g_settings.rackTravel, 0.1f))
+                        const float pullU = pull / std::max(g_settings.rackTravel, 0.1f);
+                        const auto palmIn = inGun(root, free.palm);
+                        const auto shift = hasRoute() ? palmIn - routeInverse(pullU, palmIn)
                                          : g_settings.recordedBolt && g_play.parsed && g_play.boltKnown && g_play.weapon == gun.weapon->GetFormID()
                                                ? boltWay(pull / std::max(g_settings.rackTravel, 0.1f)).translate - boltWay(0.0f).translate
                                                : RE::NiPoint3{ 0.0f, -pull, 0.0f };
