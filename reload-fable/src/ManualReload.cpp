@@ -139,6 +139,7 @@ namespace
         float cylinderSwing{ -80.0f };  // how far a revolver's cylinder swings out (degrees; minus = to the gun's left)
         float breakAngle{ -35.0f };     // how far a break-action gun opens (degrees; minus = barrels down)
         float flickSpeed{ 150.0f };     // the gun jerked this fast (game units a second) closes it
+        float flickTurn{ 3.5f };        // ..or turned this fast (a flick of the wrist, radians a second)
         float breechRadius{ 6.0f };     // rounds this close to the open breech go in
         float chamberReach{ 3.0f };     // ..or this close to a chamber of the zones file (gun units)
         bool  holdPoseOnExit{ false };  // a magazine pulled out of the well turns to the pose of one from the belt
@@ -181,7 +182,7 @@ namespace
             { "fHandRadius", 2, &s.handRadius }, { "fLooseLifetime", 2, &s.looseLifetime }, { "iMaxLoose", 1, &s.maxLoose },
             { "bAllGuns", 0, &s.allGuns }, { "bRockParts", 0, &s.rockParts }, { "bRockBeltHandover", 0, &s.rockBeltHandover },
             { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bBreech", 0, &s.breech }, { "bRecordAnim", 0, &s.recordAnim }, { "bAutoRecord", 0, &s.autoRecord }, { "bRecordedBolt", 0, &s.recordedBolt }, { "bRealInHand", 0, &s.realInHand }, { "bCore2", 0, &s.core2 }, { "fContactMargin", 2, &s.contactMargin }, { "iMarkButton", 1, &s.markButton }, { "bStopEmptyReload", 0, &s.stopEmptyReload }, { "fCatchSide", 2, &s.catchSide }, { "fCatchAhead", 2, &s.catchAhead }, { "fPushFactor", 2, &s.pushFactor }, { "bTraceState", 0, &s.traceState }, { "fCylinderSwing", 2, &s.cylinderSwing },
-            { "fBreakAngle", 2, &s.breakAngle }, { "fFlickSpeed", 2, &s.flickSpeed }, { "fBreechRadius", 2, &s.breechRadius }, { "fChamberReach", 2, &s.chamberReach }, { "bRockPlacesHeld", 0, &s.rockPlacesHeld }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
+            { "fBreakAngle", 2, &s.breakAngle }, { "fFlickSpeed", 2, &s.flickSpeed }, { "fFlickTurn", 2, &s.flickTurn }, { "fBreechRadius", 2, &s.breechRadius }, { "fChamberReach", 2, &s.chamberReach }, { "bRockPlacesHeld", 0, &s.rockPlacesHeld }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
             { "fChamberForward", 2, &s.chamberForward }, { "fRoundUp", 2, &s.roundUp }, { "fRoundRotX", 2, &s.roundRotX },
             { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale },
         };
@@ -1346,6 +1347,11 @@ namespace
         RE::NiTransform   restInRoot{};       // the opening part closed, in the gun root's frame (zones are drawn there)
         RE::NiTransform   drawnLocal{};       // ..as drawn last frame (opened): ROCK's collision follows it
         bool              drawn{ false };
+        RE::NiPoint3      prevForward{}, prevSide{};   // the gun's turn last frame (a flick of the wrist closes it)
+        bool              turnKnown{ false };
+        float             ejectPushed{ 0.0f };          // how far the hand has pushed the ejector rod
+        RE::NiPoint3      ejectPrev{};
+        bool              ejectTouch{ false };
     };
 
     struct State
@@ -1451,6 +1457,7 @@ namespace
         std::vector<float> routeAt;                        // ..each point's share of the way's length (0..1)
         std::unordered_map<std::string, std::pair<RE::NiPoint3, RE::NiPoint3>> zoneBoxes;   // zones file: "box NAME lo .. hi .."
         std::vector<RE::NiPoint3> chambers;                // zones file: "point chamberN x y z" (the closed gun)
+        std::unordered_map<std::string, std::vector<RE::NiPoint3>> zoneRoutes;   // zones file: "route NAME x y z .."
         ArcFit             slideFit{};                     // the slide's way: a turn first (a bolt handle lifted), then straight
         ArcFit             zoneHinge{};                    // zones file "route cylinder/barrels/breech": the opening part's turn
         bool               magBoxKnown{ false };
@@ -1852,6 +1859,13 @@ namespace
                 const RE::NiPoint3 hi{ std::max(num(3), num(7)), std::max(num(4), num(8)), std::max(num(5), num(9)) };
                 st.zoneBoxes[words[1]] = { lo, hi };
                 note("ZONES: box %s (%.1f %.1f %.1f)..(%.1f %.1f %.1f)", words[1].c_str(), lo.x, lo.y, lo.z, hi.x, hi.y, hi.z);
+                ++used;
+            } else if (words[0] == "route" && words.size() >= 8) {
+                auto& pts = st.zoneRoutes[words[1]];
+                pts.clear();
+                for (std::size_t i = 2; i + 2 < words.size(); i += 3) {
+                    pts.push_back(RE::NiPoint3{ num(i), num(i + 1), num(i + 2) });
+                }
                 ++used;
             } else if (words[0] == "point" && words.size() >= 5 && words[1].rfind("chamber", 0) == 0) {
                 st.chambers.push_back(RE::NiPoint3{ num(2), num(3), num(4) });
@@ -3726,15 +3740,58 @@ namespace
             const auto inPart = relative(mag->world, pointTransform(palmWorld));
             return compose(b.restInRoot, inPart).translate;
         };
+        // the whole hand, not one point: wrist, palm, fingers, fingertips
+        const auto fingers = spare.palm - spare.wrist.translate;
+        const std::array<RE::NiPoint3, 4> handPoints{ spare.wrist.translate, spare.palm, spare.palm + fingers * 0.8f, spare.palm + fingers * 1.5f };
+        const auto handIn = [&](const std::pair<RE::NiPoint3, RE::NiPoint3>& box, float margin, RE::NiPoint3* where) {
+            for (const auto& point : handPoints) {
+                const auto at = palmOnPart(point);
+                if (inBox(box.first, box.second, at, margin)) {
+                    if (where) *where = at;
+                    return true;
+                }
+            }
+            return false;
+        };
         const auto touchesPart = [&](float fallback) {
             if (!spare.valid) {
                 return false;
             }
             if (partZone) {
-                return inBox(partZone->first, partZone->second, palmOnPart(spare.palm), g_settings.contactMargin);
+                return handIn(*partZone, g_settings.contactMargin, nullptr);
             }
             return distance(spare.palm, mag->world.translate) < fallback * scale;
         };
+
+        // the ejector rod (zones file: box + route "ejector"): pushed along its way by the hand, it throws out what is in
+        if (const auto box = st.zoneBoxes.find("ejector"), way = st.zoneRoutes.find("ejector");
+            fullyOpen && spare.valid && box != st.zoneBoxes.end() && way != st.zoneRoutes.end() && way->second.size() >= 2) {
+            RE::NiPoint3 at{};
+            const bool touch = handIn(box->second, 1.5f, &at);
+            if (touch) {
+                const auto run = way->second.back() - way->second.front();
+                const float length = std::sqrt(dot(run, run));
+                if (b.ejectTouch && length > 0.1f) {
+                    b.ejectPushed = std::max(0.0f, b.ejectPushed + dot(at - b.ejectPrev, run * (1.0f / length)));
+                    if (b.ejectPushed > 0.6f * length && b.live + b.spent > 0) {
+                        note("EJECTOR: pushed %.1f of %.1f: %u rounds back to the pouch, %u fired cases out", b.ejectPushed, length, b.live, b.spent);
+                        if (b.live > 0) {
+                            hud("Патроны выброшены и вернулись в запас");
+                        }
+                        b.live = 0;
+                        b.spent = 0;
+                        b.ejectPushed = 0.0f;
+                        playSound(4);
+                        buzz(freeIndex(), 1500);
+                        buzz(g_settings.gunHand, 1500);
+                    }
+                }
+                b.ejectPrev = at;
+            } else {
+                b.ejectPushed = 0.0f;
+            }
+            b.ejectTouch = touch;
+        }
 
         // muzzle up: everything falls out
         if (fullyOpen && b.live + b.spent > 0 && barrel.z > (revolver ? 0.5f : 0.3f) && now - b.opened > std::chrono::milliseconds(350)) {
@@ -3862,10 +3919,21 @@ namespace
             buzz(1, 2000);
             griphook::setOwned(false);
         }
-        if (fullyOpen && b.held == 0 && now - b.opened > std::chrono::milliseconds(700)) {
+        // a flick of the wrist: a revolver rolled sharply about its barrel, a break action's muzzle snapped up
+        const auto forwardNow = axisOf(root->world, 1);
+        const auto sideNow = axisOf(root->world, 0);
+        float flick = 0.0f;
+        if (b.turnKnown && dt > 1e-4f) {
+            flick = revolver ? std::fabs(sideNow.z - b.prevSide.z) / dt : (forwardNow.z - b.prevForward.z) / dt;
+        }
+        b.prevForward = forwardNow;
+        b.prevSide = sideNow;
+        b.turnKnown = true;
+        if (fullyOpen && b.held == 0 && !b.driving && now - b.opened > std::chrono::milliseconds(600)) {
             const float jerk = revolver ? std::fabs(dot(b.velocity, axisOf(root->world, 0))) : b.velocity.z;
-            if (jerk > g_settings.flickSpeed * scale && !(barrel.z > 0.3f && b.live + b.spent > 0)) {
-                close("a jerk of the gun");
+            if ((jerk > g_settings.flickSpeed * scale || flick > g_settings.flickTurn) && !(barrel.z > 0.3f && b.live + b.spent > 0)) {
+                note("Flick: moved %.0f, turned %.1f/s", jerk / std::max(scale, 0.01f), flick);
+                close("a flick of the gun");
             }
         }
 
