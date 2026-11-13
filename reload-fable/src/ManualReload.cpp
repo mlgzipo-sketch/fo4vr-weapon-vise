@@ -379,6 +379,8 @@ namespace
 
     // Guns with a detachable magazine and a slide / bolt / charging handle (group 1). A gun is handled when the
     // magazine mod it wears has one of these models; the index is the magazine's kind (MRF_Mags order in the ESP).
+    constexpr std::uint32_t kLaserGun = 0x0009983B;
+    constexpr int kLaserCellKind = 19;   // MRF_MagLaserCell, after the 19 magazine models
     constexpr std::array<const char*, 19> kMagModels{
         "weapons\\10mmpistol\\10mmmag01.nif", "weapons\\10mmpistol\\10mmmaglarge.nif",
         "weapons\\machinegun\\mgmagstraight.nif", "weapons\\machinegun\\mgmagdrum.nif",
@@ -1364,6 +1366,8 @@ namespace
         std::uint32_t      lastGunState{ 0xFFFFFFFF };
         bool               chamber{ false };
         bool               hasBolt{ true };               // the model has a WeaponBolt node
+        bool               cellFed{ false };
+        bool               hasZonesFile{ false };         // drawn in Blender: no recording of the game's reload is needed              // an energy gun: the cell feeds it, nothing to rack
         int                kind{ 0 };
         bool               dumped{ false };
         Clock::time_point  equippedAt{};
@@ -1748,6 +1752,7 @@ namespace
         char path[160];
         std::snprintf(path, sizeof(path), "Data/F4SE/Plugins/ManualReloadF_zones/%08X.txt", weapon);
         std::ifstream in(path);
+        st.hasZonesFile = static_cast<bool>(in);
         std::string line;
         while (in && std::getline(in, line)) {
             std::istringstream words(line);
@@ -4083,7 +4088,11 @@ namespace
             dropRound();
             g_round.modelReady = false;
             std::string magModel;
-            const int kind = gun.weapon && gun.data ? magazineKindOf(player, gun.weapon, magModel) : -1;
+            int kind = gun.weapon && gun.data ? magazineKindOf(player, gun.weapon, magModel) : -1;
+            if (kind < 0 && gun.weapon && gun.weapon->GetFormID() == kLaserGun) {
+                kind = kLaserCellKind;   // the laser gun has no magazine mod: its cell is the magazine
+                magModel = "Weapons\\LaserWeapons\\FusionCell.nif";
+            }
             const bool pistol10 = gun.weapon && gun.data && gun.weapon->GetFormID() == k10mmPistol;
             st.managed = gun.weapon && gun.data && (pistol10 || (kind >= 0 && g_settings.allGuns));
             st.equippedAt = now;
@@ -4091,6 +4100,7 @@ namespace
             st.chamber = total > 0;
             st.rounds = total > 0 ? total - 1 : 0;
             st.kind = kind >= 0 ? kind : (capacityOf(gun) > 12 ? 1 : 0);
+            st.cellFed = kind == kLaserCellKind;
             note("Equipped weapon %08X, capacity %u, rounds %u, magazine '%s' (kind %d): %s", gun.weapon ? gun.weapon->GetFormID() : 0u,
                 capacityOf(gun), total, magModel.c_str(), kind, st.managed ? "reloaded by hand" : "not handled (no magazine of group 1)");
             if (gun.weapon) {
@@ -4098,7 +4108,7 @@ namespace
             }
         }
 
-        const bool unrecorded = g_settings.autoRecord && gun.weapon && gun.data && gun.data->ammo && !hasRecording(gun.weapon->GetFormID()) && !st.zoneHinge.arc;
+        const bool unrecorded = g_settings.autoRecord && gun.weapon && gun.data && gun.data->ammo && !hasRecording(gun.weapon->GetFormID()) && !st.zoneHinge.arc && !st.hasZonesFile;
         if (g_settings.recordAnim || unrecorded || g_rec.active) {
             static Clock::time_point toldAt{};
             if (now - toldAt > std::chrono::seconds(10)) {
@@ -4210,7 +4220,7 @@ namespace
             parts[i] = findNamed(root, kMovingParts[i]);
         }
         auto* magazine = parts[0];
-        auto* bolt = parts[1];
+        auto* bolt = st.cellFed ? nullptr : parts[1];   // an energy gun's 'bolt' is not worked by hand
         if (st.hasBolt != looksLikeObject(bolt)) {
             st.hasBolt = looksLikeObject(bolt);
             note("Slide / bolt node: %s", st.hasBolt ? "found" : "none (rounds are chambered by the magazine)");
