@@ -1378,6 +1378,8 @@ namespace
         // core2: the parts as ROCK measured them at rest (gun root frame), the palm touching them
         bool               slideBoxKnown{ false };
         RE::NiPoint3       slideLo{}, slideHi{};
+        std::vector<RE::NiPoint3> route;                   // zones file: the slide / handle's way (a polyline, gun root frame), first point at rest
+        std::vector<float> routeAt;                        // ..each point's share of the way's length (0..1)
         bool               magBoxKnown{ false };
         RE::NiPoint3       magLo{}, magHi{};
         bool               pushing{ false };               // the open palm moves the slide / bolt
@@ -1655,6 +1657,7 @@ namespace
     //   slide lo x y z hi x y z        ..the slide / bolt (at rest)
     //   well side S ahead A            the well catches a magazine this close to its line, from A below the mouth
     //   well mouth x y z axis x y z    (written for reference: where the magazine's top leaves the well, the way out)
+    //   slide route x y z x y z ...   the slide / charging handle's way (first point at rest), instead of the recorded one
     // Written from what ROCK measured when there is no file; read instead of it when there is.
     void zonesFor(std::uint32_t weapon) noexcept
     {
@@ -1723,6 +1726,27 @@ namespace
                     note("ZONES: the well's mouth at (%.1f %.1f %.1f), way out (%.2f %.2f %.2f): the magazine leaves it after %.1f", mouth.x, mouth.y, mouth.z,
                         st.axis.x, st.axis.y, st.axis.z, st.length);
                     ++used;
+                }
+            } else if (words[0] == "slide" && words.size() >= 8 && words[1] == "route") {
+                st.route.clear();
+                for (std::size_t i = 2; i + 2 < words.size(); i += 3) {
+                    st.route.push_back(RE::NiPoint3{ num(i), num(i + 1), num(i + 2) });
+                }
+                st.routeAt.assign(st.route.size(), 0.0f);
+                float total = 0.0f;
+                for (std::size_t i = 1; i < st.route.size(); ++i) {
+                    total += distance(st.route[i], st.route[i - 1]);
+                    st.routeAt[i] = total;
+                }
+                if (st.route.size() >= 2 && total > 0.2f) {
+                    for (auto& at : st.routeAt) {
+                        at /= total;
+                    }
+                    note("ZONES: the slide's way from the file: %zu points, %.1f long", st.route.size(), total);
+                    ++used;
+                } else {
+                    st.route.clear();
+                    st.routeAt.clear();
                 }
             } else if (words[0] == "well" && words.size() >= 5 && words[1] == "side" && words[3] == "ahead") {
                 st.zoneCatchSide = num(2);
@@ -2945,6 +2969,25 @@ namespace
 
     RE::NiTransform boltWay(float s) noexcept { return g_settings.core2 ? boltArc(s) : boltAt(s); }
 
+    // The zones file's way for the slide / handle: how far it stands off its rest at u (0..1 of the way).
+    bool hasRoute() noexcept { return g_settings.core2 && g_state.route.size() >= 2; }
+
+    RE::NiPoint3 routeShift(float u) noexcept
+    {
+        const auto& st = g_state;
+        if (st.route.size() < 2) {
+            return {};
+        }
+        u = std::clamp(u, 0.0f, 1.0f);
+        std::size_t j = 1;
+        while (j + 1 < st.route.size() && st.routeAt[j] < u) {
+            ++j;
+        }
+        const float a = st.routeAt[j - 1], b = st.routeAt[j];
+        const float f = b > a ? std::clamp((u - a) / (b - a), 0.0f, 1.0f) : 1.0f;
+        return st.route[j - 1] + (st.route[j] - st.route[j - 1]) * f - st.route[0];
+    }
+
     bool boltPathFor(const Gun& gun) noexcept
     {
         if (!gun.weapon) {
@@ -2966,7 +3009,8 @@ namespace
         const auto& spare = g_hands[freeIndex()];
         const auto& firing = g_hands[g_settings.gunHand];
         const float scale = gunScale(root);
-        const bool path = g_settings.recordedBolt && boltPathFor(gun) && looksLikeObject(bolt->parent);
+        const bool route = hasRoute();   // the zones file's way wins over the recorded one
+        const bool path = !route && g_settings.recordedBolt && boltPathFor(gun) && looksLikeObject(bolt->parent);
         const float travel = g_settings.rackTravel;
         if (path && !st.boltAction && g_play.boltTurn > 0.35f) {
             st.boltAction = true;
@@ -2986,12 +3030,18 @@ namespace
             const float s0 = std::clamp(st.rackPull / travel, 0.0f, 1.0f);
             auto wayPoint = [&](float s) {
                 s = std::clamp(s, 0.0f, 1.0f);
+                if (route) {
+                    return st.handInBolt + routeShift(s);
+                }
                 if (path) {
                     return compose(boltWay(s), pointTransform(st.handInBolt)).translate;
                 }
                 return st.handInBolt + RE::NiPoint3{ 0.0f, -s * travel, 0.0f };
             };
             auto shiftNow = [&]() {
+                if (route) {
+                    return routeShift(s0);
+                }
                 if (path) {
                     return boltWay(s0).translate - boltWay(0.0f).translate;
                 }
@@ -3008,7 +3058,9 @@ namespace
             const bool mayTouch = spare.valid && !handBusy && !magFirst && !justSeated;
             auto anchor = [&]() {
                 // the hand's point on the part, kept as the part moves: the way the hand goes is this point's way
-                if (path) {
+                if (route) {
+                    st.handInBolt = handLocal - routeShift(s0);
+                } else if (path) {
                     st.handInBolt = relative(boltWay(s0), pointTransform(handLocal)).translate;
                 } else {
                     st.handInBolt = handLocal + RE::NiPoint3{ 0.0f, s0 * travel, 0.0f };
@@ -3145,7 +3197,11 @@ namespace
             buzz(g_settings.gunHand, 1500);
             note("RACK: slide home, chamber %s, magazine %u", st.chamber ? "loaded" : "empty", st.rounds);
         }
-        if (path) {
+        if (route) {
+            if (st.rackPull > 0.0f || st.racking) {
+                refreshSubtree(bolt, directionToWorld(root->world, routeShift(st.rackPull / travel)) * scale);
+            }
+        } else if (path) {
             if (st.rackPull > 0.0f || st.racking) {
                 auto recorded = boltWay(st.rackPull / travel);
                 recorded.scale = bolt->world.scale / scale;
@@ -4282,7 +4338,8 @@ namespace
                     toMag = st.place == kRailAuto && st.railKnown && palmOnMagazine(root, free.palm) ? 0.0f : 1e9f;
                     if (toMag > 0.0f && looksLikeObject(bolt) && st.slideBoxKnown) {
                         const float pull = st.rackPull;
-                        const auto shift = g_settings.recordedBolt && g_play.parsed && g_play.boltKnown && g_play.weapon == gun.weapon->GetFormID()
+                        const auto shift = hasRoute() ? routeShift(pull / std::max(g_settings.rackTravel, 0.1f))
+                                         : g_settings.recordedBolt && g_play.parsed && g_play.boltKnown && g_play.weapon == gun.weapon->GetFormID()
                                                ? boltWay(pull / std::max(g_settings.rackTravel, 0.1f)).translate - boltWay(0.0f).translate
                                                : RE::NiPoint3{ 0.0f, -pull, 0.0f };
                         toSlide = inBox(st.slideLo, st.slideHi, inGun(root, free.palm) - shift, g_settings.contactMargin) ? 0.5f : 1e9f;
