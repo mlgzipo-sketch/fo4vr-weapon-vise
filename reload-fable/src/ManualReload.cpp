@@ -128,6 +128,7 @@ namespace
         float catchSide{ 2.0f };
         float catchAhead{ 9.5f };       // core2: ..and from this far below the mouth (the gun's collision keeps a real magazine out of the well)
         float pushFactor{ 0.45f };      // core2: an open palm moves the slide only this part of the hand's motion (it slips; the grip takes it fully)        // core2: a magazine is caught by the well only this close to its line (from below, not from the side)
+        bool  stopEmptyReload{ true };  // the game's own reload of an empty gun is cut short (its state is set back to idle)
         int   markButton{ 32 };         // the free hand's stick click: writes a numbered mark and the whole state to the log
         bool  traceState{ true };       // every change of what the plugin thinks (where the magazine is, the slide, who holds what)    // the palm this close to a part's box touches it (gun units)
         bool  recordedBolt{ true };     // the bolt / slide moves along the recorded way (a bolt action lifts, then goes back)
@@ -177,7 +178,7 @@ namespace
             { "fSlideGrabRadius", 2, &s.slideGrabRadius }, { "fSlideGrabAt", 2, &s.slideGrabAt }, { "fSlideGrabHigh", 2, &s.slideGrabHigh }, { "fRackTravel", 2, &s.rackTravel }, { "fSlideLockAt", 2, &s.slideLockAt },
             { "fHandRadius", 2, &s.handRadius }, { "fLooseLifetime", 2, &s.looseLifetime }, { "iMaxLoose", 1, &s.maxLoose },
             { "bAllGuns", 0, &s.allGuns }, { "bRockParts", 0, &s.rockParts }, { "bRockBeltHandover", 0, &s.rockBeltHandover },
-            { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bBreech", 0, &s.breech }, { "bRecordAnim", 0, &s.recordAnim }, { "bAutoRecord", 0, &s.autoRecord }, { "bRecordedBolt", 0, &s.recordedBolt }, { "bRealInHand", 0, &s.realInHand }, { "bCore2", 0, &s.core2 }, { "fContactMargin", 2, &s.contactMargin }, { "iMarkButton", 1, &s.markButton }, { "fCatchSide", 2, &s.catchSide }, { "fCatchAhead", 2, &s.catchAhead }, { "fPushFactor", 2, &s.pushFactor }, { "bTraceState", 0, &s.traceState }, { "fCylinderSwing", 2, &s.cylinderSwing },
+            { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bBreech", 0, &s.breech }, { "bRecordAnim", 0, &s.recordAnim }, { "bAutoRecord", 0, &s.autoRecord }, { "bRecordedBolt", 0, &s.recordedBolt }, { "bRealInHand", 0, &s.realInHand }, { "bCore2", 0, &s.core2 }, { "fContactMargin", 2, &s.contactMargin }, { "iMarkButton", 1, &s.markButton }, { "bStopEmptyReload", 0, &s.stopEmptyReload }, { "fCatchSide", 2, &s.catchSide }, { "fCatchAhead", 2, &s.catchAhead }, { "fPushFactor", 2, &s.pushFactor }, { "bTraceState", 0, &s.traceState }, { "fCylinderSwing", 2, &s.cylinderSwing },
             { "fBreakAngle", 2, &s.breakAngle }, { "fFlickSpeed", 2, &s.flickSpeed }, { "fBreechRadius", 2, &s.breechRadius }, { "bRockPlacesHeld", 0, &s.rockPlacesHeld }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
             { "fChamberForward", 2, &s.chamberForward }, { "fRoundUp", 2, &s.roundUp }, { "fRoundRotX", 2, &s.roundRotX },
             { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale },
@@ -1390,6 +1391,7 @@ namespace
         int                grabTries{ 0 };
         bool               grabDone{ false };
         float              exitAt{ 0.0f };
+        Clock::time_point  stopReloadUntil{};             // the game's reload of an empty gun is being cut short
         bool               zonesChecked{ false };          // ManualReloadF_zones/<weapon>.txt read (or written) for this gun
         bool               zonesFromFile{ false };
         float              zoneCatchSide{ -1.0f };
@@ -3902,6 +3904,13 @@ namespace
                 startEject(gun, true, now);
             }
         }
+        if (now < st.stopReloadUntil && gunState == reloading) {
+            static int cut = 0;
+            player->gunState = static_cast<RE::GUN_STATE>(g_settings.idleGunState);
+            if (++cut % 30 == 1) {
+                note("The game's reload of an empty gun is cut short (gunState %u -> %d)", gunState, g_settings.idleGunState);
+            }
+        }
         if (pressed && g_settings.blockReload) {
             st.freezeUntil = now + std::chrono::milliseconds(static_cast<int>(g_settings.freezeSeconds * 1000.0f));
             const bool byButton = now - st.buttonEdge < std::chrono::milliseconds(700);
@@ -3909,6 +3918,9 @@ namespace
             if (!byButton && (triggerHeld || justEmptied)) {
                 // the game reloads by itself when the trigger is pulled on an empty gun: a dry click, not a reload
                 logNote("The game's own reload of an empty gun: ignored");
+                if (g_settings.stopEmptyReload) {
+                    st.stopReloadUntil = now + std::chrono::milliseconds(1500);
+                }
             } else if (st.place == kSeated) {
                 if (ready) {
                     startEject(gun, false, now);
