@@ -139,6 +139,7 @@ namespace
         float breakAngle{ -35.0f };     // how far a break-action gun opens (degrees; minus = barrels down)
         float flickSpeed{ 150.0f };     // the gun jerked this fast (game units a second) closes it
         float breechRadius{ 6.0f };     // rounds this close to the open breech go in
+        float chamberReach{ 3.0f };     // ..or this close to a chamber of the zones file (gun units)
         bool  holdPoseOnExit{ false };  // a magazine pulled out of the well turns to the pose of one from the belt
         bool  nativeSound{ true };      // sounds played by the plugin (the script's Sound objects are not heard)
         int   soundFlags{ 16 };
@@ -179,7 +180,7 @@ namespace
             { "fHandRadius", 2, &s.handRadius }, { "fLooseLifetime", 2, &s.looseLifetime }, { "iMaxLoose", 1, &s.maxLoose },
             { "bAllGuns", 0, &s.allGuns }, { "bRockParts", 0, &s.rockParts }, { "bRockBeltHandover", 0, &s.rockBeltHandover },
             { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bBreech", 0, &s.breech }, { "bRecordAnim", 0, &s.recordAnim }, { "bAutoRecord", 0, &s.autoRecord }, { "bRecordedBolt", 0, &s.recordedBolt }, { "bRealInHand", 0, &s.realInHand }, { "bCore2", 0, &s.core2 }, { "fContactMargin", 2, &s.contactMargin }, { "iMarkButton", 1, &s.markButton }, { "bStopEmptyReload", 0, &s.stopEmptyReload }, { "fCatchSide", 2, &s.catchSide }, { "fCatchAhead", 2, &s.catchAhead }, { "fPushFactor", 2, &s.pushFactor }, { "bTraceState", 0, &s.traceState }, { "fCylinderSwing", 2, &s.cylinderSwing },
-            { "fBreakAngle", 2, &s.breakAngle }, { "fFlickSpeed", 2, &s.flickSpeed }, { "fBreechRadius", 2, &s.breechRadius }, { "bRockPlacesHeld", 0, &s.rockPlacesHeld }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
+            { "fBreakAngle", 2, &s.breakAngle }, { "fFlickSpeed", 2, &s.flickSpeed }, { "fBreechRadius", 2, &s.breechRadius }, { "fChamberReach", 2, &s.chamberReach }, { "bRockPlacesHeld", 0, &s.rockPlacesHeld }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
             { "fChamberForward", 2, &s.chamberForward }, { "fRoundUp", 2, &s.roundUp }, { "fRoundRotX", 2, &s.roundRotX },
             { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale },
         };
@@ -422,6 +423,10 @@ namespace
                     std::string name = path;
                     for (auto& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                     if (name.rfind("meshes\\", 0) == 0) name = name.substr(7);
+                    if (name == "weapons\\combatshotgun\\combatriflemagsmall.nif") {
+                        model = path;
+                        return 4;   // the combat rifle's small magazine: handled (and spawned) as its medium one
+                    }
                     for (std::size_t i = 0; i < kMagModels.size(); ++i) {
                         if (name == kMagModels[i]) {
                             model = path;
@@ -1277,6 +1282,7 @@ namespace
         float             driveT0{ 0.0f };
         bool              pushing{ false };   // the open palm is against the opening part
         float             pushAngle{ 0.0f };
+        RE::NiTransform   restInRoot{};       // the opening part closed, in the gun root's frame (zones are drawn there)
     };
 
     struct State
@@ -1380,6 +1386,8 @@ namespace
         RE::NiPoint3       slideLo{}, slideHi{};
         std::vector<RE::NiPoint3> route;                   // zones file: the slide / handle's way (a polyline, gun root frame), first point at rest
         std::vector<float> routeAt;                        // ..each point's share of the way's length (0..1)
+        std::unordered_map<std::string, std::pair<RE::NiPoint3, RE::NiPoint3>> zoneBoxes;   // zones file: "box NAME lo .. hi .."
+        std::vector<RE::NiPoint3> chambers;                // zones file: "point chamberN x y z" (the closed gun)
         bool               magBoxKnown{ false };
         RE::NiPoint3       magLo{}, magHi{};
         bool               pushing{ false };               // the open palm moves the slide / bolt
@@ -1659,12 +1667,16 @@ namespace
     //   well mouth x y z axis x y z    (written for reference: where the magazine's top leaves the well, the way out)
     //   slide route x y z x y z ...   the slide / charging handle's way (first point at rest), instead of the recorded one
     // Written from what ROCK measured when there is no file; read instead of it when there is.
-    void zonesFor(std::uint32_t weapon) noexcept
+    void zonesFor(std::uint32_t weapon, bool mayWrite = true) noexcept
     {
         auto& st = g_state;
         char path[160];
         std::snprintf(path, sizeof(path), "Data/F4SE/Plugins/ManualReloadF_zones/%08X.txt", weapon);
         std::ifstream in(path);
+        if (!in && !mayWrite) {
+            note("ZONES: no %s (the gun's own distances are used)", path);
+            return;
+        }
         if (!in) {
             std::error_code ignored;
             std::filesystem::create_directories("Data/F4SE/Plugins/ManualReloadF_zones", ignored);
@@ -1727,6 +1739,15 @@ namespace
                         st.axis.x, st.axis.y, st.axis.z, st.length);
                     ++used;
                 }
+            } else if (words[0] == "box" && words.size() >= 10 && words[2] == "lo" && words[6] == "hi") {
+                const RE::NiPoint3 lo{ std::min(num(3), num(7)), std::min(num(4), num(8)), std::min(num(5), num(9)) };
+                const RE::NiPoint3 hi{ std::max(num(3), num(7)), std::max(num(4), num(8)), std::max(num(5), num(9)) };
+                st.zoneBoxes[words[1]] = { lo, hi };
+                note("ZONES: box %s (%.1f %.1f %.1f)..(%.1f %.1f %.1f)", words[1].c_str(), lo.x, lo.y, lo.z, hi.x, hi.y, hi.z);
+                ++used;
+            } else if (words[0] == "point" && words.size() >= 5 && words[1].rfind("chamber", 0) == 0) {
+                st.chambers.push_back(RE::NiPoint3{ num(2), num(3), num(4) });
+                ++used;
             } else if (words[0] == "slide" && words.size() >= 8 && words[1] == "route") {
                 st.route.clear();
                 for (std::size_t i = 2; i + 2 < words.size(); i += 3) {
@@ -3390,6 +3411,11 @@ namespace
                 return true;
             });
             b.known = true;
+            b.restInRoot = relative(root->world, mag->world);
+            if (!st.zonesChecked && gun.weapon) {
+                st.zonesChecked = true;
+                zonesFor(gun.weapon->GetFormID(), false);
+            }
             b.live = gun.data->ammoCount;
             b.lastAmmo = b.live;
             note("Breech: closed pose remembered (%zu nodes below), %u of %u rounds in it", b.kids.size(), b.live, capacity);
@@ -3486,6 +3512,29 @@ namespace
         const auto breechNode = looksLikeObject(child[0]) ? child[0] : mag;
         const auto breechAt = breechNode->world.translate - (revolver ? barrel * (2.0f * scale) : RE::NiPoint3{});
         const bool fullyOpen = b.open && b.t >= 0.95f;
+        // zones (Blender): the palm against the opening part, taken back to where the part stands closed
+        const auto partZone = [&]() -> const std::pair<RE::NiPoint3, RE::NiPoint3>* {
+            for (const char* name : { "cylinder", "barrels", "breech" }) {
+                const auto it = st.zoneBoxes.find(name);
+                if (it != st.zoneBoxes.end()) {
+                    return &it->second;
+                }
+            }
+            return nullptr;
+        }();
+        const auto palmOnPart = [&](const RE::NiPoint3& palmWorld) {
+            const auto inPart = relative(mag->world, pointTransform(palmWorld));
+            return compose(b.restInRoot, inPart).translate;
+        };
+        const auto touchesPart = [&](float fallback) {
+            if (!spare.valid) {
+                return false;
+            }
+            if (partZone) {
+                return inBox(partZone->first, partZone->second, palmOnPart(spare.palm), g_settings.contactMargin);
+            }
+            return distance(spare.palm, mag->world.translate) < fallback * scale;
+        };
 
         // muzzle up: everything falls out
         if (fullyOpen && b.live + b.spent > 0 && barrel.z > (revolver ? 0.5f : 0.3f) && now - b.opened > std::chrono::milliseconds(350)) {
@@ -3519,7 +3568,7 @@ namespace
                     buzz(freeIndex(), 1200);
                     note("BELT: %u round(s) in the free hand", take);
                 }
-            } else if (played && !atBelt && b.held == 0 && distance(spare.palm, mag->world.translate) < 14.0f * scale) {
+            } else if (played && !atBelt && b.held == 0 && touchesPart(14.0f)) {
                 b.driving = true;
                 b.driveAngle0 = hingeAngle(root, spare.palm);
                 b.driveT0 = b.t;
@@ -3551,7 +3600,7 @@ namespace
         }
         // the open palm pushes it shut (no grip needed): only a move towards closed carries it
         const bool touching = played && b.open && !b.driving && b.held == 0 && spare.valid && !spare.grip && !atBelt &&
-                              distance(spare.palm, mag->world.translate) < 8.0f * scale;
+                              touchesPart(8.0f);
         if (touching) {
             const float angle = hingeAngle(root, spare.palm);
             if (b.pushing) {
@@ -3579,7 +3628,16 @@ namespace
             note("The rounds in the hand are put away");
             b.held = 0;
         }
-        if (b.held > 0 && fullyOpen && toGun < g_settings.breechRadius * scale) {
+        bool atChamber = toGun < g_settings.breechRadius * scale;
+        if (!st.chambers.empty() && spare.valid) {
+            const auto palm = palmOnPart(spare.palm);
+            float nearest = 1e9f;
+            for (const auto& c : st.chambers) {
+                nearest = std::min(nearest, distance(palm, c));
+            }
+            atChamber = nearest < g_settings.chamberReach;
+        }
+        if (b.held > 0 && fullyOpen && atChamber) {
             b.live += b.held;
             note("LOAD: %u round(s) in, %u of %u in the gun", b.held, b.live, capacity);
             b.held = 0;
