@@ -126,7 +126,7 @@ namespace
         bool  core2{ true };            // 0.12 core: parts move along their way by the palm on them (no grab point), a magazine out of the gun is ROCK's
         float contactMargin{ 2.5f };
         float catchSide{ 2.0f };
-        float catchAhead{ 3.0f };       // core2: ..and from this far below the mouth (the gun's collision keeps a real magazine out of the well)
+        float catchAhead{ 9.5f };       // core2: ..and from this far below the mouth (the gun's collision keeps a real magazine out of the well)
         float pushFactor{ 0.45f };      // core2: an open palm moves the slide only this part of the hand's motion (it slips; the grip takes it fully)        // core2: a magazine is caught by the well only this close to its line (from below, not from the side)
         int   markButton{ 32 };         // the free hand's stick click: writes a numbered mark and the whole state to the log
         bool  traceState{ true };       // every change of what the plugin thinks (where the magazine is, the slide, who holds what)    // the palm this close to a part's box touches it (gun units)
@@ -1389,6 +1389,7 @@ namespace
         Clock::time_point  grabTriedAt{};
         int                grabTries{ 0 };
         bool               grabDone{ false };
+        float              exitAt{ 0.0f };                 // core2: out this far along the well and the magazine has left it
     };
     State g_state;
     rocklink::Result g_rock;   // what ROCK answered last frame
@@ -2066,6 +2067,7 @@ namespace
         st.place = kRailHand;
         st.autoHold = false;
         st.resting = false;
+        st.exitAt = 0.0f;
         st.blendSeconds = 0.0f;
         buzz(freeIndex(), 1200);
         note("TAKE: the free hand has the magazine, %.1f out of the well", st.s);
@@ -2177,6 +2179,7 @@ namespace
                         st.rounds = loose.rounds;
                         st.place = kRailHand;
                         st.s = std::clamp(top, 0.0f, mouth + ahead);
+                        st.exitAt = st.s + 1.5f;
                         st.driveS0 = st.s;
                         st.driveAlong0 = alongRail(root, node.translate);
                         st.magInWand = relative(free.wand, node);
@@ -2202,7 +2205,7 @@ namespace
                     static Clock::time_point missTold{};
                     if (top < mouth + ahead + 6.0f && side < sideMax + 6.0f && now - missTold > std::chrono::milliseconds(400)) {
                         missTold = now;   // near the well and not taken: why
-                        note("NEAR WELL: magazine %08X top %.1f below the mouth (catch from %.1f), %.1f off the line (max %.1f), upright %.2f (needs < %.2f)",
+                        note("NEAR WELL: magazine %08X top %.1f below the mouth (catch from %.1f), %.1f off the line (max %.1f), upright %.2f (needs > %.2f)",
                             id, top - mouth, ahead, side, sideMax, -tilt, g_settings.core2 ? 0.7f : 0.5f);
                     }
                 }
@@ -3943,7 +3946,12 @@ namespace
                 }
                 const auto carried = compose(free.wand, st.magInWand);
                 const float target = st.driveS0 + (alongRail(root, carried.translate) - st.driveAlong0);
-                const float limit = st.length + (g_settings.core2 ? g_settings.catchAhead : g_settings.captureAhead) + 1.0f;
+                // core2: caught low (the gun's collision stops a real magazine below the mouth), it leaves again only when
+                // pulled 1.5 further out than it has been since it was caught
+                if (g_settings.core2) {
+                    st.exitAt = std::min(st.exitAt > 0.0f ? st.exitAt : 1e9f, std::max(st.length + 2.0f, st.s + 1.5f));
+                }
+                const float limit = g_settings.core2 ? st.exitAt : st.length + g_settings.captureAhead + 1.0f;
                 if (target > limit) {
                     // clear of the well: from here it goes with the hand
                     if (g_settings.holdPoseOnExit && !g_rock.onMagazine) {
