@@ -2805,12 +2805,12 @@ namespace
         // where the slide is furthest from rest (by its origin)
         int last = kSamples;
         if (p.boltTurn <= 0.35f) {
-            float far = 0.0f;
+            float farthest = 0.0f;
             for (int i = 0; i <= kSamples; ++i) {
-                far = std::max(far, distance(at[i][0], at[0][0]));
+                farthest = std::max(farthest, distance(at[i][0], at[0][0]));
             }
             for (int i = 0; i <= kSamples; ++i) {
-                if (distance(at[i][0], at[0][0]) >= far * 0.98f) {
+                if (distance(at[i][0], at[0][0]) >= farthest * 0.98f) {
                     last = std::max(i, 1);
                     break;
                 }
