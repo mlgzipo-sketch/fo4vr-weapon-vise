@@ -1115,6 +1115,18 @@ namespace
         }
     }
 
+    // The hand on a turning part (a crank, a handle): the palm stays on the point of the part it took, the wrist
+    // keeps the turn of the controller (so it is not wrung round, and does not swing out on a wider circle).
+    RE::NiTransform handOnPart(const RE::NiTransform& wristNow, const RE::NiTransform& part, const RE::NiPoint3& gripInPart, const RE::NiPoint3& palmInWrist) noexcept
+    {
+        auto target = wristNow;
+        target.scale = 1.0f;
+        const auto grip = compose(part, pointTransform(gripInPart)).translate;
+        const auto palmOffset = compose(target, pointTransform(palmInWrist)).translate - target.translate;
+        target.translate = grip - palmOffset;
+        return target;
+    }
+
     void unpinHand() noexcept
     {
         const auto* frik = FRIKApiV2::inst;
@@ -1622,6 +1634,7 @@ namespace
         bool               gunPartsChecked{ false };
         std::vector<std::string> gunPartsHidden;                               // magazine branches culled instead of the whole node
         RE::NiTransform    wristInLever{}, wristInCrank{};
+        RE::NiPoint3       gripInLever{}, gripInCrank{}, palmInWristLever{}, palmInWristCrank{};   // the palm's point on the part, and in the wrist
         bool               crankKnown{ false };            // zones file "route crank": a full circle (the laser musket)
         RE::NiPoint3       crankCenter{}, crankAxis{}, crankStart{};
         bool               crankRestKnown{ false };
@@ -4124,12 +4137,12 @@ namespace
             if (!st.crankPinned) {
                 st.crankPinned = true;
                 st.wristInCrank = relative(crank->world, spare.wrist);
+                st.gripInCrank = relative(crank->world, pointTransform(spare.palm)).translate;
+                auto wrist = spare.wrist;
+                wrist.scale = 1.0f;
+                st.palmInWristCrank = relative(wrist, pointTransform(spare.palm)).translate;
             }
-            // the handle turns in the hand: the hand follows where the handle goes, but keeps the turn of the
-            // controller, or the wrist would be wrung round with every turn of the crank
-            auto target = spare.wrist;
-            target.translate = compose(crank->world, st.wristInCrank).translate;
-            pinHand(target);
+            pinHand(handOnPart(spare.wrist, crank->world, st.gripInCrank, st.palmInWristCrank));
             poseFingers(true);
         } else if (st.crankPinned) {
             st.crankPinned = false;
@@ -4530,6 +4543,10 @@ namespace
                     if (!st.leverPinned) {
                         st.leverPinned = true;
                         st.wristInLever = relative(bolt->world, spare.wrist);
+                        st.gripInLever = relative(bolt->world, pointTransform(spare.palm)).translate;
+                        auto wrist = spare.wrist;
+                        wrist.scale = 1.0f;
+                        st.palmInWristLever = relative(wrist, pointTransform(spare.palm)).translate;
                     }
                 } else if (st.leverPinned) {
                     st.leverPinned = false;
@@ -4546,9 +4563,7 @@ namespace
                 }
                 if (st.leverPinned) {
                     {
-                        auto target = spare.wrist;   // the hand stays on the handle it pulls, turned as the controller is
-                        target.translate = compose(bolt->world, st.wristInLever).translate;
-                        pinHand(target);
+                        pinHand(handOnPart(spare.wrist, bolt->world, st.gripInLever, st.palmInWristLever));   // the hand stays on the handle
                     }
                     poseFingers(true);
                 }
@@ -6261,12 +6276,12 @@ namespace
             if (!st.leverPinned) {
                 st.leverPinned = true;
                 st.wristInLever = relative(handle->world, free.wrist);
+                st.gripInLever = relative(handle->world, pointTransform(free.palm)).translate;
+                auto wrist = free.wrist;
+                wrist.scale = 1.0f;
+                st.palmInWristLever = relative(wrist, pointTransform(free.palm)).translate;
             }
-            {
-                auto target = free.wrist;   // where the handle goes, turned as the controller is (the wrist is not wrung)
-                target.translate = compose(handle->world, st.wristInLever).translate;
-                pinHand(target);
-            }
+            pinHand(handOnPart(free.wrist, handle->world, st.gripInLever, st.palmInWristLever));   // where the handle goes, turned as the controller is
         } else if (st.racking && looksLikeObject(bolt) && free.valid) {
             if (!st.rackPinned) {
                 st.rackPinned = true;
