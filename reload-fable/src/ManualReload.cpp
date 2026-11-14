@@ -2773,15 +2773,11 @@ namespace
                     const float mouth = st.length;
                     // the gun's own collision stops a real magazine a hand's width short of the mouth, so
                     // the catch reaches out past it and forgives the hand a little to the side
-                    float sideMax = g_settings.core2 ? (st.zoneCatchSide > 0.0f ? st.zoneCatchSide : g_settings.catchSide) : g_settings.wellSide;
+                    const float sideMax = g_settings.core2 ? (st.zoneCatchSide > 0.0f ? st.zoneCatchSide : g_settings.catchSide) : g_settings.wellSide;
                     // a cell, a core or a drum is taken anywhere along its short way in, not only at the mouth
                     const float below = st.cellFed ? mouth + 1.5f : (g_settings.core2 ? 1.5f : 3.0f);
-                    float ahead = g_settings.core2 ? (st.zoneCatchAhead > 0.0f ? st.zoneCatchAhead : g_settings.catchAhead) : g_settings.captureAhead;
-                    // (not the fusion core: its zone is drawn generously in Blender and must be where it is taken)
-                    if (g_settings.core2 && st.kind != kFusionCoreKind) {
-                        sideMax = std::max(sideMax, 3.5f);
-                        ahead = std::max(ahead, st.cellFed ? 13.0f : 9.0f);
-                    }
+                    const float ahead = g_settings.core2 ? (st.zoneCatchAhead > 0.0f ? st.zoneCatchAhead : g_settings.catchAhead) : g_settings.captureAhead;
+                    // the zone is taken as drawn (in Blender or in the game's zone editor): no minimum of its own
                     if (upright && side <= sideMax && top <= mouth + ahead && top >= mouth - below) {
                         st.rounds = loose.rounds;
                         st.place = kRailHand;
@@ -5181,7 +5177,8 @@ namespace
             RE::NiPoint3 u, v;
             const auto axis = normalized(z.axis);
             sideAxes(axis, u, v);
-            const float rings[3]{ 0.0f, z.ahead, -z.ahead };
+            // what the game uses: from the mouth out along the way out, as far as "ahead" (the catch)
+            const float rings[3]{ 0.0f, z.ahead, z.ahead * 0.5f };
             for (const float along : rings) {
                 const auto centre = z.mouth + axis * along;
                 const int n = along == 0.0f ? 16 : 10;
@@ -5193,7 +5190,7 @@ namespace
             for (int k = 0; k < 4; ++k) {
                 const float a = 1.5707963f * static_cast<float>(k);
                 const auto off = (u * std::cos(a) + v * std::sin(a)) * z.side;
-                dotLine(out, z.mouth - axis * z.ahead + off, z.mouth + axis * z.ahead + off, 1.0f, 10);
+                dotLine(out, z.mouth + off, z.mouth + axis * z.ahead + off, 0.8f, 10);
             }
             dotLine(out, z.mouth, z.mouth + axis * (z.ahead + 3.0f), 0.35f, 24);   // the way out
         } else if (z.type == 2) {
@@ -6032,12 +6029,8 @@ namespace
                 const float tilt = -dot(wayOutOf(target), axisWorld(root));
                 const bool upright = st.cellFed ? std::fabs(tilt) > 0.5f : tilt < -0.5f;
                 const float mouth = st.length;
-                float sideMax = g_settings.core2 ? (st.zoneCatchSide > 0.0f ? st.zoneCatchSide : g_settings.catchSide) : g_settings.wellSide;
-                float ahead = g_settings.core2 ? (st.zoneCatchAhead > 0.0f ? st.zoneCatchAhead : g_settings.catchAhead) : g_settings.captureAhead;
-                if (g_settings.core2 && st.kind != kFusionCoreKind) {
-                    sideMax = std::max(sideMax, 3.5f);
-                    ahead = std::max(ahead, 6.0f);
-                }
+                const float sideMax = g_settings.core2 ? (st.zoneCatchSide > 0.0f ? st.zoneCatchSide : g_settings.catchSide) : g_settings.wellSide;
+                const float ahead = g_settings.core2 ? (st.zoneCatchAhead > 0.0f ? st.zoneCatchAhead : g_settings.catchAhead) : g_settings.captureAhead;
                 const float below = st.cellFed ? mouth + 1.5f : 3.0f;
                 if (st.mustLeave) {
                     if (top > mouth + ahead + 2.5f || side > sideMax + 2.5f) {
