@@ -38,7 +38,7 @@ IDS = {'MRF_Mag10mm': 0x800, 'MRF_Mag10mmLarge': 0x801, 'MRF_SndIn': 0x802, 'MRF
        'MRF_MagLaserCell': 0x820, 'MRF_MagSyringer': 0x821, 'MRF_MagFusionCore': 0x822, 'MRF_MagMinigun': 0x823,
        'MRF_MagPlasma': 0x824, 'MRF_MagGaussSmall': 0x825, 'MRF_MagGaussLarge': 0x826, 'MRF_MagGaussXL': 0x827,
        'MRF_MagFlamer': 0x828, 'MRF_MagFlamerLarge': 0x829, 'MRF_MagCryo': 0x82A,
-       'MRF_MagCasing': 0x82B}
+       'MRF_MagCasing': 0x82B, 'MRF_MagSpeedloader': 0x82C, 'MRF_MagHeldRound': 0x82D}
 recs = {}
 def add(tag, edid, subs):
     fid = OWN | IDS[edid]
@@ -77,7 +77,11 @@ MODELS = [('10mm', 'Weapons\\10mmPistol\\10mmMag01.nif', '10mm Magazine'),
           ('FlamerLarge', 'Weapons\\Flamer\\FlamerPropellantTankLarge.nif', 'Flamer Large Fuel Tank'),
           ('Cryo', 'Ammo\\CryoAmmo\\CryoCell.nif', 'Cryolator Cryo Cell'),
           # not a magazine: a case thrown out of the gun (the plugin sets its model from the gun's ammo)
-          ('Casing', 'Weapons\\Shells\\10mmShell.nif', 'Spent Casing')]
+          ('Casing', 'Weapons\\Shells\\10mmShell.nif', 'Spent Casing'),
+          # a revolver's six rounds on their clip, from the belt into the hand (the game's own speedloader)
+          ('Speedloader', 'Ammo\\45Cal\\45Speedloader.nif', 'Speedloader'),
+          # not a magazine: a round from the belt held in the hand (the plugin sets its model from the gun's ammo)
+          ('HeldRound', 'Weapons\\Shells\\10mmShell.nif', 'Round')]
 mags = [add('MISC', 'MRF_Mag' + k, [sub('OBND', b'\0' * 12), sub('FULL', zstr(name)), sub('MODL', zstr(model)),
                                     sub('DATA', struct.pack('<If', 0, 0.0))]) for k, model, name in MODELS]
 

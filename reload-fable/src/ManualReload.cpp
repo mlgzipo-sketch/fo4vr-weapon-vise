@@ -157,6 +157,7 @@ namespace
         float roundRotY{ 0.0f };
         float roundRotZ{ 0.0f };
         float roundScale{ 1.0f };
+        bool  realRounds{ true };       // rounds from the belt (shells, a revolver's clip, a missile, a cell) are real objects ROCK holds
         bool  casings{ true };          // racking, a break action or a revolver emptied: cases (and unfired rounds) fly out as objects
         float casingImpulse{ 0.4f };    // how hard they are thrown (Havok impulse)
         float casingSeconds{ 40.0f };   // they lie this long, then are removed
@@ -194,7 +195,7 @@ namespace
             { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bBreech", 0, &s.breech }, { "bRecordAnim", 0, &s.recordAnim }, { "bAutoRecord", 0, &s.autoRecord }, { "bRecordedBolt", 0, &s.recordedBolt }, { "bRealInHand", 0, &s.realInHand }, { "bCore2", 0, &s.core2 }, { "fContactMargin", 2, &s.contactMargin }, { "iMarkButton", 1, &s.markButton }, { "bStopEmptyReload", 0, &s.stopEmptyReload }, { "fCatchSide", 2, &s.catchSide }, { "fCatchAhead", 2, &s.catchAhead }, { "fPushFactor", 2, &s.pushFactor }, { "bTraceState", 0, &s.traceState }, { "fCylinderSwing", 2, &s.cylinderSwing },
             { "fBreakAngle", 2, &s.breakAngle }, { "fFlickSpeed", 2, &s.flickSpeed }, { "fFlickTurn", 2, &s.flickTurn }, { "fHingeHold", 2, &s.hingeHold }, { "fBreechRadius", 2, &s.breechRadius }, { "fChamberReach", 2, &s.chamberReach }, { "bRockPlacesHeld", 0, &s.rockPlacesHeld }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
             { "fChamberForward", 2, &s.chamberForward }, { "fRoundUp", 2, &s.roundUp }, { "fRoundRotX", 2, &s.roundRotX },
-            { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale }, { "bCasings", 0, &s.casings }, { "fCasingImpulse", 2, &s.casingImpulse }, { "fCasingSeconds", 2, &s.casingSeconds }, { "iCasingMax", 1, &s.casingMax },
+            { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale }, { "bCasings", 0, &s.casings }, { "bRealRounds", 0, &s.realRounds }, { "fCasingImpulse", 2, &s.casingImpulse }, { "fCasingSeconds", 2, &s.casingSeconds }, { "iCasingMax", 1, &s.casingMax },
         };
         try {
             std::ifstream file("Data/F4SE/Plugins/ManualReloadF.ini");
@@ -1644,6 +1645,10 @@ namespace
         bool               singleShot{ false };            // zones file "socket nuke/missile": one big round goes in at the breech
         RE::NiPoint3       breechMouth{};                  // ..where it goes in (gun root frame)
         float              breechReach{ 6.0f };
+        bool               breechZone{ false };            // ..a cylinder as drawn: way out, radius, length out of the mouth
+        RE::NiPoint3       breechAxis{};
+        float              breechSide{ 0.0f };
+        float              breechAhead{ 0.0f };
         bool               leverKnown{ false };            // zones file "route lever": the handle (WeaponBolt) that opens the breech
         std::vector<RE::NiPoint3> leverPts;
         std::vector<float> leverAt;
@@ -1985,6 +1990,10 @@ namespace
             }
             inside = inside || in;
         };
+        if (st.kind == kMinigunKind) {
+            // the minigun's drum is stood in for by a box of 5mm held in the hand: the box itself counts
+            test(node.translate);
+        }
         if (st.catchPointKnown) {
             test(catchPointOf(node, false));
             if (st.cellFed) {
@@ -2076,11 +2085,25 @@ namespace
             } else if (head == "socket" && (name == "nuke" || name == "missile" || name == "cell") && words >> word >> lo.x >> lo.y >> lo.z) {
                 st.singleShot = name != "cell";
                 st.breechMouth = lo;
-                float side = 0.0f;
+                float side = 0.0f, ahead = 0.0f;
+                RE::NiPoint3 axis{};
+                bool axisRead = false;
                 while (words >> word) {
                     if (word == "side" && words >> side) {
-                        st.breechReach = std::clamp(side * 2.0f, 7.0f, 12.0f);   // the round is held by its tail: be generous
+                        st.breechReach = std::max(side, 0.5f);
+                    } else if (word == "ahead") {
+                        words >> ahead;
+                    } else if (word == "axis" && words >> axis.x >> axis.y >> axis.z) {
+                        axisRead = true;
                     }
+                }
+                // the cylinder exactly as drawn (Blender or the game's editor): no reach of its own
+                st.breechZone = axisRead && dot(axis, axis) > 0.5f && side > 0.0f && ahead > 0.0f;
+                if (st.breechZone) {
+                    st.breechAxis = normalized(axis);
+                    st.breechSide = side;
+                    st.breechAhead = ahead;
+                    st.breechReach = side;
                 }
                 note("ZONES: one %s goes in at (%.1f %.1f %.1f), reach %.1f", name.c_str(), lo.x, lo.y, lo.z, st.breechReach);
             }
@@ -2397,7 +2420,8 @@ namespace
         for (std::uint32_t i = 0; i < count; ++i) {
             RE::NiTransform pose = root->world;
             const float spread = static_cast<float>(i) - 0.5f * static_cast<float>(count - 1);
-            pose.translate = at + axisOf(root->world, 1) * (spread * 0.8f * gunScale(root));
+            // well apart, or the physics throws two cases born inside each other far away
+            pose.translate = at + axisOf(root->world, 1) * (spread * 2.0f * gunScale(root)) + axisOf(root->world, 2) * (0.6f * static_cast<float>(i % 2) * gunScale(root));
             PendingCommand command;
             command.type = kCasing;
             command.kind = kCasingKind;
@@ -2413,27 +2437,54 @@ namespace
         note("CASINGS: %u out (%s)", count, why);
     }
 
-    // A round shown as a real object, for the hand to take it the way it should be held (stick click, then ROCK
-    // holds it; a second click keeps that hold for the gun it came from)
+    // A round from the belt (a shell, a revolver's clip, a missile, a cell, a capacitor) as a real object that ROCK
+    // holds in the free hand: the fingers close on it by themselves. Drawn in the hand until ROCK has it.
     constexpr std::int32_t kPoseToken = -8;
-    struct PoseRound
+    constexpr RE::TESFormID kHeldRoundForm = 0x82D;   // MRF_MagHeldRound (index 32 of MRF_Mags), its model set here
+    constexpr std::int32_t kSpeedloaderKind = 31;     // MRF_MagSpeedloader: the game's .45 speedloader, six rounds on it
+    constexpr std::int32_t kHeldRoundKind = 32;
+    struct HandRound
     {
+        bool              wanted{ false };   // the belt gave rounds: one object is to be made
         bool              asked{ false };
         std::uint32_t     ref{ 0 };
         std::uint32_t     weapon{ 0 };
         Clock::time_point askedAt{};
+        Clock::time_point grabAt{};
+        int               grabTries{ 0 };
+        bool              held{ false };     // ROCK has had it in the hand
     };
-    PoseRound g_pose;
-    Clock::time_point g_poseDoneAt{};
+    HandRound g_round;
+    int g_roundOrphans = 0;   // asked for and given up before they came: deleted when they come
 
-    // the round's own model on MRF_MagCasing (a missile, a mini nuke: the ammo's model; else its case)
-    bool preparePoseModel(const Gun& gun, bool big) noexcept
+    void dropHandRound(const char* why) noexcept
+    {
+        if (g_round.ref) {
+            if (rocklink::heldBy(freeIndex()) == g_round.ref) {
+                rocklink::releaseHeld(freeIndex(), g_round.ref);
+            }
+            PendingCommand command;
+            command.type = kDelete;
+            command.ref = g_round.ref;
+            pushCommand(command);
+        } else if (g_round.asked) {
+            ++g_roundOrphans;
+        }
+        if (g_round.asked) {
+            note("ROUND: the real round %08X is gone (%s)", g_round.ref, why);
+        }
+        g_round = HandRound{};
+    }
+
+    // the model of MRF_MagHeldRound: a missile, a mini nuke, a cell: the ammo's own model; a shell: its case
+    bool prepareHeldRoundModel(const Gun& gun, bool big) noexcept
     {
         auto* ammo = gun.instance && readable(gun.instance, sizeof(RE::TESObjectWEAP::InstanceData)) ? gun.instance->ammo : nullptr;
         auto* data = RE::TESDataHandler::GetSingleton();
-        auto* form = data ? data->LookupForm(kCasingForm, "ManualReloadF.esp") : nullptr;
+        auto* form = data ? data->LookupForm(kHeldRoundForm, "ManualReloadF.esp") : nullptr;
         auto* misc = form ? form->As<RE::TESObjectMISC>() : nullptr;
         if (!misc || !ammo || !readable(ammo, sizeof(RE::TESAmmo))) {
+            note("ROUND: %s", !misc ? "MRF_MagHeldRound is not in ManualReloadF.esp (old plugin?)" : "the gun has no ammo");
             return false;
         }
         const char* casing = ammo->shellCasing.GetModel();
@@ -2443,9 +2494,7 @@ namespace
             return false;
         }
         static_cast<RE::TESModel&>(static_cast<RE::BGSModelMaterialSwap&>(*misc)).SetModel(model);
-        g_casingModelFor = nullptr;   // the next case sets its own model again
-        g_casingModelReady = false;
-        note("POSE: the round is shown as '%s'", model);
+        detail("ROUND: the round in the hand is '%s'", model);
         return true;
     }
 
@@ -2674,16 +2723,18 @@ namespace
                 continue;
             }
             if (mag.token == kPoseToken) {
-                g_pose.ref = mag.ref;
-                const auto& hand = g_hands[freeIndex()];
-                auto* ref = lookupRef(mag.ref);
-                auto* object = ref ? ref->Get3D() : nullptr;
-                const auto c = looksLikeObject(object) ? object->worldBound.center : hand.palm;
-                const float middle[3]{ c.x, c.y, c.z };
-                if (hand.valid && hand.grip) {
-                    rocklink::forceGrab(freeIndex(), mag.ref, middle);
+                if (g_roundOrphans > 0 || !g_round.asked || g_round.ref) {
+                    g_roundOrphans = std::max(0, g_roundOrphans - 1);
+                    PendingCommand command;
+                    command.type = kDelete;
+                    command.ref = mag.ref;
+                    pushCommand(command);
+                    detail("ROUND: %08X came too late: deleted", mag.ref);
+                    continue;
                 }
-                note("POSE: round object %08X is here", mag.ref);
+                g_round.ref = mag.ref;
+                g_round.grabAt = Clock::time_point{};   // asked for at once
+                note("ROUND: real round %08X is here (%.2f s)", mag.ref, std::chrono::duration<float>(Clock::now() - g_round.askedAt).count());
                 continue;
             }
             if (mag.token <= kCasingTokenBase) {
@@ -4201,7 +4252,9 @@ namespace
         const int state = rocklink::forceGrabState(&failure);
         if (!(free.valid && free.grip) || now - st.handRefAt > std::chrono::milliseconds(2000)) {
             note("CORE2: ROCK did not take magazine %08X (grab state %d, failure %d, held %08X): it falls", st.handRef, state, failure, held);
-            if (st.weapon && !st.grabDone) {
+            // let go before ROCK took it: it was dropped on purpose (a spent magazine thrown away), nothing is wrong
+            // with this gun's magazines. Only a grip held all the way through and never answered says ROCK can't.
+            if (st.weapon && !st.grabDone && free.valid && free.grip) {
                 // ROCK never took it: from now on this gun's magazine is drawn in the hand (grip it again to take it)
                 g_noRealHandGuns.insert(st.weapon->GetFormID());
                 g_noRealHandNow = true;
@@ -4536,9 +4589,17 @@ namespace
         wand.scale = 1.0f;
         auto hold = relative(wand, node);
         hold.scale = 1.0f;
-        const auto x = normalized(axisOf(hold, 0));
+        auto x = axisOf(hold, 0);
         auto y = axisOf(hold, 1);
-        y = normalized(y - x * dot(y, x));
+        if (dot(x, x) < 1e-4f) {
+            x = normalized(cross(y, axisOf(hold, 2)));
+        }
+        x = normalized(x);
+        y = y - x * dot(y, x);
+        if (dot(y, y) < 1e-4f) {
+            y = cross(axisOf(hold, 2), x);   // two rows alike (a node squashed flat): rebuilt from the third
+        }
+        y = normalized(y);
         setRows(hold, x, y, cross(x, y));
         return hold;
     }
@@ -5059,6 +5120,8 @@ namespace
                     hud(have == 0 ? "Патронов нет" : "Заряжено полностью");
                 } else {
                     b.held = take;
+                    dropHandRound("a new one from the belt");
+                    g_round.wanted = g_settings.realRounds;
                     playSound(4);
                     buzz(freeIndex(), 1200);
                     note("BELT: %u round(s) in the free hand", take);
@@ -5136,38 +5199,42 @@ namespace
             }
             b.pushing = false;
         }
-        // the stick click with a round in the hand: it becomes a real object that ROCK holds (the fingers close on it
-        // by themselves); turned in the hand, dropped and picked up again, whatever: a second click keeps how it is held
-        {
-            static Clock::time_point clickDown{};
-            static bool clickWas = false;
-            const bool click = spare.valid && (spare.buttons & buttonMask(g_settings.markButton)) != 0;
-            if (click && !clickWas) {
-                clickDown = now;
+        // the round from the belt as a real object: ROCK is asked to put it in the hand; held, it is not drawn.
+        // Let go once ROCK had it, it is gone (the rounds stay with the ammo carried); not taken in time, it is drawn.
+        RE::NiAVObject* roundObject = nullptr;
+        if (g_round.ref) {
+            const bool rockHas = rocklink::heldBy(freeIndex()) == g_round.ref;
+            auto* ref = lookupRef(g_round.ref);
+            auto* object = ref ? ref->Get3D() : nullptr;
+            if (rockHas && !g_round.held) {
+                g_round.held = true;
+                note("ROUND: ROCK holds the real round %08X (%.2f s, %d asks)", g_round.ref,
+                    std::chrono::duration<float>(now - g_round.askedAt).count(), g_round.grabTries);
             }
-            if (!click && clickWas && now - clickDown < std::chrono::milliseconds(500) && b.held > 0 && !st.roundAdjusting && !g_pose.asked &&
-                now - g_poseDoneAt > std::chrono::milliseconds(400) &&
-                gun.weapon && preparePoseModel(gun, single)) {
-                st.roundAdjusting = true;
-                g_pose = PoseRound{ true, 0, gun.weapon->GetFormID(), now };
-                PendingCommand command;
-                command.type = kCasing;
-                command.kind = kCasingKind;
-                command.token = kPoseToken;
-                command.pose = poseForScript(st.roundFrozen);
-                command.impulse = { 0.0f, 0.0f, 1.0f, 0.0f };
-                pushCommand(command);
-                griphook::setOwned(false);   // ROCK takes the grip from here
-                hud("Патрон в руке как настоящий: возьми его как надо и нажми стик ещё раз");
-                buzz(freeIndex(), 1500);
+            if (g_round.held && !rockHas) {
+                dropHandRound("let go");
+                note("The rounds in the hand are put away");
+                b.held = 0;
+            } else if (!g_round.held && now - g_round.askedAt > std::chrono::milliseconds(2000)) {
+                dropHandRound("ROCK did not take it: drawn in the hand instead");
+            } else if (!g_round.held && spare.valid && spare.grip && g_round.grabTries < 6 &&
+                       now - g_round.grabAt > std::chrono::milliseconds(300)) {
+                g_round.grabAt = now;
+                ++g_round.grabTries;
+                griphook::setOwned(false);   // the grip is ROCK's to take it with
+                const auto c = looksLikeObject(object) ? object->worldBound.center : spare.palm;
+                const float middle[3]{ c.x, c.y, c.z };
+                rocklink::forceGrab(freeIndex(), g_round.ref, middle);
             }
-            clickWas = click;
+            if (g_round.held && looksLikeObject(object)) {
+                roundObject = object;
+            }
+        } else if (g_round.asked && now - g_round.askedAt > std::chrono::seconds(3)) {
+            dropHandRound("the object never came: drawn in the hand instead");
         }
-        if (b.held == 0 || !g_pose.asked) {
-            st.roundAdjusting = false;
-        }
-        if (b.held > 0 && !st.roundAdjusting && !(spare.valid && spare.grip)) {
+        if (b.held > 0 && !g_round.held && !(spare.valid && spare.grip)) {
             note("The rounds in the hand are put away");
+            dropHandRound("let go before ROCK had it");
             b.held = 0;
         }
         bool atChamber = toGun < g_settings.breechRadius * scale;
@@ -5175,22 +5242,54 @@ namespace
             // the palm, or the nose of the round held ahead of the fingers, at the breech
             const auto palmIn = relative(root->world, pointTransform(spare.palm)).translate;
             const auto noseIn = relative(root->world, pointTransform(spare.palm + axisOf(spare.wand, 1) * (10.0f * scale))).translate;
-            const float d = std::min(distance(palmIn, st.breechMouth), distance(noseIn, st.breechMouth));
-            atChamber = d < st.breechReach;
+            float d = std::min(distance(palmIn, st.breechMouth), distance(noseIn, st.breechMouth));
+            if (st.breechZone) {
+                // the socket's cylinder as drawn: way out from the mouth, `side` round its line, `ahead` long.
+                // The palm or the nose in it, or the real round touching it (its bound sphere).
+                const auto test = [&](const RE::NiPoint3& at, float reach) {
+                    const auto off = at - st.breechMouth;
+                    const float a = dot(off, st.breechAxis);
+                    const auto across = off - st.breechAxis * a;
+                    const float r = std::sqrt(dot(across, across));
+                    const float outside = std::max({ r - st.breechSide - reach, a - st.breechAhead - reach, -a - st.breechSide - reach, 0.0f });
+                    d = std::min(d, outside);
+                    return outside <= 0.0f;
+                };
+                d = 1e9f;
+                bool in = test(palmIn, 0.0f);
+                in = test(noseIn, 0.0f) || in;
+                if (roundObject) {
+                    const float radius = roundObject->worldBound.fRadius / std::max(scale, 0.01f);
+                    const auto centerIn = relative(root->world, pointTransform(roundObject->worldBound.center)).translate;
+                    in = test(centerIn, radius * 0.6f) || in;
+                }
+                atChamber = in;
+            } else {
+                if (roundObject) {
+                    const auto centerIn = relative(root->world, pointTransform(roundObject->worldBound.center)).translate;
+                    d = std::min(d, distance(centerIn, st.breechMouth));
+                }
+                atChamber = d < st.breechReach;
+            }
             static Clock::time_point toldNear{};
             if (b.held > 0 && !atChamber && d < st.breechReach + 15.0f && now - toldNear > std::chrono::milliseconds(500)) {
                 toldNear = now;
-                note("NEAR BREECH: the round in the hand %.1f from where it goes in (needs < %.1f), open %.2f", d, st.breechReach, b.t);
+                note("NEAR BREECH: the round in the hand %.1f %s (%s), open %.2f", d, st.breechZone ? "outside the socket drawn" : "from where it goes in",
+                    roundObject ? "a real round" : "drawn", b.t);
             }
         } else if (!st.chambers.empty() && spare.valid) {
-            const auto palm = palmOnPart(spare.palm);
+            const auto palm = palmOnPart(roundObject ? roundObject->worldBound.center : spare.palm);
             float nearest = 1e9f;
             for (const auto& c : st.chambers) {
                 nearest = std::min(nearest, distance(palm, c));
             }
             atChamber = nearest < g_settings.chamberReach;
         }
-        if (b.held > 0 && !st.roundAdjusting && fullyOpen && atChamber) {
+        if (!single && !cellCover && st.chambers.empty() && roundObject && b.held > 0 && !atChamber) {
+            atChamber = distance(roundObject->worldBound.center, breechAt) < g_settings.breechRadius * scale;   // the round itself at the breech
+        }
+        if (b.held > 0 && fullyOpen && atChamber) {
+            dropHandRound("it went in");
             if (capacitors) {
                 b.caps = std::min(b.caps + 1, 3u);
                 note("LOAD: capacitor %u of 3 in", b.caps);
@@ -5247,7 +5346,7 @@ namespace
             }
         };
         const std::uint32_t filled = b.live + b.spent;
-        const std::uint32_t shownHeld = st.roundAdjusting ? 0u : b.held;   // a round shown as a real object is not drawn too
+        const std::uint32_t shownHeld = g_round.held ? 0u : b.held;   // a round held as a real object is not drawn too
         // a mini nuke / a missile is a node of the gun's own model (CNuke / CMissile): seen only when it is in or in the hand
         RE::NiAVObject* bigRound = single ? findNamed(root, "CNuke") : nullptr;
         if (single && !looksLikeObject(bigRound)) {
@@ -5288,13 +5387,28 @@ namespace
             if (single) {
                 pose.translate = spare.palm + y * (6.0f * scale);   // held by its tail, the warhead ahead of the fingers
             }
-            if (st.roundAdjusting) {
-                pose = st.roundFrozen;
-            } else if (st.roundHoldKnown) {
+            if (st.roundHoldKnown) {
                 pose = compose(spare.wand, st.roundHold);
                 pose.scale = scale;
             }
             st.roundFrozen = pose;
+            // the real round, made where the drawn one is: ROCK takes it from there
+            if (g_round.wanted && !g_round.asked && gun.weapon) {
+                g_round.wanted = false;
+                if (revolver || prepareHeldRoundModel(gun, single || cellCover || capacitors)) {
+                    PendingCommand command;
+                    command.type = kCasing;
+                    command.kind = revolver ? kSpeedloaderKind : kHeldRoundKind;
+                    command.token = kPoseToken;
+                    command.pose = poseForScript(pose);
+                    command.impulse = { 0.0f, 0.0f, 1.0f, 0.0f };
+                    pushCommand(command);
+                    g_round.asked = true;
+                    g_round.askedAt = now;
+                    g_round.weapon = gun.weapon->GetFormID();
+                    detail("ROUND: a real %s is asked for", revolver ? "speedloader" : "round");
+                }
+            }
             if (cellCover) {
                 if (looksLikeObject(cellNode)) {
                     placeNode(cellNode, pose);
@@ -6173,44 +6287,9 @@ namespace
         tidyCasings(Clock::now());
         readHand(0);
         readHand(1);
-        // the second stick click while a round is shown as a real object: how ROCK holds it now is kept
-        if (g_pose.asked) {
-            static Clock::time_point clickDown{};
-            static bool clickWas = false;
-            const auto& hand = g_hands[freeIndex()];
-            const auto tick = Clock::now();
-            const bool click = hand.valid && (hand.buttons & buttonMask(g_settings.markButton)) != 0;
-            if (click && !clickWas) {
-                clickDown = tick;
-            }
-            if (!click && clickWas && tick - clickDown < std::chrono::milliseconds(500) && tick - g_pose.askedAt > std::chrono::milliseconds(400)) {
-                auto* ref = g_pose.ref ? lookupRef(g_pose.ref) : nullptr;
-                auto* object = ref ? ref->Get3D() : nullptr;
-                if (looksLikeObject(object) && rocklink::heldBy(freeIndex()) == g_pose.ref) {
-                    const auto hold = holdAgainst(hand.wand, object->world);
-                    writeHoldLine(g_pose.weapon, "roundhold", hold);
-                    if (g_state.weapon && g_state.weapon->GetFormID() == g_pose.weapon) {
-                        g_state.roundHold = hold;
-                        g_state.roundHoldKnown = true;
-                    }
-                    rocklink::releaseHeld(freeIndex(), g_pose.ref);
-                    PendingCommand command;
-                    command.type = kDelete;
-                    command.ref = g_pose.ref;
-                    pushCommand(command);
-                    g_pose = PoseRound{};
-                    g_poseDoneAt = tick;
-                    hud("Хват патрона сохранён: так он будет в руке с пояса");
-                    buzz(freeIndex(), 3000);
-                } else {
-                    hud("Сначала возьми патрон рукой, потом нажми стик");
-                }
-            }
-            clickWas = click;
-            if (!g_pose.ref && g_pose.asked && tick - g_pose.askedAt > std::chrono::seconds(6)) {
-                note("POSE: the round object never came");
-                g_pose = PoseRound{};
-            }
+        // a real round in the hand belongs to the gun it came for: another gun, or none, and it is gone
+        if (g_round.asked && !(g_state.weapon && g_state.weapon->GetFormID() == g_round.weapon && g_state.breech.held > 0)) {
+            dropHandRound("the gun is not open for it any more");
         }
         auto& st = g_state;
         const auto now = Clock::now();
