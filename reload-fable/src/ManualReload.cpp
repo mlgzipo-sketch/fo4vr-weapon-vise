@@ -2443,7 +2443,7 @@ namespace
     constexpr RE::TESFormID kHeldRoundForm = 0x82D;   // MRF_MagHeldRound (index 32 of MRF_Mags), its model set here
     constexpr std::int32_t kSpeedloaderKind = 31;     // MRF_MagSpeedloader: the game's .45 speedloader, six rounds on it
     constexpr std::int32_t kHeldRoundKind = 32;
-    struct HandRound
+    struct BeltRound
     {
         bool              wanted{ false };   // the belt gave rounds: one object is to be made
         bool              asked{ false };
@@ -2454,26 +2454,26 @@ namespace
         int               grabTries{ 0 };
         bool              held{ false };     // ROCK has had it in the hand
     };
-    HandRound g_round;
+    BeltRound g_beltRound;
     int g_roundOrphans = 0;   // asked for and given up before they came: deleted when they come
 
     void dropHandRound(const char* why) noexcept
     {
-        if (g_round.ref) {
-            if (rocklink::heldBy(freeIndex()) == g_round.ref) {
-                rocklink::releaseHeld(freeIndex(), g_round.ref);
+        if (g_beltRound.ref) {
+            if (rocklink::heldBy(freeIndex()) == g_beltRound.ref) {
+                rocklink::releaseHeld(freeIndex(), g_beltRound.ref);
             }
             PendingCommand command;
             command.type = kDelete;
-            command.ref = g_round.ref;
+            command.ref = g_beltRound.ref;
             pushCommand(command);
-        } else if (g_round.asked) {
+        } else if (g_beltRound.asked) {
             ++g_roundOrphans;
         }
-        if (g_round.asked) {
-            note("ROUND: the real round %08X is gone (%s)", g_round.ref, why);
+        if (g_beltRound.asked) {
+            note("ROUND: the real round %08X is gone (%s)", g_beltRound.ref, why);
         }
-        g_round = HandRound{};
+        g_beltRound = BeltRound{};
     }
 
     // the model of MRF_MagHeldRound: a missile, a mini nuke, a cell: the ammo's own model; a shell: its case
@@ -2723,7 +2723,7 @@ namespace
                 continue;
             }
             if (mag.token == kPoseToken) {
-                if (g_roundOrphans > 0 || !g_round.asked || g_round.ref) {
+                if (g_roundOrphans > 0 || !g_beltRound.asked || g_beltRound.ref) {
                     g_roundOrphans = std::max(0, g_roundOrphans - 1);
                     PendingCommand command;
                     command.type = kDelete;
@@ -2732,9 +2732,9 @@ namespace
                     detail("ROUND: %08X came too late: deleted", mag.ref);
                     continue;
                 }
-                g_round.ref = mag.ref;
-                g_round.grabAt = Clock::time_point{};   // asked for at once
-                note("ROUND: real round %08X is here (%.2f s)", mag.ref, std::chrono::duration<float>(Clock::now() - g_round.askedAt).count());
+                g_beltRound.ref = mag.ref;
+                g_beltRound.grabAt = Clock::time_point{};   // asked for at once
+                note("ROUND: real round %08X is here (%.2f s)", mag.ref, std::chrono::duration<float>(Clock::now() - g_beltRound.askedAt).count());
                 continue;
             }
             if (mag.token <= kCasingTokenBase) {
@@ -5121,7 +5121,7 @@ namespace
                 } else {
                     b.held = take;
                     dropHandRound("a new one from the belt");
-                    g_round.wanted = g_settings.realRounds;
+                    g_beltRound.wanted = g_settings.realRounds;
                     playSound(4);
                     buzz(freeIndex(), 1200);
                     note("BELT: %u round(s) in the free hand", take);
@@ -5202,37 +5202,37 @@ namespace
         // the round from the belt as a real object: ROCK is asked to put it in the hand; held, it is not drawn.
         // Let go once ROCK had it, it is gone (the rounds stay with the ammo carried); not taken in time, it is drawn.
         RE::NiAVObject* roundObject = nullptr;
-        if (g_round.ref) {
-            const bool rockHas = rocklink::heldBy(freeIndex()) == g_round.ref;
-            auto* ref = lookupRef(g_round.ref);
+        if (g_beltRound.ref) {
+            const bool rockHas = rocklink::heldBy(freeIndex()) == g_beltRound.ref;
+            auto* ref = lookupRef(g_beltRound.ref);
             auto* object = ref ? ref->Get3D() : nullptr;
-            if (rockHas && !g_round.held) {
-                g_round.held = true;
-                note("ROUND: ROCK holds the real round %08X (%.2f s, %d asks)", g_round.ref,
-                    std::chrono::duration<float>(now - g_round.askedAt).count(), g_round.grabTries);
+            if (rockHas && !g_beltRound.held) {
+                g_beltRound.held = true;
+                note("ROUND: ROCK holds the real round %08X (%.2f s, %d asks)", g_beltRound.ref,
+                    std::chrono::duration<float>(now - g_beltRound.askedAt).count(), g_beltRound.grabTries);
             }
-            if (g_round.held && !rockHas) {
+            if (g_beltRound.held && !rockHas) {
                 dropHandRound("let go");
                 note("The rounds in the hand are put away");
                 b.held = 0;
-            } else if (!g_round.held && now - g_round.askedAt > std::chrono::milliseconds(2000)) {
+            } else if (!g_beltRound.held && now - g_beltRound.askedAt > std::chrono::milliseconds(2000)) {
                 dropHandRound("ROCK did not take it: drawn in the hand instead");
-            } else if (!g_round.held && spare.valid && spare.grip && g_round.grabTries < 6 &&
-                       now - g_round.grabAt > std::chrono::milliseconds(300)) {
-                g_round.grabAt = now;
-                ++g_round.grabTries;
+            } else if (!g_beltRound.held && spare.valid && spare.grip && g_beltRound.grabTries < 6 &&
+                       now - g_beltRound.grabAt > std::chrono::milliseconds(300)) {
+                g_beltRound.grabAt = now;
+                ++g_beltRound.grabTries;
                 griphook::setOwned(false);   // the grip is ROCK's to take it with
                 const auto c = looksLikeObject(object) ? object->worldBound.center : spare.palm;
                 const float middle[3]{ c.x, c.y, c.z };
-                rocklink::forceGrab(freeIndex(), g_round.ref, middle);
+                rocklink::forceGrab(freeIndex(), g_beltRound.ref, middle);
             }
-            if (g_round.held && looksLikeObject(object)) {
+            if (g_beltRound.held && looksLikeObject(object)) {
                 roundObject = object;
             }
-        } else if (g_round.asked && now - g_round.askedAt > std::chrono::seconds(3)) {
+        } else if (g_beltRound.asked && now - g_beltRound.askedAt > std::chrono::seconds(3)) {
             dropHandRound("the object never came: drawn in the hand instead");
         }
-        if (b.held > 0 && !g_round.held && !(spare.valid && spare.grip)) {
+        if (b.held > 0 && !g_beltRound.held && !(spare.valid && spare.grip)) {
             note("The rounds in the hand are put away");
             dropHandRound("let go before ROCK had it");
             b.held = 0;
@@ -5346,7 +5346,7 @@ namespace
             }
         };
         const std::uint32_t filled = b.live + b.spent;
-        const std::uint32_t shownHeld = g_round.held ? 0u : b.held;   // a round held as a real object is not drawn too
+        const std::uint32_t shownHeld = g_beltRound.held ? 0u : b.held;   // a round held as a real object is not drawn too
         // a mini nuke / a missile is a node of the gun's own model (CNuke / CMissile): seen only when it is in or in the hand
         RE::NiAVObject* bigRound = single ? findNamed(root, "CNuke") : nullptr;
         if (single && !looksLikeObject(bigRound)) {
@@ -5393,8 +5393,8 @@ namespace
             }
             st.roundFrozen = pose;
             // the real round, made where the drawn one is: ROCK takes it from there
-            if (g_round.wanted && !g_round.asked && gun.weapon) {
-                g_round.wanted = false;
+            if (g_beltRound.wanted && !g_beltRound.asked && gun.weapon) {
+                g_beltRound.wanted = false;
                 if (revolver || prepareHeldRoundModel(gun, single || cellCover || capacitors)) {
                     PendingCommand command;
                     command.type = kCasing;
@@ -5403,9 +5403,9 @@ namespace
                     command.pose = poseForScript(pose);
                     command.impulse = { 0.0f, 0.0f, 1.0f, 0.0f };
                     pushCommand(command);
-                    g_round.asked = true;
-                    g_round.askedAt = now;
-                    g_round.weapon = gun.weapon->GetFormID();
+                    g_beltRound.asked = true;
+                    g_beltRound.askedAt = now;
+                    g_beltRound.weapon = gun.weapon->GetFormID();
                     detail("ROUND: a real %s is asked for", revolver ? "speedloader" : "round");
                 }
             }
@@ -6288,7 +6288,7 @@ namespace
         readHand(0);
         readHand(1);
         // a real round in the hand belongs to the gun it came for: another gun, or none, and it is gone
-        if (g_round.asked && !(g_state.weapon && g_state.weapon->GetFormID() == g_round.weapon && g_state.breech.held > 0)) {
+        if (g_beltRound.asked && !(g_state.weapon && g_state.weapon->GetFormID() == g_beltRound.weapon && g_state.breech.held > 0)) {
             dropHandRound("the gun is not open for it any more");
         }
         auto& st = g_state;
