@@ -1671,6 +1671,8 @@ namespace
         bool               catchPointKnown{ false };
         RE::NiPoint3       holdPointInGun{};               // zones file "point maghold": where the palm holds the magazine (on it, seated, gun frame)
         bool               holdPointKnown{ false };
+        RE::NiTransform    holdInWand{};                   // zones file "hold": the magazine in the hand as it was shown (stick click with one held)
+        bool               holdInWandKnown{ false };
         bool               gameBoltAction{ true };         // the game's own flag for the gun as built (a pipe pistol is not a bolt action)
         float              zoneCatchAhead{ -1.0f };                 // core2: out this far along the well and the magazine has left it
     };
@@ -2231,6 +2233,17 @@ namespace
                 st.catchPointKnown = true;
                 note("ZONES: the magazine is caught by its point (%.1f %.1f %.1f) in the gun, (%.2f %.2f %.2f) on the magazine", at.x, at.y, at.z,
                     st.catchPointInNode.x, st.catchPointInNode.y, st.catchPointInNode.z);
+            } else if (words[0] == "hold" && words.size() >= 13) {
+                auto& h = st.holdInWand;
+                h = identityTransform();
+                h.translate = RE::NiPoint3{ num(1), num(2), num(3) };
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 3; ++c) {
+                        h.rotate.entry[r][c] = num(4 + r * 3 + c);
+                    }
+                }
+                st.holdInWandKnown = true;
+                note("ZONES: a magazine from the belt comes as it was shown in the hand (at %.1f %.1f %.1f of the controller)", h.translate.x, h.translate.y, h.translate.z);
             } else if (words[0] == "point" && words.size() >= 5 && words[1] == "maghold") {
                 st.holdPointInGun = RE::NiPoint3{ num(2), num(3), num(4) };
                 st.holdPointKnown = true;
@@ -2797,6 +2810,11 @@ namespace
     RE::NiTransform beltPose(const RE::NiAVObject* root, const Hand& hand, float scale) noexcept
     {
         const auto& st = g_state;
+        if (st.holdInWandKnown) {
+            auto pose = compose(hand.wand, st.holdInWand);
+            pose.scale = scale;
+            return pose;
+        }
         if (!g_settings.holdAsInGun || !looksLikeObject(root) || !st.railKnown) {
             return holdPose(hand, scale);
         }
@@ -5008,6 +5026,73 @@ namespace
     }
 
     // One line per thing: the magazine, the slide, the free hand, the real magazines around.
+    std::string zonesPathOf(std::uint32_t weapon);
+
+    // The stick click with a magazine in the free hand: the way it is held now is how it comes from the belt from now on
+    // (zones file "hold": where the magazine stands against the controller). Returns false with no magazine in the hand.
+    bool saveHold(const Gun& gun) noexcept
+    {
+        auto& st = g_state;
+        const auto& free = g_hands[freeIndex()];
+        if (!gun.weapon || !free.valid || !free.grip) {
+            return false;
+        }
+        bool found = false;
+        RE::NiTransform node{};
+        if (st.place == kHand) {
+            node = compose(free.wand, st.magInWand);
+            found = true;
+        }
+        for (const auto& [id, loose] : g_loose) {
+            if (found) {
+                break;
+            }
+            auto* ref = lookupRef(id);
+            auto* mag3D = ref ? ref->Get3D() : nullptr;
+            if (looksLikeObject(mag3D) && loose.kind == st.kind && distance(mag3D->worldBound.center, free.palm) < g_settings.handRadius + 4.0f) {
+                node = compose(mag3D->world, inverse(st.looseInNode));
+                found = true;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+        auto wand = free.wand;
+        wand.scale = 1.0f;
+        auto hold = relative(wand, node);
+        hold.scale = 1.0f;
+        // keep the rotation square (a scaled node leaves its scale in the matrix rows)
+        const auto x = normalized(axisOf(hold, 0));
+        auto y = axisOf(hold, 1);
+        y = normalized(y - x * dot(y, x));
+        setRows(hold, x, y, cross(x, y));
+        st.holdInWand = hold;
+        st.holdInWandKnown = true;
+        const auto path = zonesPathOf(gun.weapon->GetFormID());
+        std::vector<std::string> lines;
+        {
+            std::ifstream in(path);
+            for (std::string line; std::getline(in, line);) {
+                if (line.rfind("hold ", 0) != 0) {
+                    lines.push_back(line);
+                }
+            }
+        }
+        char text[512];
+        std::snprintf(text, sizeof(text), "hold %.4f %.4f %.4f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f", hold.translate.x, hold.translate.y, hold.translate.z,
+            hold.rotate.entry[0][0], hold.rotate.entry[0][1], hold.rotate.entry[0][2], hold.rotate.entry[1][0], hold.rotate.entry[1][1], hold.rotate.entry[1][2],
+            hold.rotate.entry[2][0], hold.rotate.entry[2][1], hold.rotate.entry[2][2]);
+        lines.insert(lines.begin() + (lines.empty() || lines[0].rfind(";", 0) != 0 ? 0 : 1), text);
+        std::error_code ignored;
+        std::filesystem::create_directories("Data/F4SE/Plugins/ManualReloadF_zones", ignored);
+        std::ofstream out(path);
+        for (const auto& line : lines) {
+            out << line << "\n";
+        }
+        note("HOLD: the magazine's hold saved to %s: %s", path.c_str(), text);
+        return static_cast<bool>(out);
+    }
+
     void writeState(const char* why, const Gun& gun, RE::NiAVObject* root, RE::NiAVObject* magazine, RE::NiAVObject* bolt) noexcept
     {
         const auto& st = g_state;
@@ -5076,6 +5161,7 @@ namespace
         bool on{ false };
         std::uint32_t weapon{ 0 };
         std::vector<EditZone> zones;
+        std::vector<std::string> keep;   // lines the editor does not edit (the magazine's hold): written back as they were
         int sel{ 0 }, mode{ 0 };
         bool gripWas{ false };
         RE::NiTransform handPrev{};
@@ -5141,6 +5227,7 @@ namespace
     {
         auto& ed = g_ed;
         ed.zones.clear();
+        ed.keep.clear();
         std::ifstream in(zonesPathOf(weapon));
         if (!in) {
             return false;
@@ -5154,6 +5241,10 @@ namespace
             }
             if (line.rfind("slide route", 0) == 0) {
                 continue;   // read in the second pass below
+            }
+            if (head == "hold") {
+                ed.keep.push_back(line);
+                continue;
             }
             EditZone z;
             if (head == "magazine" || head == "slide" || head == "box") {
@@ -5298,6 +5389,9 @@ namespace
         char text[2048];
         std::snprintf(text, sizeof(text), "; ManualReloadF zones of weapon %08X, edited in game\n", weapon);
         out << text;
+        for (const auto& line : g_ed.keep) {
+            out << line << "\n";
+        }
         for (const auto& z : g_ed.zones) {
             if (z.type == 0) {
                 const std::string head = z.head == "box" ? "box " + z.name : z.head;
@@ -6619,7 +6713,10 @@ namespace
             static int marks = 0;
             const bool markNow = free.valid && (free.buttons & buttonMask(g_settings.markButton)) != 0 &&
                                  (free.previousButtons & buttonMask(g_settings.markButton)) == 0;
-            if (markNow) {
+            if (markNow && saveHold(gun)) {
+                hud("Хват магазина сохранён: так он будет доставаться с пояса");
+                buzz(freeIndex(), 3000);
+            } else if (markNow) {
                 ++marks;
                 char tag[32];
                 std::snprintf(tag, sizeof(tag), "MARK %d", marks);
