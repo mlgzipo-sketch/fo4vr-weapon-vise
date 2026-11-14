@@ -113,7 +113,7 @@ Function Casing(int kind, float[] pose, float[] impulse, int token)
 		n += 1
 	endwhile
 	c.SetMotionType(1, true)
-	if impulse && impulse.Length == 4
+	if impulse && impulse.Length == 4 && impulse[3] > 0.0
 		c.ApplyHavokImpulse(impulse[0], impulse[1], impulse[2], impulse[3])
 	endif
 	ManualReloadF.AddMag(c, token)
