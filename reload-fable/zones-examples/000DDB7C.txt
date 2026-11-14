@@ -1,0 +1,5 @@
+; ManualReloadF zones of weapon 000DDB7C (gamma gun): three capacitors, each into its own socket
+magazine lo 1.227 0.514 4.542 hi 4.265 4.013 7.052
+point chamber1 -2.745 2.220 5.794
+point chamber2 -0.363 2.497 8.157
+point chamber3 2.746 2.263 5.797

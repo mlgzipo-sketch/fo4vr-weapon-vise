@@ -1,0 +1,5 @@
+; ManualReloadF zones of weapon 000FF995 (alien blaster): the cover WeaponExtra1 swings about its hinge, one cell goes in at the socket
+box breech lo -4.025 3.341 1.067 hi -3.226 6.151 3.996
+route breech -3.996 4.746 2.531 -4.789 5.296 2.531 -5.158 5.932 2.531 -5.269 6.583 2.531 -5.167 7.202 2.531
+point hinge -3.310 6.580 2.480
+socket cell mouth -0.546 4.755 2.529 axis -1.0000 -0.0000 0.0000 side 1.140 ahead 3.687

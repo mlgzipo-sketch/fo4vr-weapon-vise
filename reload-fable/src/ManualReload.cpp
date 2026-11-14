@@ -443,6 +443,8 @@ namespace
     constexpr int kMinigunKind = 22;       // MRF_MagMinigun: a box of 5mm stands for the drum (the game has no drum model of its own)
     constexpr std::uint32_t kInstituteLaser = 0x001633CC;   // its cell is the laser gun's fusion cell
     constexpr std::uint32_t kCryolator = 0x00171B2B;
+    constexpr std::uint32_t kAlienBlaster = 0x000FF995;   // its cover (WeaponExtra1) swings open, one cell (WeaponMagazine) feeds it
+    constexpr std::uint32_t kGammaGun = 0x000DDB7C;       // three capacitors (WeaponMagazineChild1-3), each into its own socket
     constexpr int kPlasmaKind = 23;        // MRF_MagPlasma
     constexpr int kGaussFirstKind = 24;    // MRF_MagGaussSmall .. MRF_MagGaussXL (24..26)
     constexpr int kFlamerFirstKind = 27;   // MRF_MagFlamer, MRF_MagFlamerLarge (27, 28)
@@ -1474,7 +1476,11 @@ namespace
     // Guns that open instead of taking a magazine: a revolver's cylinder swings out, a break-action gun folds.
     struct Breech
     {
-        int               mech{ 0 };        // 0 none, 1 revolver, 2 break action, 3 one big round at a breech (Fat Man, missile launcher)
+        int               mech{ 0 };        // 0 none, 1 revolver, 2 break action, 3 one big round at a breech (Fat Man, missile launcher),
+                                            // 4 a cover and one cell (alien blaster), 5 three capacitors in three sockets (gamma gun)
+        std::uint32_t     caps{ 0 };        // mech 5: capacitors in
+        RE::NiTransform   cellRest{};       // mech 4: the cell node as it stands in the gun
+        bool              cellRestKnown{ false };
         bool              checked{ false };
         bool              known{ false };   // the closed pose is remembered
         RE::NiTransform   rest{};
@@ -2067,8 +2073,8 @@ namespace
                 hingeKnown = true;
             } else if (head == "box" && words >> word >> lo.x >> lo.y >> lo.z >> word >> hi.x >> hi.y >> hi.z) {
                 boxMiddle[name] = (lo + hi) * 0.5f;
-            } else if (head == "socket" && (name == "nuke" || name == "missile") && words >> word >> lo.x >> lo.y >> lo.z) {
-                st.singleShot = true;
+            } else if (head == "socket" && (name == "nuke" || name == "missile" || name == "cell") && words >> word >> lo.x >> lo.y >> lo.z) {
+                st.singleShot = name != "cell";
                 st.breechMouth = lo;
                 float side = 0.0f;
                 while (words >> word) {
@@ -4502,7 +4508,8 @@ namespace
         rocklink::Frame link{};
         link.gun = true;
         link.freeHand = freeIndex();
-        link.magazine.node = kMovingParts[0];
+        const char* partName = b.mech == 4 ? "WeaponExtra1" : kMovingParts[0];   // the part that opens
+        link.magazine.node = partName;
         link.bolt.node = kMovingParts[1];
         if (b.drawn) {
             link.magazine.drive = true;   // ROCK's collision of the opening part goes where it is drawn
@@ -4510,13 +4517,16 @@ namespace
         }
         g_rock = rocklink::frame(link);
 
-        auto* mag = findNamed(root, kMovingParts[0]);
+        auto* mag = findNamed(root, partName);
         if (!looksLikeObject(mag) || !looksLikeObject(mag->parent)) {
             return;
         }
         const bool revolver = b.mech == 1;
         const bool single = b.mech == 3;   // a mini nuke / a missile: nothing is left in it after the shot
-        const bool played = gun.weapon && loadPlayed(gun.weapon->GetFormID());
+        const bool cellCover = b.mech == 4;   // alien blaster: one cell is all its rounds
+        const bool capacitors = b.mech == 5;  // gamma gun: three capacitors, then it is loaded
+        auto* cellNode = cellCover ? findNamed(root, kMovingParts[0]) : nullptr;
+        const bool played = !cellCover && !capacitors && gun.weapon && loadPlayed(gun.weapon->GetFormID());
         const bool zoneHinge = !played && st.zoneHinge.arc;   // no recording: the turn drawn in Blender
         if (zoneHinge) {
             g_play.axis = st.zoneHinge.axis;
@@ -4565,6 +4575,11 @@ namespace
             });
             b.known = true;
             b.restInRoot = relative(root->world, mag->world);
+            if (looksLikeObject(cellNode)) {
+                b.cellRest = cellNode->local;
+                b.cellRestKnown = true;
+            }
+            b.caps = capacitors ? 3u : 0u;
             if (st.leverKnown) {
                 if (auto* bolt = leverNodeOf(root); looksLikeObject(bolt) && looksLikeObject(bolt->parent)) {
                     b.leverRestLocal = bolt->local;
@@ -4620,7 +4635,7 @@ namespace
                 gun.data->ammoCount = ammo;
                 gameReloaded = true;
             } else if (ammo < b.lastAmmo) {
-                b.spent = single ? 0u : std::min(b.spent + (b.lastAmmo - ammo), capacity - std::min(ammo, capacity));
+                b.spent = single || capacitors ? 0u : cellCover ? (ammo == 0 ? 1u : 0u) : std::min(b.spent + (b.lastAmmo - ammo), capacity - std::min(ammo, capacity));
                 detail("Shot: %u rounds and %u fired cases in the gun", ammo, b.spent);
             }
             b.live = ammo;
@@ -4659,6 +4674,13 @@ namespace
                 playSound(1);
                 buzz(g_settings.gunHand, 1200);
                 note("OPEN: %u rounds, %u fired cases", b.live, b.spent);
+                if (capacitors) {
+                    // the three capacitors drop out: what was left in them goes back to the pouch
+                    ejectCasings(gun, root, mag->world.translate, axisOf(root->world, 2) * -1.0f, b.caps, "the gamma gun's capacitors");
+                    b.caps = 0;
+                    b.live = 0;
+                    b.spent = 0;
+                }
             }
         } else if ((reloadStarted || gameReloaded) && !b.open && b.known) {
             // the game's own reload began (an empty gun reloads by itself): held shut, the hand opens it
@@ -4669,7 +4691,7 @@ namespace
         }
         // a break action's barrels (or a launcher's breech) hang on a hinge: gravity and the gun's own jerks swing them;
         // they fall open freely, and only a pull shut stronger than fHingeHold (a flick) carries them shut
-        const bool swinging = hinged && !revolver && !single && b.open && b.known && g_play.openAngle > 0.1f;
+        const bool swinging = hinged && !revolver && !single && !cellCover && !capacitors && b.open && b.known && g_play.openAngle > 0.1f;
         if (!b.driving && !b.pushing && swinging) {
             const float range = g_play.openAngle;
             float theta = b.t * range;
@@ -4736,7 +4758,7 @@ namespace
             mag->local = b.rest;
             if (b.t > 0.0f) {
                 const float eased = b.t * b.t * (3.0f - 2.0f * b.t);
-                if (!hinged) {
+                if (!hinged && !capacitors) {
                     turnRows(mag->local.rotate, revolver ? 1 : 0, (revolver ? g_settings.cylinderSwing : g_settings.breakAngle) * 0.01745329f * eased);
                 }
             }
@@ -4770,8 +4792,8 @@ namespace
         b.prevAt = at;
         b.prevKnown = true;
 
-        const auto barrel = axisOf(mag->world, 1);   // the cylinder's / the barrels' own line, forward
-        const auto breechNode = looksLikeObject(child[0]) ? child[0] : mag;
+        const auto barrel = cellCover || capacitors ? axisOf(root->world, 1) : axisOf(mag->world, 1);   // the cylinder's / the barrels' own line, forward
+        const auto breechNode = cellCover && looksLikeObject(cellNode) ? cellNode : looksLikeObject(child[0]) ? child[0] : mag;
         const auto breechAt = breechNode->world.translate - (revolver ? barrel * (2.0f * scale) : RE::NiPoint3{});
         const bool fullyOpen = b.open && b.t >= (swinging || single ? 0.6f : 0.95f);   // hanging barrels need not be all the way down
         // zones (Blender): the palm against the opening part, taken back to where the part stands closed
@@ -4949,7 +4971,7 @@ namespace
         if (!single && fullyOpen && b.live + b.spent > 0 && muzzleUp && now - b.upSince > std::chrono::milliseconds(250) &&
             now - b.opened > std::chrono::milliseconds(350)) {
             note("EMPTIED: %u rounds back to the pouch, %u fired cases gone", b.live, b.spent);
-            ejectCasings(gun, root, breechAt, barrel * -1.0f, b.live + b.spent, "fell out, muzzle up");
+            ejectCasings(gun, root, breechAt, barrel * -1.0f, cellCover ? 1u : b.live + b.spent, "fell out, muzzle up");
             if (b.live > 0) {
                 hud("Патроны высыпались и вернулись в запас");
             }
@@ -4974,12 +4996,15 @@ namespace
             if (atBelt && b.held == 0) {
                 const auto inventory = gun.data->ammo ? inventoryCount(player, gun.data->ammo) : 0u;
                 const auto have = inventory > b.live ? inventory - b.live : 0u;
-                const auto room = capacity - std::min(capacity, b.live + b.spent);
-                const auto take = std::min(have, revolver ? room : std::min(room, 1u));
+                const auto room = cellCover ? (b.live + b.spent > 0 ? 0u : capacity) :
+                                  capacitors ? (b.caps < 3 ? 1u : 0u) : capacity - std::min(capacity, b.live + b.spent);
+                const auto take = capacitors ? std::min(have, room) : std::min(have, revolver || cellCover ? room : std::min(room, 1u));
                 if (take == 0) {
                     note("BELT: nothing taken (%u carried, %u in the gun, room %u)", inventory, b.live, room);
                 }
-                if (b.spent > 0 && room == 0) {
+                if (cellCover && room == 0) {
+                    hud("Сначала достань батарею: вытащи рукой или подними ствол вверх");
+                } else if (b.spent > 0 && room == 0) {
                     hud("Сначала вытряхни гильзы: подними ствол вверх");
                 } else if (take == 0) {
                     hud(have == 0 ? "Патронов нет" : "Заряжено полностью");
@@ -4989,13 +5014,21 @@ namespace
                     buzz(freeIndex(), 1200);
                     note("BELT: %u round(s) in the free hand", take);
                 }
+            } else if (cellCover && !atBelt && b.held == 0 && b.live + b.spent > 0 && looksLikeObject(cellNode) &&
+                       distance(spare.palm, cellNode->world.translate) < 8.0f * scale) {
+                note("The cell is pulled out by hand: %u rounds back to the pouch", b.live);
+                ejectCasings(gun, root, cellNode->world.translate, axisOf(root->world, 2) * -1.0f, 1, "the alien blaster's cell");
+                b.live = 0;
+                b.spent = 0;
+                playSound(4);
+                buzz(freeIndex(), 1200);
             } else if (hinged && !atBelt && b.held == 0 && touchesPart(14.0f)) {
                 b.driving = true;
                 b.driveAngle0 = hingeAngle(root, spare.palm);
                 b.driveT0 = b.t;
                 buzz(freeIndex(), 800);
                 detail("The free hand takes the opening part at %.2f open", b.t);
-            } else if (!hinged && !atBelt && b.held == 0 && fullyOpen && toGun < 12.0f * scale) {
+            } else if (!hinged && !capacitors && !atBelt && b.held == 0 && fullyOpen && toGun < 12.0f * scale) {
                 close("the free hand");
             }
         }
@@ -5089,7 +5122,7 @@ namespace
             b.held = 0;
         }
         bool atChamber = toGun < g_settings.breechRadius * scale;
-        if (single && spare.valid) {
+        if ((single || cellCover) && spare.valid) {
             // the palm, or the nose of the round held ahead of the fingers, at the breech
             const auto palmIn = relative(root->world, pointTransform(spare.palm)).translate;
             const auto noseIn = relative(root->world, pointTransform(spare.palm + axisOf(spare.wand, 1) * (10.0f * scale))).translate;
@@ -5109,20 +5142,30 @@ namespace
             atChamber = nearest < g_settings.chamberReach;
         }
         if (b.held > 0 && !st.roundAdjusting && fullyOpen && atChamber) {
-            b.live += b.held;
-            note("LOAD: %u round(s) in, %u of %u in the gun", b.held, b.live, capacity);
+            if (capacitors) {
+                b.caps = std::min(b.caps + 1, 3u);
+                note("LOAD: capacitor %u of 3 in", b.caps);
+            } else {
+                b.live += b.held;
+                note("LOAD: %u round(s) in, %u of %u in the gun", b.held, b.live, capacity);
+            }
             b.held = 0;
             playSound(0);
             buzz(0, 2000);
             buzz(1, 2000);
             griphook::setOwned(false);
+            if (capacitors && b.caps >= 3) {
+                const auto inventory = gun.data->ammo ? inventoryCount(player, gun.data->ammo) : 0u;
+                b.live = std::min(inventory, capacity);
+                close("all three capacitors in");
+            }
         }
         // a flick of the wrist: a revolver rolled sharply about its barrel, a break action's muzzle snapped up
         const auto forwardNow = axisOf(root->world, 1);
         const auto sideNow = axisOf(root->world, 0);
         float flick = 0.0f;
         if (b.turnKnown && dt > 1e-4f) {
-            flick = revolver ? std::fabs(sideNow.z - b.prevSide.z) / dt : (forwardNow.z - b.prevForward.z) / dt;
+            flick = revolver || cellCover ? std::fabs(sideNow.z - b.prevSide.z) / dt : (forwardNow.z - b.prevForward.z) / dt;
         }
         b.prevForward = forwardNow;
         b.prevSide = sideNow;
@@ -5141,7 +5184,7 @@ namespace
             note("OPEN (latch and a flick down, %.1f/s): %u rounds, %u fired cases", -flick, b.live, b.spent);
         }
         if (!swinging && fullyOpen && b.held == 0 && !b.driving && now - b.opened > std::chrono::milliseconds(600)) {
-            const float jerk = revolver ? std::fabs(dot(b.velocity, axisOf(root->world, 0))) : b.velocity.z;
+            const float jerk = revolver || cellCover ? std::fabs(dot(b.velocity, axisOf(root->world, 0))) : b.velocity.z;
             if ((jerk > g_settings.flickSpeed * scale || flick > g_settings.flickTurn) && !(barrel.z > 0.3f && b.live + b.spent > 0)) {
                 note("Flick: moved %.0f, turned %.1f/s", jerk / std::max(scale, 0.01f), flick);
                 close("a flick of the gun");
@@ -5160,7 +5203,19 @@ namespace
         if (single && !looksLikeObject(bigRound)) {
             bigRound = findNamed(root, "CMissile");
         }
-        if (single) {
+        if (cellCover) {
+            if (looksLikeObject(cellNode)) {
+                setCulled(cellNode, !(b.live > 0 || b.spent > 0 || b.held > 0));
+                if (b.held == 0 && b.cellRestKnown) {
+                    cellNode->local = b.cellRest;   // back in its place in the gun
+                    refreshSubtree(cellNode, RE::NiPoint3{});
+                }
+            }
+        } else if (capacitors) {
+            for (std::uint32_t i = 0; i < 3; ++i) {
+                show(static_cast<int>(i), i < b.caps || (b.held > 0 && i == b.caps));
+            }
+        } else if (single) {
             if (looksLikeObject(bigRound)) {
                 setCulled(bigRound, !(b.live > 0 || b.held > 0));
             }
@@ -5190,7 +5245,15 @@ namespace
                 pose.scale = scale;
             }
             st.roundFrozen = pose;
-            if (single) {
+            if (cellCover) {
+                if (looksLikeObject(cellNode)) {
+                    placeNode(cellNode, pose);
+                }
+            } else if (capacitors) {
+                if (b.caps < 3) {
+                    placeNode(child[b.caps], pose);
+                }
+            } else if (single) {
                 if (looksLikeObject(bigRound)) {
                     placeNode(bigRound, pose);
                 }
@@ -6154,10 +6217,16 @@ namespace
                     return true;
                 });
                 st.breech.mech = cylinder ? 1 : (shells ? 2 : (st.singleShot && st.zoneHinge.arc ? 3 : 0));
+                if (gun.weapon->GetFormID() == kAlienBlaster) {
+                    st.breech.mech = 4;
+                } else if (gun.weapon->GetFormID() == kGammaGun) {
+                    st.breech.mech = 5;
+                }
                 if (st.breech.mech != 0 && looksLikeObject(findNamed(drawnRoot, kMovingParts[0]))) {
                     st.managed = true;
                     note("This gun opens: %s, reloaded by hand",
-                        st.breech.mech == 1 ? "a revolver (the cylinder swings out)" : (st.breech.mech == 2 ? "a break action" : "one big round at the breech"));
+                        st.breech.mech == 1 ? "a revolver (the cylinder swings out)" : st.breech.mech == 2 ? "a break action" :
+                        st.breech.mech == 4 ? "a cover and a cell" : st.breech.mech == 5 ? "three capacitors" : "one big round at the breech");
                 } else {
                     st.breech.mech = 0;
                 }
