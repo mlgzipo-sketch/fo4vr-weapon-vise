@@ -17,18 +17,20 @@ OUT = sys.argv[1] if len(sys.argv) > 1 else 'RigVR.esp'
 FORM_VERSION = 131
 OWN = 0x01000000
 
-POUCHES = ['Mag', 'Med', 'Grenade', 'Holster', 'Dump', 'Bandolier']   # pouch type 1..6 in the plugin
+POUCHES = ['Mag', 'Med', 'Grenade', 'Holster', 'Dump', 'Bandolier', 'Sling']   # pouch type 1..7 in the plugin
 NAMES = {'Mag': 'Rig: Magazine Pouch', 'Med': 'Rig: First Aid Pouch', 'Grenade': 'Rig: Grenade Pouch',
-         'Holster': 'Rig: Holster', 'Dump': 'Rig: Dump Pouch', 'Bandolier': 'Rig: Ammo Loops'}
+         'Holster': 'Rig: Holster', 'Dump': 'Rig: Dump Pouch', 'Bandolier': 'Rig: Ammo Loops',
+         'Sling': 'Rig: Back Gun Sling'}
 
 IDS = {'RigVR_Mannequin': 0x800, 'RigVR_Rig': 0x801, 'RigVR_Ghost': 0x802, 'RigVR_Cursor': 0x803}
-for k, p in enumerate(POUCHES):
+for k, p in enumerate(POUCHES[:6]):
     IDS['RigVR_Pouch' + p] = 0x804 + k          # 0x804..0x809
 IDS['RigVR_Kit'] = 0x80A
-for k, p in enumerate(POUCHES):
+for k, p in enumerate(POUCHES[:6]):
     IDS['RigVR_Item' + p] = 0x80B + k           # 0x80B..0x810
 IDS.update({'RigVR_SndSnap': 0x811, 'RigVR_SndPickUp': 0x812, 'RigVR_SndFocus': 0x813, 'RigVR_SndPutIn': 0x814,
-            'RigVR_Stats': 0x815, 'RigVR_PouchItems': 0x816, 'RigVR_Sounds': 0x817, 'RigVR_Quest': 0x818})
+            'RigVR_Stats': 0x815, 'RigVR_PouchItems': 0x816, 'RigVR_Sounds': 0x817, 'RigVR_Quest': 0x818,
+            'RigVR_PouchSling': 0x819, 'RigVR_ItemSling': 0x81A})   # 0.2
 
 
 def zstr(s): return s.encode('latin1') + b'\0'

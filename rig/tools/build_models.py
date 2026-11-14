@@ -132,7 +132,7 @@ def rig():
     return s
 
 
-# kind -> (half sizes, colour). Order = pouch type 1..6 in the plugin.
+# kind -> (half sizes, colour). Order = pouch type 1..7 in the plugin.
 POUCHES = [
     ('Mag', (3.0, 2.0, 4.5), (0.35, 1.0, 0.35, 1.0)),        # magazines: green
     ('Med', (4.0, 2.5, 4.0), (1.0, 0.25, 0.25, 1.0)),        # first aid: red
@@ -140,6 +140,7 @@ POUCHES = [
     ('Holster', (3.0, 2.0, 7.5), (0.3, 0.6, 1.0, 1.0)),      # holster: blue
     ('Dump', (5.0, 3.5, 5.0), (1.0, 0.55, 0.15, 1.0)),       # dump pouch: orange
     ('Bandolier', (7.0, 1.5, 2.0), (0.8, 0.55, 0.35, 1.0)),  # ammo loops: brown
+    ('Sling', (2.5, 2.0, 14.0), (0.75, 0.4, 1.0, 1.0)),      # a long gun on the back: violet
 ]
 
 

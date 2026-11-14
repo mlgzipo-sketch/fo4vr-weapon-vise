@@ -3,7 +3,7 @@ Scriptname RigVRMain extends Quest
 objects it draws with, moves items between the inventory and the hands, and keeps the rig in the save.}
 
 FormList Property RigVR_Stats Auto Const        ; 0 mannequin, 1 rig, 2 free place, 3 cursor, 4.. pouches (type 1..6)
-FormList Property RigVR_PouchItems Auto Const   ; pouch items, type 1..6
+FormList Property RigVR_PouchItems Auto Const   ; pouch items, type 1..7
 FormList Property RigVR_Sounds Auto Const       ; 0 snap, 1 pick up, 2 focus, 3 put in
 MiscObject Property Kit Auto Const              ; the folded mannequin
 
@@ -15,6 +15,7 @@ ObjectReference[] Spawned   ; objects made for drawing (ring buffer), removed af
 int SpawnedNext
 bool Busy
 bool KitGiven
+bool SlingGiven             ; 0.2: the back sling came after the first starter kit
 
 Event OnInit()
 	RegisterForRemoteEvent(Game.GetPlayer(), "OnPlayerLoadGame")
@@ -23,8 +24,10 @@ Event OnInit()
 	SendState()
 	if !KitGiven
 		KitGiven = true
+		SlingGiven = true
 		GiveStarterKit()
 	endif
+	GiveNewItems()
 	StartTimer(0.1, TimerPoll)
 EndEvent
 
@@ -33,8 +36,18 @@ Event Actor.OnPlayerLoadGame(Actor akSender)
 	Cleanup()
 	SendForms()
 	SendState()
+	GiveNewItems()
 	StartTimer(0.1, TimerPoll)
 EndEvent
+
+; Pouches added in later versions, for a game that already got the starter kit.
+Function GiveNewItems()
+	if !SlingGiven && RigVR_PouchItems.GetSize() >= 7
+		SlingGiven = true
+		Game.GetPlayer().AddItem(RigVR_PouchItems.GetAt(6), 2, true)
+		RigVR.Notify(21)
+	endif
+EndFunction
 
 Function SendForms()
 	RigVR.SetForm(0, Kit.GetFormID())
@@ -61,6 +74,7 @@ Function GiveStarterKit()
 	Actor player = Game.GetPlayer()
 	player.AddItem(Kit, 1, true)
 	player.AddItem(RigVR_PouchItems.GetAt(0), 2, true)
+	player.AddItem(RigVR_PouchItems.GetAt(6), 1, true)   ; two back slings in all
 	int i = 1
 	while i < RigVR_PouchItems.GetSize()
 		player.AddItem(RigVR_PouchItems.GetAt(i), 1, true)

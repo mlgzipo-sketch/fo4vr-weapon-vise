@@ -64,8 +64,8 @@ namespace
 
     // ------------------------------------------------------------ the rig's shape
 
-    constexpr int kSlots = 11;
-    constexpr int kPouchTypes = 6;   // 1..6
+    constexpr int kSlots = 13;
+    constexpr int kPouchTypes = 7;   // 1..7
     constexpr int kItemsPerPouch = 4;
 
     enum PouchType : int
@@ -77,6 +77,7 @@ namespace
         kHolster = 4,
         kDump = 5,
         kBandolier = 6,
+        kSling = 7,       // a long gun on the back
     };
 
     const char* pouchName(int type) noexcept
@@ -88,6 +89,7 @@ namespace
         case kHolster: return "Кобура";
         case kDump: return "Сбросной мешок";
         case kBandolier: return "Патронташ";
+        case kSling: return "Ремень для оружия (спина)";
         default: return "";
         }
     }
@@ -109,7 +111,7 @@ namespace
         float yaw;       // the pouch turned this much around the vertical (degrees, + = to the right)
     };
 
-    // Default places: 6 on the chest panel, 5 around the belt. Each can be moved in RigVR.ini (Slot0=x,y,z,yaw).
+    // Default places: 6 on the chest panel, 5 around the belt, 2 on the back (for long guns). Each can be moved in RigVR.ini (Slot0=x,y,z,yaw).
     std::array<SlotPlace, kSlots> g_places{ {
         { 1, -8.0f, 9.0f, 4.0f, 0.0f },
         { 1, 0.0f, 9.5f, 4.0f, 0.0f },
@@ -122,6 +124,8 @@ namespace
         { 0, 9.0f, 8.0f, 0.0f, 35.0f },
         { 0, 13.0f, 1.0f, -4.0f, 90.0f },
         { 0, 0.0f, -10.5f, 0.0f, 180.0f },
+        { 1, -9.0f, -10.0f, 6.0f, 180.0f },
+        { 1, 9.0f, -10.0f, 6.0f, 180.0f },
     } };
 
     int capacityOf(int type) noexcept
@@ -133,6 +137,7 @@ namespace
         case kHolster: return 1;
         case kDump: return 12;
         case kBandolier: return 12;
+        case kSling: return 1;
         default: return 0;
         }
     }
@@ -146,6 +151,7 @@ namespace
         bool  haptics{ true };
         bool  messages{ true };
         float slotRadius{ 8.0f };      // the palm this close to a pouch / a free place
+        float backRadius{ 16.0f };     // ..and this close to a gun place on the back (you cannot see it)
         float mannequinReach{ 150.0f };// the mannequin is used within this distance
         float wearRadius{ 12.0f };     // both hands this close to the mannequin's shoulders to put the rig on / hang it back
         float wearWindow{ 0.5f };      // ..both grips pressed within this many seconds
@@ -192,7 +198,7 @@ namespace
         auto& s = g_settings;
         const Entry entries[]{
             { "iGunHand", 1, &s.gunHand }, { "iGripButton", 1, &s.gripButton }, { "bHaptics", 0, &s.haptics },
-            { "bMessages", 0, &s.messages }, { "fSlotRadius", 2, &s.slotRadius }, { "fMannequinReach", 2, &s.mannequinReach },
+            { "bMessages", 0, &s.messages }, { "fSlotRadius", 2, &s.slotRadius }, { "fBackRadius", 2, &s.backRadius }, { "fMannequinReach", 2, &s.mannequinReach },
             { "fWearRadius", 2, &s.wearRadius }, { "fWearWindow", 2, &s.wearWindow }, { "fPackSeconds", 2, &s.packSeconds },
             { "fStoreRadius", 2, &s.storeRadius }, { "fMouthRadius", 2, &s.mouthRadius }, { "fHolsterCooldown", 2, &s.holsterCooldown },
             { "fBeltHeight", 2, &s.beltHeight }, { "fChestHeight", 2, &s.chestHeight }, { "fBeltUp", 2, &s.beltUp },
@@ -527,6 +533,7 @@ namespace
             }
             return false;
         case kHolster:
+        case kSling:
             return kind == RE::ENUM_FORM_ID::kWEAP && static_cast<RE::TESObjectWEAP*>(form)->weaponData.type.get() == RE::WEAPON_TYPE::kGun;
         case kDump:
             return kind == RE::ENUM_FORM_ID::kMISC || kind == RE::ENUM_FORM_ID::kALCH || kind == RE::ENUM_FORM_ID::kAMMO ||
@@ -793,6 +800,7 @@ namespace
         case 2: queueHud("Не получилось достать предмет"); break;
         case 3: queueHud("Не получилось поставить манекен"); break;
         case 10: queueHud("Подсумки не бросают: повесь его на манекен (полка справа от манекена)"); break;
+        case 21: queueHud("Разгрузка 0.2: в инвентаре два ремня для оружия на спину. Повесь их на спину манекена"); break;
         case 20: queueHud("Разгрузка: в инвентаре (Разное) манекен и подсумки. Выбрось манекен из Пип-Боя, чтобы поставить его"); break;
         default: break;
         }
@@ -1198,7 +1206,7 @@ namespace
             if (filled != wantFilled) {
                 continue;
             }
-            const float d = distance(slotPose(f, i).translate, palm);
+            const float d = distance(slotPose(f, i).translate, palm) * (g_rig.slots[i].type == kSling ? g_settings.slotRadius / g_settings.backRadius : 1.0f);
             if (d < bestDistance) {
                 bestDistance = d;
                 best = i;
@@ -1467,7 +1475,8 @@ namespace
             auto& pouch = g_rig.slots[slot];
             const bool gunHand = h == g_settings.gunHand;
 
-            if (pouch.type == kHolster && gunHand) {
+            const bool gunPlace = pouch.type == kHolster || pouch.type == kSling;
+            if (gunPlace && gunHand) {
                 // holster: let go of (or press) the grip with a gun at an empty holster to put it away
                 if (gun && pouch.total() == 0 && (hand.released() || hand.pressed()) && !cooling) {
                     pouch.items[0] = Stack{ gun->GetFormID(), 1 };
@@ -1481,7 +1490,7 @@ namespace
                 // ..and grip at a full holster with an empty hand to draw it
                 if (!gun && pouch.total() > 0 && hand.pressed() && !cooling) {
                     const auto form = pouch.items[0].form;
-                    pouch = Pouch{ kHolster };
+                    pouch = Pouch{ pouch.type };
                     if (inventoryCount(player, form) > 0) {
                         pushSimple(kEquip, 0, form);
                         sound(1);
@@ -1501,7 +1510,7 @@ namespace
             }
 
             // let go of an item over a pouch: it goes in
-            if (hand.released() && pouch.type != kHolster) {
+            if (hand.released() && !gunPlace) {
                 if (auto* ref = looseItemNear(player, hand.palm, pouch.type)) {
                     auto* base = ref->GetObjectReference();
                     if (addToPouch(pouch, base->GetFormID())) {
@@ -1520,7 +1529,7 @@ namespace
             if (!hand.pressed()) {
                 continue;
             }
-            if (pouch.type == kHolster) {
+            if (gunPlace) {
                 // a loose gun let go of over the holster is taken above; with the gun hand busy nothing else to do
                 continue;
             }
