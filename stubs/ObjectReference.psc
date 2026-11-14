@@ -20,6 +20,7 @@ Function RemoveItem(Form akItemToRemove, int aiCount = 1, bool abSilent = false,
 Function RemoveMod(ObjectMod akMod) native
 Function SetAngle(float afXAngle, float afYAngle, float afZAngle) native
 Function SetMotionType(int aeMotionType, bool abAllowActivate = true) native
+Function ApplyHavokImpulse(float afX, float afY, float afZ, float afMagnitude) native
 Function SetPosition(float afX, float afY, float afZ) native
 ObjectMod[] Function GetAllMods() native
 Event OnItemAdded(Form akBaseItem, int aiItemCount, ObjectReference akItemReference, ObjectReference akSourceContainer)
