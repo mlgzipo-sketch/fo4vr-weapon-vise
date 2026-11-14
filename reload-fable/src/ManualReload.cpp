@@ -110,6 +110,7 @@ namespace
         float holdRotY{ 0.0f };
         float holdRotZ{ 0.0f };
         int   holdFlip{ 0 };            // 1 = the magazine from the belt is upside down in the hand: turn it
+        bool  holdAsInGun{ true };      // a magazine from the belt comes turned as it goes into the gun held now (no turn of the hand at the well)
         float fingerCurl{ 0.35f };      // fingers around a magazine: 0 = fist, 1 = open
         float freezeSeconds{ 1.6f };
         float slideGrabRadius{ 8.0f };
@@ -180,7 +181,7 @@ namespace
             { "fSlideSpeed", 2, &s.slideSpeed }, { "fRailLength", 2, &s.railLength }, { "fMagTilt", 2, &s.magTilt },
             { "fWellSide", 2, &s.wellSide }, { "fCaptureAhead", 2, &s.captureAhead }, { "fSeatAt", 2, &s.seatAt },
             { "fSeatRelease", 2, &s.seatRelease }, { "fMagGrabRadius", 2, &s.magGrabRadius }, { "fGrabUp", 2, &s.grabUp },
-            { "fHoldUp", 2, &s.holdUp }, { "fHoldSide", 2, &s.holdSide }, { "fHoldForward", 2, &s.holdForward },
+            { "fHoldUp", 2, &s.holdUp }, { "bHoldAsInGun", 0, &s.holdAsInGun }, { "fHoldSide", 2, &s.holdSide }, { "fHoldForward", 2, &s.holdForward },
             { "fHoldRotX", 2, &s.holdRotX }, { "fHoldRotY", 2, &s.holdRotY }, { "fHoldRotZ", 2, &s.holdRotZ },
             { "iHoldFlip", 1, &s.holdFlip }, { "fFingerCurl", 2, &s.fingerCurl }, { "fFreezeSeconds", 2, &s.freezeSeconds },
             { "fSlideGrabRadius", 2, &s.slideGrabRadius }, { "fSlideGrabAt", 2, &s.slideGrabAt }, { "fSlideGrabHigh", 2, &s.slideGrabHigh }, { "fRackTravel", 2, &s.rackTravel }, { "fSlideLockAt", 2, &s.slideLockAt },
@@ -1668,6 +1669,9 @@ namespace
         bool               zoneMouthKnown{ false };
         RE::NiPoint3       catchPointInNode{};             // zones file "point magtop": the point of the magazine the well catches
         bool               catchPointKnown{ false };
+        RE::NiPoint3       holdPointInGun{};               // zones file "point maghold": where the palm holds the magazine (on it, seated, gun frame)
+        bool               holdPointKnown{ false };
+        bool               gameBoltAction{ true };         // the game's own flag for the gun as built (a pipe pistol is not a bolt action)
         float              zoneCatchAhead{ -1.0f };                 // core2: out this far along the well and the magazine has left it
     };
     State g_state;
@@ -2011,12 +2015,16 @@ namespace
         st.hasZonesFile = static_cast<bool>(in);
         std::vector<std::string> lines;
         std::unordered_map<std::string, RE::NiPoint3> boxMiddle;
+        bool hingeKnown = false;
+        RE::NiPoint3 hinge{};
         for (std::string line; in && std::getline(in, line);) {
             std::istringstream words(line);
             std::string head, name, word;
             words >> head >> name;
             RE::NiPoint3 lo{}, hi{};
-            if (head == "box" && words >> word >> lo.x >> lo.y >> lo.z >> word >> hi.x >> hi.y >> hi.z) {
+            if (head == "point" && name == "hinge" && words >> hinge.x >> hinge.y >> hinge.z) {
+                hingeKnown = true;
+            } else if (head == "box" && words >> word >> lo.x >> lo.y >> lo.z >> word >> hi.x >> hi.y >> hi.z) {
                 boxMiddle[name] = (lo + hi) * 0.5f;
             } else if (head == "socket" && (name == "nuke" || name == "missile") && words >> word >> lo.x >> lo.y >> lo.z) {
                 st.singleShot = true;
@@ -2076,7 +2084,25 @@ namespace
             for (auto& a : at) {
                 a = total > 0.0f ? a / total : 0.0f;
             }
-            const auto fit = fitArc(pts, at);
+            auto fit = fitArc(pts, at);
+            if (hingeKnown && (name == "barrels" || name == "breech") && pts.size() >= 2) {
+                // the hinge is where it was put (zones file "point hinge"): the part turns about it from the way's first
+                // point to its last, whatever circle the drawn points make
+                auto u = pts.front() - hinge, v = pts.back() - hinge;
+                const auto n = cross(u, v);
+                if (dot(n, n) > 1e-6f) {
+                    fit = ArcFit{};
+                    fit.axis = normalized(n);
+                    u = u - fit.axis * dot(u, fit.axis);
+                    v = v - fit.axis * dot(v, fit.axis);
+                    fit.angle = std::atan2(std::sqrt(dot(cross(u, v), cross(u, v))), dot(u, v));
+                    fit.pivot = hinge;
+                    fit.arc = fit.angle > 0.05f;
+                    fit.arcAt = 1.0f;
+                    fit.k = pts.size() - 1;
+                    note("ZONES: %s turns about its hinge point (%.1f %.1f %.1f)", name.c_str(), hinge.x, hinge.y, hinge.z);
+                }
+            }
             if (name == "lever") {
                 if (pts.size() >= 2 && total > 0.5f) {
                     st.leverKnown = true;
@@ -2205,6 +2231,10 @@ namespace
                 st.catchPointKnown = true;
                 note("ZONES: the magazine is caught by its point (%.1f %.1f %.1f) in the gun, (%.2f %.2f %.2f) on the magazine", at.x, at.y, at.z,
                     st.catchPointInNode.x, st.catchPointInNode.y, st.catchPointInNode.z);
+            } else if (words[0] == "point" && words.size() >= 5 && words[1] == "maghold") {
+                st.holdPointInGun = RE::NiPoint3{ num(2), num(3), num(4) };
+                st.holdPointKnown = true;
+                note("ZONES: a magazine from the belt is held at (%.1f %.1f %.1f) of it (seated, in the gun)", num(2), num(3), num(4));
             } else if (words[0] == "point" && words.size() >= 5 && words[1].rfind("chamber", 0) == 0) {
                 st.chambers.push_back(RE::NiPoint3{ num(2), num(3), num(4) });
                 ++used;
@@ -2740,6 +2770,40 @@ namespace
         pose.translate = hand.palm - axisOf(pose, 2) * ((g_state.bottomAt + g_settings.holdUp) * scale) +
                          axisOf(pose, 0) * ((g_settings.holdSide - g_state.sideInNode.x) * scale) - axisOf(pose, 1) * (g_state.sideInNode.y * scale) +
                          axisOf(pose, 1) * (g_settings.holdForward * scale);
+        return pose;
+    }
+
+    // Where the palm holds a magazine, on the magazine as it sits in the gun (gun frame): "point maghold" from the zones
+    // file, else the middle of its outer half (a cell: its middle).
+    RE::NiPoint3 defaultHoldPoint() noexcept
+    {
+        const auto& st = g_state;
+        if (st.magBoxKnown) {
+            const auto mid = (st.magLo + st.magHi) * 0.5f;
+            if (st.cellFed) {
+                return mid;
+            }
+            const auto size = st.magHi - st.magLo;
+            const float along = std::fabs(size.x * st.axis.x) + std::fabs(size.y * st.axis.y) + std::fabs(size.z * st.axis.z);
+            return mid + st.axis * (along * 0.25f);
+        }
+        const auto& r = st.magRest;
+        const float z = st.cellFed ? (st.topAt + st.bottomAt) * 0.5f : st.bottomAt + (st.topAt - st.bottomAt) * 0.25f;
+        return r.translate + (axisOf(r, 0) * st.sideInNode.x + axisOf(r, 1) * st.sideInNode.y + axisOf(r, 2) * z) * r.scale;
+    }
+
+    // A magazine from the belt: turned exactly as it goes into the gun as the gun is held now, held at its hold point,
+    // so it reaches the well lined up and nothing turns the hand there. Without a gun or a rail: the old fist pose.
+    RE::NiTransform beltPose(const RE::NiAVObject* root, const Hand& hand, float scale) noexcept
+    {
+        const auto& st = g_state;
+        if (!g_settings.holdAsInGun || !looksLikeObject(root) || !st.railKnown) {
+            return holdPose(hand, scale);
+        }
+        auto pose = railPose(root, 0.0f);
+        pose.scale = scale;
+        const auto grip = compose(root->world, pointTransform(st.holdPointKnown ? st.holdPointInGun : defaultHoldPoint())).translate;
+        pose.translate += hand.palm - grip;
         return pose;
     }
 
@@ -5185,6 +5249,36 @@ namespace
                                        r.translate + (axisOf(r, 0) * st.sideInNode.x + axisOf(r, 1) * st.sideInNode.y + axisOf(r, 2) * st.topAt) * r.scale;
             ed.zones.push_back(z);
         }
+        // where the palm holds a magazine from the belt: always there to move
+        const bool hasHold = std::any_of(ed.zones.begin(), ed.zones.end(), [](const EditZone& z) { return z.type == 3 && z.name == "maghold"; });
+        if (!hasHold && g_state.railKnown) {
+            EditZone z;
+            z.type = 3;
+            z.head = "point";
+            z.name = "maghold";
+            z.p = g_state.holdPointKnown ? g_state.holdPointInGun : defaultHoldPoint();
+            ed.zones.push_back(z);
+        }
+        // a part that swings open (barrels, breech): its hinge, to put where the model's hinge is
+        const bool hasHinge = std::any_of(ed.zones.begin(), ed.zones.end(), [](const EditZone& z) { return z.type == 3 && z.name == "hinge"; });
+        if (!hasHinge) {
+            for (const auto& r : ed.zones) {
+                if (r.type == 2 && (r.name == "barrels" || r.name == "breech") && r.pts.size() >= 2) {
+                    EditZone z;
+                    z.type = 3;
+                    z.head = "point";
+                    z.name = "hinge";
+                    std::vector<float> at(r.pts.size(), 0.0f);
+                    for (std::size_t i = 1; i < at.size(); ++i) {
+                        at[i] = static_cast<float>(i) / static_cast<float>(at.size() - 1);
+                    }
+                    const auto fit = fitArc(r.pts, at);
+                    z.p = fit.arc ? fit.pivot : r.pts.front();
+                    ed.zones.push_back(z);
+                    break;
+                }
+            }
+        }
         return true;
     }
 
@@ -5382,7 +5476,9 @@ namespace
         const auto& z = ed.zones[ed.sel];
         const auto modes = modesOf(z);
         char text[256];
-        const std::string label = z.name == "magtop" ? "magtop (кончик магазина в оружии: этой точкой магазин входит в цилиндр)" : z.name;
+        const std::string label = z.name == "magtop" ? "magtop (кончик магазина в оружии: этой точкой магазин входит в цилиндр)" :
+                                  z.name == "maghold" ? "maghold (где ладонь держит магазин с пояса)" :
+                                  z.name == "hinge" ? "hinge (ось, вокруг которой откидывается ствол/казённик)" : z.name;
         std::snprintf(text, sizeof(text), "Зона %d/%d: %s (%s). Режим: %s%s%s", ed.sel + 1, static_cast<int>(ed.zones.size()), label.c_str(), zoneTypeName(z.type),
             modes[std::clamp(ed.mode, 0, static_cast<int>(modes.size()) - 1)].c_str(), extra ? ". " : "", extra ? extra : "");
         RE::SendHUDMessage::ShowHUDMessage(text, nullptr, false, false);
@@ -5729,6 +5825,12 @@ namespace
             st.chamber = total > 0;
             st.rounds = total > 0 ? total - 1 : 0;
             st.kind = kind >= 0 ? kind : (capacityOf(gun) > 12 ? 1 : 0);
+            st.gameBoltAction = true;
+            if (gun.instance && readable(gun.instance, sizeof(RE::TESObjectWEAP::InstanceData))) {
+                const auto flags = gun.instance->flags.underlying();
+                st.gameBoltAction = flags == 0 || gun.instance->flags.any(RE::WEAPON_FLAGS::kBoltAction) || gun.weapon->GetFormID() == 0x0004F46A;
+                note("Weapon flags %08X: %s", static_cast<unsigned>(flags), st.gameBoltAction ? "a bolt action" : "not a bolt action (no working of the bolt after a shot)");
+            }
             st.cellFed = kind == kLaserCellKind || kind == kSyringerKind || kind == kFusionCoreKind || kind == kMinigunKind || kind >= kPlasmaKind;   // nothing to rack
             note("Equipped weapon %08X, capacity %u, rounds %u, magazine '%s' (kind %d): %s", gun.weapon ? gun.weapon->GetFormID() : 0u,
                 capacityOf(gun), total, magModel.c_str(), kind, st.managed ? "reloaded by hand" : "not handled (no magazine of group 1)");
@@ -5946,7 +6048,7 @@ namespace
             } else if (ammo < st.lastAmmo) {
                 st.lastShot = now;
                 st.chamber = ammo > 0;
-                if (st.boltAction && st.place == kSeated) {
+                if (st.boltAction && st.gameBoltAction && st.place == kSeated) {
                     // a bolt action: the fired case stays in the chamber until the bolt is worked
                     st.rounds = ammo;
                     st.chamber = false;
@@ -6043,7 +6145,7 @@ namespace
                 if (rounds == 0) {
                     hud("Патронов для магазина нет");
                 } else {
-                    const auto pose = holdPose(free, magScale);
+                    const auto pose = beltPose(root, free, magScale);
                     st.place = kHand;
                     st.rounds = rounds;
                     st.magInWand = relative(free.wand, pose);
@@ -6078,14 +6180,14 @@ namespace
             st.lastBelt = now;
             if (rounds > 0 && g_settings.core2) {
                 if (!st.handToken && !st.handRef) {
-                    st.handToken = spawnLoose(holdPose(free, magScale), rounds, "a spare from the belt");
+                    st.handToken = spawnLoose(beltPose(root, free, magScale), rounds, "a spare from the belt");
                     st.handTokenDropped = false;
                     st.handSpare = true;
                     playSound(4);
                     buzz(freeIndex(), 1200);
                 }
             } else if (rounds > 0) {
-                spawnLoose(holdPose(free, magScale), rounds, "a spare from the belt");
+                spawnLoose(beltPose(root, free, magScale), rounds, "a spare from the belt");
             }
         }
 
