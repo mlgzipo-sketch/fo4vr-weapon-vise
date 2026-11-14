@@ -90,6 +90,8 @@ jobs:
           New-Item -ItemType Directory -Force $plugins | Out-Null
           Copy-Item build\Release\ManualReloadF.dll $plugins
           Copy-Item reload-fable\ManualReloadF.ini $plugins
+          Copy-Item -Recurse reload-fable\Meshes package\Meshes
+          Copy-Item -Recurse reload-fable\Textures package\Textures
           python reload-fable\tools\build_esp.py package\ManualReloadF.esp
           Compress-Archive -Path package\* -DestinationPath ManualReloadF.zip
 

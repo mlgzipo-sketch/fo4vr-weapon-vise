@@ -17,6 +17,8 @@ namespace griphook
     void setGripMask(std::uint64_t mask) noexcept;
     void setAxis2IsGrip(bool value) noexcept;
     std::uint32_t hiddenCount() noexcept;
+    void setEditing(bool value) noexcept;         // the zone editor: the free controller is hidden from the game
+    bool keyDown(int virtualKey) noexcept;        // a key of the keyboard is held (zone editor)
     // The controller as it really is. False when there is no hook: read it the usual way.
     bool rawState(std::uint32_t device, void* state, std::uint32_t size) noexcept;
 }

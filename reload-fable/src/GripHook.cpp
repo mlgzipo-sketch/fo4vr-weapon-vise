@@ -77,7 +77,8 @@ std::atomic<bool>          g_previous{ false };
 std::atomic<std::uint32_t> g_device{ vr::k_unTrackedDeviceIndexInvalid };
 std::atomic<bool>          g_axis2IsGrip{ false };
 std::atomic<std::uint64_t> g_gripMask{ 1ull << 2 };
-std::atomic<std::uint32_t> g_hidden{ 0 };       // reads answered with the grip hidden (for the log)
+std::atomic<std::uint32_t> g_hidden{ 0 };
+std::atomic<bool>          g_editing{ false };  // the zone editor: the whole free controller is hidden       // reads answered with the grip hidden (for the log)
 
 // One place decides whose press it is, whoever reads the controller first in a frame.
 void arbitrate(bool raw) noexcept
@@ -97,6 +98,15 @@ void filter(vr::TrackedDeviceIndex_t device, vr::VRControllerState_t& state) noe
     }
     const auto mask = g_gripMask.load();
     arbitrate((state.ulButtonPressed & mask) != 0);
+    if (g_editing.load()) {
+        state.ulButtonPressed = 0;
+        state.ulButtonTouched = 0;
+        for (auto& axis : state.rAxis) {
+            axis.x = 0.0f;
+            axis.y = 0.0f;
+        }
+        return;
+    }
     if (!g_owned.load() || !g_hide.load()) {
         return;
     }
@@ -333,4 +343,10 @@ namespace griphook
         t_bypass = false;
         return ok;
     }
+}
+
+namespace griphook
+{
+    void setEditing(bool value) noexcept { g_editing.store(value); }
+    bool keyDown(int virtualKey) noexcept { return (GetAsyncKeyState(virtualKey) & 0x8000) != 0; }
 }
