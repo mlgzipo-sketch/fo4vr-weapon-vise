@@ -3526,12 +3526,14 @@ namespace
         }
         int failure = 0;
         const int state = rocklink::forceGrabState(&failure);
-        if (!(free.valid && free.grip) || now - st.handRefAt > std::chrono::milliseconds(1500)) {
+        if (!(free.valid && free.grip) || now - st.handRefAt > std::chrono::milliseconds(2000)) {
             note("CORE2: ROCK did not take magazine %08X (grab state %d, failure %d, held %08X): it falls", st.handRef, state, failure, held);
+            rocklink::cancelGrab();   // a request still queued would keep the magazine claimed: it would hang in the air, not to be taken
             st.handRef = 0;
             return;
         }
-        if (st.grabTries < 5 && now - st.grabTriedAt > std::chrono::milliseconds(250) && state != 1) {
+        // queued (1): ROCK is on it, asking again only answers "hand busy"; asked again after it was rejected or cancelled
+        if (st.grabTries < 5 && now - st.grabTriedAt > std::chrono::milliseconds(250) && state != 1 && state != 2) {
             st.grabTriedAt = now;
             ++st.grabTries;
             detail("CORE2: asking ROCK again for magazine %08X (state %d, failure %d, held %08X)", st.handRef, state, failure, held);

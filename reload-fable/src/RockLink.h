@@ -58,6 +58,8 @@ namespace rocklink
     bool forceGrab(int hand, std::uint32_t refFormId, const float point[3]) noexcept;
     // The last force grab: 0 unknown, 1 queued, 2 succeeded, 3 rejected, 4 cancelled.
     int forceGrabState(int* failure) noexcept;
+    // Drops a force grab that has not landed, so the magazine is free again (no pending claim on it).
+    void cancelGrab() noexcept;
     // The reference the hand holds through ROCK now (0 none).
     std::uint32_t heldBy(int hand) noexcept;
     // ROCK lets go of that reference.

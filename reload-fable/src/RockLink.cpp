@@ -551,11 +551,21 @@ namespace rocklink
         const auto status = g_grab->requestForceGrab(g_client.owner(), &request, &id);
         say("ROCK: force grab of %08X into the %s hand: status %u, command %llu", refFormId, hand == 0 ? "right" : "left",
             static_cast<unsigned>(status), static_cast<unsigned long long>(id));
-        if (status != api::Status::Ok) {
+        if (status != api::Status::Ok && status != api::Status::RequestQueued) {
             return false;
         }
-        g_grabCommand = id;
+        g_grabCommand = id;   // queued is accepted too: its result is polled, and it is cancelled if it never lands
         return true;
+    }
+
+    void cancelGrab() noexcept
+    {
+        if (!g_grab || !g_grab->cancelInteractionCommand || !g_grabCommand) {
+            return;
+        }
+        const auto status = g_grab->cancelInteractionCommand(g_client.owner(), g_grabCommand);
+        say("ROCK: force grab command %llu cancelled: status %u", static_cast<unsigned long long>(g_grabCommand), static_cast<unsigned>(status));
+        g_grabCommand = 0;
     }
 
     int forceGrabState(int* failure) noexcept
