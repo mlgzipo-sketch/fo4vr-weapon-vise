@@ -2772,14 +2772,16 @@ namespace
                     // a cell, a core or a drum is taken anywhere along its short way in, not only at the mouth
                     const float below = st.cellFed ? mouth + 1.5f : (g_settings.core2 ? 1.5f : 3.0f);
                     float ahead = g_settings.core2 ? (st.zoneCatchAhead > 0.0f ? st.zoneCatchAhead : g_settings.catchAhead) : g_settings.captureAhead;
-                    if (g_settings.core2) {
+                    // (not the fusion core: its zone is drawn generously in Blender and must be where it is taken)
+                    if (g_settings.core2 && st.kind != kFusionCoreKind) {
                         sideMax = std::max(sideMax, 3.5f);
                         ahead = std::max(ahead, st.cellFed ? 13.0f : 9.0f);
                     }
                     if (upright && side <= sideMax && top <= mouth + ahead && top >= mouth - below) {
                         st.rounds = loose.rounds;
                         st.place = kRailHand;
-                        st.s = std::clamp(top, 0.0f, mouth + ahead);
+                        // a cell or a core held off by the gun's collision goes straight to the mouth of its socket
+                        st.s = std::clamp(top, 0.0f, st.cellFed ? mouth + 0.5f : mouth + ahead);
                         st.exitAt = st.s + 4.0f;   // a shaky hand does not pull it straight back out
                         st.driveS0 = st.s;
                         st.driveAlong0 = alongRail(root, node.translate);
@@ -2807,7 +2809,7 @@ namespace
                     if (top < mouth + ahead + 6.0f && side < sideMax + 6.0f && now - missTold > std::chrono::milliseconds(400)) {
                         missTold = now;   // near the well and not taken: why
                         note("NEAR WELL: magazine %08X top %.1f past the mouth (catch from %.1f), %.1f off the line (max %.1f), upright %.2f (needs > %.2f)",
-                            id, top - mouth, ahead, side, sideMax, -tilt, g_settings.core2 ? 0.7f : 0.5f);
+                            id, top - mouth, ahead, side, sideMax, st.cellFed ? std::fabs(tilt) : -tilt, st.cellFed ? 0.5f : (g_settings.core2 ? 0.7f : 0.5f));
                     }
                 }
             }
@@ -4065,7 +4067,11 @@ namespace
                 st.crankPinned = true;
                 st.wristInCrank = relative(crank->world, spare.wrist);
             }
-            pinHand(compose(crank->world, st.wristInCrank));
+            // the handle turns in the hand: the hand follows where the handle goes, but keeps the turn of the
+            // controller, or the wrist would be wrung round with every turn of the crank
+            auto target = spare.wrist;
+            target.translate = compose(crank->world, st.wristInCrank).translate;
+            pinHand(target);
             poseFingers(true);
         } else if (st.crankPinned) {
             st.crankPinned = false;
@@ -5295,9 +5301,9 @@ namespace
                 const auto carried = compose(free.wand, st.magInWand);
                 const float target = st.driveS0 + (alongRail(root, carried.translate) - st.driveAlong0);
                 // core2: caught low (the gun's collision stops a real magazine below the mouth), it leaves again only when
-                // pulled 1.5 further out than it has been since it was caught
+                // pulled 4 further out than it has been since it was caught
                 if (g_settings.core2) {
-                    st.exitAt = std::min(st.exitAt > 0.0f ? st.exitAt : 1e9f, std::max(st.length + 2.0f, st.s + 1.5f));
+                    st.exitAt = std::min(st.exitAt > 0.0f ? st.exitAt : 1e9f, std::max(st.length + 2.0f, st.s + 4.0f));
                 }
                 const float limit = g_settings.core2 ? st.exitAt : st.length + g_settings.captureAhead + 1.0f;
                 if (target > limit) {
@@ -5365,21 +5371,38 @@ namespace
                 }
                 float side = 0.0f;
                 const float top = alongRail(root, topOf(target), &side) + st.topAt * st.magRest.scale;   // as if it were on the rail this far out
-                const bool upright = -dot(wayOutOf(target), axisWorld(root)) < -0.5f;
+                // the same window as for a real magazine (zones file, cells either way round)
+                const float tilt = -dot(wayOutOf(target), axisWorld(root));
+                const bool upright = st.cellFed ? std::fabs(tilt) > 0.5f : tilt < -0.5f;
                 const float mouth = st.length;
+                float sideMax = g_settings.core2 ? (st.zoneCatchSide > 0.0f ? st.zoneCatchSide : g_settings.catchSide) : g_settings.wellSide;
+                float ahead = g_settings.core2 ? (st.zoneCatchAhead > 0.0f ? st.zoneCatchAhead : g_settings.catchAhead) : g_settings.captureAhead;
+                if (g_settings.core2 && st.kind != kFusionCoreKind) {
+                    sideMax = std::max(sideMax, 3.5f);
+                    ahead = std::max(ahead, 6.0f);
+                }
+                const float below = st.cellFed ? mouth + 1.5f : 3.0f;
                 if (st.mustLeave) {
-                    if (top > mouth + g_settings.captureAhead + 2.5f || side > g_settings.wellSide + 2.5f) {
+                    if (top > mouth + ahead + 2.5f || side > sideMax + 2.5f) {
                         st.mustLeave = false;
                     }
-                } else if (upright && side <= g_settings.wellSide && top <= mouth + g_settings.captureAhead && top >= mouth - 3.0f) {
+                } else if (upright && side <= sideMax && top <= mouth + ahead && top >= mouth - below) {
                     // the mouth of the well takes the top of the magazine: from here it moves only along the well
                     st.place = kRailHand;
-                    st.s = std::clamp(top, 0.0f, mouth + g_settings.captureAhead);
+                    st.s = std::clamp(top, 0.0f, st.cellFed ? mouth + 0.5f : mouth + ahead);
+                    st.exitAt = st.s + 4.0f;
                     st.driveS0 = st.s;
                     st.driveAlong0 = alongRail(root, target.translate);
                     startBlend(st.lastDrawnValid ? st.lastDrawn : target, 0.12f);
                     buzz(freeIndex(), 900);
                     note("CATCH: the well has the magazine, %.1f out, %.1f off the line", st.s, side);
+                } else {
+                    static Clock::time_point missTold{};
+                    if (top < mouth + ahead + 6.0f && side < sideMax + 6.0f && now - missTold > std::chrono::milliseconds(400)) {
+                        missTold = now;
+                        note("NEAR WELL (drawn): top %.1f past the mouth (catch from %.1f), %.1f off the line (max %.1f), upright %.2f (needs > 0.50)",
+                            top - mouth, ahead, side, sideMax, st.cellFed ? std::fabs(tilt) : -tilt);
+                    }
                 }
             }
             break;
