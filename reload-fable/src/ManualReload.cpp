@@ -1544,6 +1544,8 @@ namespace
         bool               autoHold{ false };              // sticking out, waiting (the button is held)
         RE::NiTransform    magInWand{};                    // the magazine against the controller that holds it
         RE::NiTransform    wristInMag{};                   // the drawn hand against the magazine
+        bool               railPinned{ false };            // the hand is held on the magazine on the rail..
+        RE::NiPoint3       gripInMag{}, palmInWristMag{};  // ..by the palm's point on it, turned as the controller is
         float              driveS0{ 0.0f };
         float              driveAlong0{ 0.0f };
         bool               mustLeave{ false };             // just pulled out: has to clear the well before it is caught again
@@ -1661,6 +1663,8 @@ namespace
         float              zoneCatchSide{ -1.0f };
         RE::NiPoint3       zoneMouth{};                    // zones file: the well's mouth (the cylinder's origin), in the gun
         bool               zoneMouthKnown{ false };
+        RE::NiPoint3       catchPointInNode{};             // zones file "point magtop": the point of the magazine the well catches
+        bool               catchPointKnown{ false };
         float              zoneCatchAhead{ -1.0f };                 // core2: out this far along the well and the magazine has left it
     };
     State g_state;
@@ -1912,6 +1916,22 @@ namespace
         return relative(root->world, pointTransform(world)).translate;
     }
 
+    // The point of the magazine the well catches (zones file "point magtop"; else its top), or the same point at
+    // the other end (a cell goes in either way round), for a magazine node standing at `node`.
+    RE::NiPoint3 catchPointOf(const RE::NiTransform& node, bool otherEnd) noexcept
+    {
+        const auto& st = g_state;
+        if (!st.catchPointKnown) {
+            return topOf(node);
+        }
+        auto local = st.catchPointInNode;
+        if (otherEnd) {
+            const RE::NiPoint3 w{ dot(axisOf(st.magRest, 0), st.axis), dot(axisOf(st.magRest, 1), st.axis), dot(axisOf(st.magRest, 2), st.axis) };
+            local = local - w * (2.0f * dot(local, w));
+        }
+        return compose(node, pointTransform(local)).translate;
+    }
+
     // The catch, as drawn: the magazine's top (either end, for a cell) inside the well's cylinder, which runs
     // from its mouth out along the way out as far as `ahead` (and `below` into the gun). `along` is how far out
     // past the mouth that end is, `radial` how far off the cylinder's line.
@@ -1932,9 +1952,16 @@ namespace
             }
             inside = inside || in;
         };
-        test(topOf(node));
-        if (st.cellFed) {
-            test(node.translate + (axisOf(node, 0) * st.sideInNode.x + axisOf(node, 1) * st.sideInNode.y + axisOf(node, 2) * st.bottomAt) * node.scale);
+        if (st.catchPointKnown) {
+            test(catchPointOf(node, false));
+            if (st.cellFed) {
+                test(catchPointOf(node, true));
+            }
+        } else {
+            test(topOf(node));
+            if (st.cellFed) {
+                test(node.translate + (axisOf(node, 0) * st.sideInNode.x + axisOf(node, 1) * st.sideInNode.y + axisOf(node, 2) * st.bottomAt) * node.scale);
+            }
         }
         if (along) {
             *along = bestAlong;
@@ -2169,6 +2196,12 @@ namespace
                     pts.push_back(RE::NiPoint3{ num(i), num(i + 1), num(i + 2) });
                 }
                 ++used;
+            } else if (words[0] == "point" && words.size() >= 5 && words[1] == "magtop") {
+                const RE::NiPoint3 at{ num(2), num(3), num(4) };
+                st.catchPointInNode = relative(st.magRest, pointTransform(at)).translate;
+                st.catchPointKnown = true;
+                note("ZONES: the magazine is caught by its point (%.1f %.1f %.1f) in the gun, (%.2f %.2f %.2f) on the magazine", at.x, at.y, at.z,
+                    st.catchPointInNode.x, st.catchPointInNode.y, st.catchPointInNode.z);
             } else if (words[0] == "point" && words.size() >= 5 && words[1].rfind("chamber", 0) == 0) {
                 st.chambers.push_back(RE::NiPoint3{ num(2), num(3), num(4) });
                 ++used;
@@ -2692,7 +2725,8 @@ namespace
         for (auto& c : name) {
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         }
-        return name.find("drum") != std::string::npos;
+        // the cryolator's drum; the gatling laser's arms and claws that hold the core
+        return name.find("drum") != std::string::npos || name.find("arms") != std::string::npos || name.find("claw") != std::string::npos;
     }
 
     // The cryolator hangs its drum under WeaponMagazine: without this the drum leaves with the cell.
@@ -2845,7 +2879,7 @@ namespace
                         inWellZone(root, node, sideMax, ahead, below, &along, &side);
                         top = mouth + along;
                     }
-                    g_liveTop = topOf(node);
+                    g_liveTop = catchPointOf(node, false);
                     g_liveTopAt = now;
                     if (upright && side <= sideMax && top <= mouth + ahead && top >= mouth - below) {
                         st.rounds = loose.rounds;
@@ -5095,6 +5129,19 @@ namespace
                 }
             }
         }
+        // the point of the magazine the well catches: always there to move, from the measured top if not written yet
+        const bool hasTop = std::any_of(ed.zones.begin(), ed.zones.end(), [](const EditZone& z) { return z.type == 3 && z.name == "magtop"; });
+        if (!hasTop && g_state.railKnown) {
+            const auto& st = g_state;
+            const auto& r = st.magRest;
+            EditZone z;
+            z.type = 3;
+            z.head = "point";
+            z.name = "magtop";
+            z.p = st.catchPointKnown ? compose(r, pointTransform(st.catchPointInNode)).translate :
+                                       r.translate + (axisOf(r, 0) * st.sideInNode.x + axisOf(r, 1) * st.sideInNode.y + axisOf(r, 2) * st.topAt) * r.scale;
+            ed.zones.push_back(z);
+        }
         return true;
     }
 
@@ -5270,15 +5317,6 @@ namespace
                 dotLine(out, z.mouth + off, z.mouth + axis * z.ahead + off, 0.8f, 10);
             }
             dotLine(out, z.mouth, z.mouth + axis * (z.ahead + 3.0f), 0.35f, 24);   // the way out
-            if (z.head == "well" && g_state.railKnown) {
-                // the magazine's top as it sits in the gun: this point of the magazine has to come into the cylinder
-                const auto& r = g_state.magRest;
-                const auto top = r.translate + (axisOf(r, 0) * g_state.sideInNode.x + axisOf(r, 1) * g_state.sideInNode.y + axisOf(r, 2) * g_state.topAt) * r.scale;
-                dotCluster(out, top, 0.3f);
-                if (g_state.cellFed) {
-                    dotCluster(out, r.translate + (axisOf(r, 0) * g_state.sideInNode.x + axisOf(r, 1) * g_state.sideInNode.y + axisOf(r, 2) * g_state.bottomAt) * r.scale, 0.3f);
-                }
-            }
         } else if (z.type == 2) {
             for (std::size_t i = 1; i < z.pts.size(); ++i) {
                 dotLine(out, z.pts[i - 1], z.pts[i], 0.45f, 24);
@@ -5301,7 +5339,8 @@ namespace
         const auto& z = ed.zones[ed.sel];
         const auto modes = modesOf(z);
         char text[256];
-        std::snprintf(text, sizeof(text), "Зона %d/%d: %s (%s). Режим: %s%s%s", ed.sel + 1, static_cast<int>(ed.zones.size()), z.name.c_str(), zoneTypeName(z.type),
+        const std::string label = z.name == "magtop" ? "magtop (кончик магазина в оружии: этой точкой магазин входит в цилиндр)" : z.name;
+        std::snprintf(text, sizeof(text), "Зона %d/%d: %s (%s). Режим: %s%s%s", ed.sel + 1, static_cast<int>(ed.zones.size()), label.c_str(), zoneTypeName(z.type),
             modes[std::clamp(ed.mode, 0, static_cast<int>(modes.size()) - 1)].c_str(), extra ? ". " : "", extra ? extra : "");
         RE::SendHUDMessage::ShowHUDMessage(text, nullptr, false, false);
         note("EDITOR: %s", text);
@@ -6141,7 +6180,7 @@ namespace
                     inWellZone(root, target, sideMax, ahead, below, &along, &side);
                     top = mouth + along;
                 }
-                g_liveTop = topOf(target);
+                g_liveTop = catchPointOf(target, false);
                 g_liveTopAt = now;
                 if (st.mustLeave) {
                     if (top > mouth + ahead + 2.5f || side > sideMax + 2.5f) {
@@ -6291,13 +6330,28 @@ namespace
         } else {
             st.rackPinned = false;
             if (st.place == kRailHand && free.valid) {
-                pinHand(compose(drawn, st.wristInMag));
+                // the palm stays where it took the magazine; the wrist is not turned round to the magazine's own
+                // turn on the rail (that wrung the hand)
+                if (!st.railPinned) {
+                    st.railPinned = true;
+                    const auto taken = compose(drawn, st.wristInMag);
+                    const auto palm = compose(taken, pointTransform(relative(free.wrist, pointTransform(free.palm)).translate)).translate;
+                    st.gripInMag = relative(drawn, pointTransform(palm)).translate;
+                    auto wrist = free.wrist;
+                    wrist.scale = 1.0f;
+                    st.palmInWristMag = relative(wrist, pointTransform(free.palm)).translate;
+                }
+                pinHand(handOnPart(free.wrist, drawn, st.gripInMag, st.palmInWristMag));
             } else {
+                st.railPinned = false;
                 unpinHand();
             }
         }
         if (!st.leverHeld) {
             st.leverPinned = false;
+        }
+        if (st.place != kRailHand) {
+            st.railPinned = false;
         }
         poseFingers(!rockHolds && (st.place == kRailHand || st.place == kHand || st.racking || st.leverHeld));
         // a magazine on the rail is moved by the plugin alone: if ROCK saw the grip it would take the gun's
