@@ -225,10 +225,31 @@ namespace
 
     // ------------------------------------------------------------ memory safety
 
-    bool readable(const void* address, std::size_t size) noexcept
+    // Readable committed regions seen this frame: walking the gun's node tree asked Windows (VirtualQuery) thousands
+    // of times a frame, which took 10-20 ms (the hitches). A region found readable is trusted until the next frame.
+    std::atomic<std::uint32_t> g_memoryEpoch{ 1 };
+
+    struct ReadableRegion
     {
-        if (!address) {
-            return false;
+        std::uintptr_t start{ 0 }, end{ 0 };
+    };
+
+    bool readableRegion(const void* address, std::uintptr_t* regionEnd) noexcept
+    {
+        thread_local std::array<ReadableRegion, 16> regions{};
+        thread_local std::uint32_t epoch = 0;
+        thread_local std::size_t next = 0;
+        const auto now = g_memoryEpoch.load(std::memory_order_relaxed);
+        if (epoch != now) {
+            epoch = now;
+            regions.fill(ReadableRegion{});
+        }
+        const auto at = reinterpret_cast<std::uintptr_t>(address);
+        for (const auto& r : regions) {
+            if (at >= r.start && at < r.end) {
+                *regionEnd = r.end;
+                return true;
+            }
         }
         REX::W32::MEMORY_BASIC_INFORMATION info{};
         if (REX::W32::VirtualQuery(address, &info, sizeof(info)) == 0 || info.state != 0x1000u /* MEM_COMMIT */) {
@@ -238,9 +259,28 @@ namespace
         if ((info.protect & mask) == 0 || (info.protect & 0x100u) != 0) {
             return false;
         }
+        const auto start = reinterpret_cast<std::uintptr_t>(info.baseAddress);
+        const auto end = start + info.regionSize;
+        regions[next] = ReadableRegion{ start, end };
+        next = (next + 1) % regions.size();
+        *regionEnd = end;
+        return true;
+    }
+
+    bool readable(const void* address, std::size_t size) noexcept
+    {
+        if (!address) {
+            return false;
+        }
+        std::uintptr_t end = 0;
+        if (!readableRegion(address, &end)) {
+            return false;
+        }
         const auto start = reinterpret_cast<std::uintptr_t>(address);
-        const auto end = reinterpret_cast<std::uintptr_t>(info.baseAddress) + info.regionSize;
-        return start + size <= end;
+        if (start + size <= end) {
+            return true;
+        }
+        return readable(reinterpret_cast<const void*>(end), start + size - end);   // runs on into the next region
     }
 
     bool looksLikeObject(const void* object) noexcept
@@ -262,8 +302,13 @@ namespace
         if (!text || !readable(text, 1)) {
             return {};
         }
+        std::uintptr_t end = 0;
+        if (!readableRegion(text, &end)) {
+            return {};
+        }
+        const std::size_t room = static_cast<std::size_t>(std::min<std::uintptr_t>(end - reinterpret_cast<std::uintptr_t>(text), 80));
         std::size_t size = 0;
-        while (size < 80 && readable(text + size, 1) && text[size] != '\0') {
+        while (size < room && text[size] != '\0') {
             ++size;
         }
         return { text, size };
@@ -1845,7 +1890,7 @@ namespace
                 float side = 0.0f;
                 while (words >> word) {
                     if (word == "side" && words >> side) {
-                        st.breechReach = std::clamp(side, 3.0f, 10.0f);
+                        st.breechReach = std::clamp(side * 2.0f, 7.0f, 12.0f);   // the round is held by its tail: be generous
                     }
                 }
                 note("ZONES: one %s goes in at (%.1f %.1f %.1f), reach %.1f", name.c_str(), lo.x, lo.y, lo.z, st.breechReach);
@@ -3947,7 +3992,7 @@ namespace
         }
         // a break action's barrels (or a launcher's breech) hang on a hinge: gravity and the gun's own jerks swing them;
         // they fall open freely, and only a pull shut stronger than fHingeHold (a flick) carries them shut
-        const bool swinging = hinged && !revolver && !st.leverKnown && b.open && b.known && g_play.openAngle > 0.1f;
+        const bool swinging = hinged && !revolver && !single && b.open && b.known && g_play.openAngle > 0.1f;
         if (!b.driving && !b.pushing && swinging) {
             const float range = g_play.openAngle;
             float theta = b.t * range;
@@ -4045,7 +4090,7 @@ namespace
         const auto barrel = axisOf(mag->world, 1);   // the cylinder's / the barrels' own line, forward
         const auto breechNode = looksLikeObject(child[0]) ? child[0] : mag;
         const auto breechAt = breechNode->world.translate - (revolver ? barrel * (2.0f * scale) : RE::NiPoint3{});
-        const bool fullyOpen = b.open && b.t >= (swinging ? 0.6f : 0.95f);   // hanging barrels need not be all the way down
+        const bool fullyOpen = b.open && b.t >= (swinging || single ? 0.6f : 0.95f);   // hanging barrels need not be all the way down
         // zones (Blender): the palm against the opening part, taken back to where the part stands closed
         const auto partZone = [&]() -> const std::pair<RE::NiPoint3, RE::NiPoint3>* {
             for (const char* name : { "cylinder", "barrels", "breech" }) {
@@ -4230,6 +4275,9 @@ namespace
                 const auto have = inventory > b.live ? inventory - b.live : 0u;
                 const auto room = capacity - std::min(capacity, b.live + b.spent);
                 const auto take = std::min(have, revolver ? room : std::min(room, 1u));
+                if (take == 0) {
+                    note("BELT: nothing taken (%u carried, %u in the gun, room %u)", inventory, b.live, room);
+                }
                 if (b.spent > 0 && room == 0) {
                     hud("Сначала вытряхни гильзы: подними ствол вверх");
                 } else if (take == 0) {
@@ -4311,7 +4359,16 @@ namespace
         }
         bool atChamber = toGun < g_settings.breechRadius * scale;
         if (single && spare.valid) {
-            atChamber = distance(relative(root->world, pointTransform(spare.palm)).translate, st.breechMouth) < st.breechReach;
+            // the palm, or the nose of the round held ahead of the fingers, at the breech
+            const auto palmIn = relative(root->world, pointTransform(spare.palm)).translate;
+            const auto noseIn = relative(root->world, pointTransform(spare.palm + axisOf(spare.wand, 1) * (10.0f * scale))).translate;
+            const float d = std::min(distance(palmIn, st.breechMouth), distance(noseIn, st.breechMouth));
+            atChamber = d < st.breechReach;
+            static Clock::time_point toldNear{};
+            if (b.held > 0 && !atChamber && d < st.breechReach + 15.0f && now - toldNear > std::chrono::milliseconds(500)) {
+                toldNear = now;
+                note("NEAR BREECH: the round in the hand %.1f from where it goes in (needs < %.1f), open %.2f", d, st.breechReach, b.t);
+            }
         } else if (!st.chambers.empty() && spare.valid) {
             const auto palm = palmOnPart(spare.palm);
             float nearest = 1e9f;
@@ -4568,7 +4625,7 @@ namespace
             return;
         }
 
-        if (!st.managed && !st.breech.checked && g_settings.breech && gun.weapon && gun.data) {
+        if (!st.managed && !st.breech.checked && !st.crankKnown && g_settings.breech && gun.weapon && gun.data) {
             if (auto* drawnRoot = weaponRoot(player); looksLikeObject(drawnRoot)) {
                 st.breech.checked = true;
                 bool cylinder = false;
@@ -4793,6 +4850,9 @@ namespace
             st.buttonUsed = true;
             if (st.place == kSeated && ready && !triggerHeld && !st.racking && !menuOpen()) {
                 startEject(gun, true, now);
+            } else {
+                note("EJECT refused: place %d, rail known %d, magazine node %d, trigger held %d, racking %d", st.place, st.railKnown ? 1 : 0,
+                    looksLikeObject(magazine) ? 1 : 0, triggerHeld ? 1 : 0, st.racking ? 1 : 0);
             }
         }
         if (now < st.stopReloadUntil && gunState == reloading) {
@@ -5304,6 +5364,7 @@ namespace
         static int slowFrames = 0;
         static double worst = 0.0;
         const auto start = clock::now();
+        g_memoryEpoch.fetch_add(1, std::memory_order_relaxed);
         update();
         const auto end = clock::now();
         const double ms = std::chrono::duration<double, std::milli>(end - start).count();
