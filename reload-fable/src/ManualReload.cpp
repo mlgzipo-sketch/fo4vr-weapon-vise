@@ -4373,16 +4373,20 @@ namespace
         }
         int failure = 0;
         const int state = rocklink::forceGrabState(&failure);
-        if (!(free.valid && free.grip) || now - st.handRefAt > std::chrono::milliseconds(2000)) {
+        // the grip read as open for a frame or two while the hand is handed over is not a let go
+        static Clock::time_point gripLostAt{};
+        if (free.valid && free.grip) {
+            gripLostAt = Clock::time_point{};
+        } else if (gripLostAt == Clock::time_point{}) {
+            gripLostAt = now;
+        }
+        const bool letGo = gripLostAt != Clock::time_point{} && now - gripLostAt > std::chrono::milliseconds(200);
+        if (letGo || now - st.handRefAt > std::chrono::milliseconds(2000)) {
             note("CORE2: ROCK did not take magazine %08X (grab state %d, failure %d, held %08X): it falls", st.handRef, state, failure, held);
             // let go before ROCK took it: it was dropped on purpose (a spent magazine thrown away), nothing is wrong
             // with this gun's magazines. Only a grip held all the way through and never answered says ROCK can't.
-            if (st.weapon && !st.grabDone && free.valid && free.grip) {
-                // ROCK never took it: from now on this gun's magazine is drawn in the hand (grip it again to take it)
-                g_noRealHandGuns.insert(st.weapon->GetFormID());
-                g_noRealHandNow = true;
-                note("CORE2: magazines of %08X are drawn in the hand from now on", st.weapon->GetFormID());
-            }
+            // no gun is switched to drawn magazines for good any more: one miss (the hand still on the gun, a
+            // grab asked mid-swap) made every later magazine of that gun hang drawn in the air. ROCK is asked anew next time.
             rocklink::cancelGrab();   // a request still queued would keep the magazine claimed: it would hang in the air, not to be taken
             st.handRef = 0;
             return;
