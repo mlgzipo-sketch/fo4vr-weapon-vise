@@ -157,6 +157,10 @@ namespace
         float roundRotY{ 0.0f };
         float roundRotZ{ 0.0f };
         float roundScale{ 1.0f };
+        bool  casings{ true };          // racking, a break action or a revolver emptied: cases (and unfired rounds) fly out as objects
+        float casingImpulse{ 0.4f };    // how hard they are thrown (Havok impulse)
+        float casingSeconds{ 40.0f };   // they lie this long, then are removed
+        int   casingMax{ 24 };
         std::string roundModel;         // the model of the drawn round (empty: the gun's ammo casing)
     };
     Settings g_settings;
@@ -190,7 +194,7 @@ namespace
             { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bBreech", 0, &s.breech }, { "bRecordAnim", 0, &s.recordAnim }, { "bAutoRecord", 0, &s.autoRecord }, { "bRecordedBolt", 0, &s.recordedBolt }, { "bRealInHand", 0, &s.realInHand }, { "bCore2", 0, &s.core2 }, { "fContactMargin", 2, &s.contactMargin }, { "iMarkButton", 1, &s.markButton }, { "bStopEmptyReload", 0, &s.stopEmptyReload }, { "fCatchSide", 2, &s.catchSide }, { "fCatchAhead", 2, &s.catchAhead }, { "fPushFactor", 2, &s.pushFactor }, { "bTraceState", 0, &s.traceState }, { "fCylinderSwing", 2, &s.cylinderSwing },
             { "fBreakAngle", 2, &s.breakAngle }, { "fFlickSpeed", 2, &s.flickSpeed }, { "fFlickTurn", 2, &s.flickTurn }, { "fHingeHold", 2, &s.hingeHold }, { "fBreechRadius", 2, &s.breechRadius }, { "fChamberReach", 2, &s.chamberReach }, { "bRockPlacesHeld", 0, &s.rockPlacesHeld }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
             { "fChamberForward", 2, &s.chamberForward }, { "fRoundUp", 2, &s.roundUp }, { "fRoundRotX", 2, &s.roundRotX },
-            { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale },
+            { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale }, { "bCasings", 0, &s.casings }, { "fCasingImpulse", 2, &s.casingImpulse }, { "fCasingSeconds", 2, &s.casingSeconds }, { "iCasingMax", 1, &s.casingMax },
         };
         try {
             std::ifstream file("Data/F4SE/Plugins/ManualReloadF.ini");
@@ -1168,6 +1172,7 @@ namespace
         kDelete = 2,   // ref
         kSound = 3,    // kind = sound index: 0 magazine in, 1 magazine out, 2 slide back, 3 slide home, 4 put away
         kRound = 4,    // the drawn cartridge (a static object; the script answers with AddMag(ref, kRoundToken))
+        kCasing = 5,   // pose, impulse, token: a case thrown out of the gun (MRF_MagCasing, its model set from the ammo)
     };
 
     struct PendingCommand
@@ -1177,6 +1182,7 @@ namespace
         std::uint32_t ref{ 0 };
         std::int32_t token{ 0 };
         std::array<float, 6> pose{};   // x, y, z, angle x, y, z (degrees)
+        std::array<float, 4> impulse{};   // x, y, z, magnitude
     };
 
     struct NewMag
@@ -1282,6 +1288,12 @@ namespace
         return { g_shared.current.pose.begin(), g_shared.current.pose.end() };
     }
 
+    std::vector<float> CommandImpulse(std::monostate)
+    {
+        std::scoped_lock guard(g_shared.lock);
+        return { g_shared.current.impulse.begin(), g_shared.current.impulse.end() };
+    }
+
     std::vector<float> FreshPose(std::monostate, std::int32_t token)
     {
         std::scoped_lock guard(g_shared.lock);
@@ -1318,6 +1330,7 @@ namespace
         vm->BindNativeMethod(kScript, "CommandToken", CommandToken, true);
         vm->BindNativeMethod(kScript, "CommandPose", CommandPose, true);
         vm->BindNativeMethod(kScript, "FreshPose", FreshPose, true);
+        vm->BindNativeMethod(kScript, "CommandImpulse", CommandImpulse, true);
         vm->BindNativeMethod(kScript, "AddMag", AddMag, true);
         vm->BindNativeMethod(kScript, "Notify", Notify, true);
         logNote("Papyrus functions of script ManualReloadF registered");
@@ -1671,9 +1684,14 @@ namespace
         bool               catchPointKnown{ false };
         RE::NiPoint3       holdPointInGun{};               // zones file "point maghold": where the palm holds the magazine (on it, seated, gun frame)
         bool               holdPointKnown{ false };
+        RE::NiTransform    roundHold{};                    // zones file "roundhold": a round (shell, clip, rocket) in the hand as it was shown
+        bool               roundHoldKnown{ false };
+        bool               roundAdjusting{ false };        // the round hangs in the air until the hand takes it as it should be held
+        RE::NiTransform    roundFrozen{};
         RE::NiTransform    holdInWand{};                   // zones file "hold": the magazine in the hand as it was shown (stick click with one held)
         bool               holdInWandKnown{ false };
-        bool               gameBoltAction{ true };         // the game's own flag for the gun as built (a pipe pistol is not a bolt action)
+        bool               gameBoltAction{ true };
+        bool               spentInChamber{ false };        // a bolt action fired: its case waits for the bolt         // the game's own flag for the gun as built (a pipe pistol is not a bolt action)
         float              zoneCatchAhead{ -1.0f };                 // core2: out this far along the well and the magazine has left it
     };
     State g_state;
@@ -2024,7 +2042,28 @@ namespace
             std::string head, name, word;
             words >> head >> name;
             RE::NiPoint3 lo{}, hi{};
-            if (head == "point" && name == "hinge" && words >> hinge.x >> hinge.y >> hinge.z) {
+            if (head == "roundhold") {
+                std::istringstream all(line);
+                std::string skip;
+                all >> skip;
+                float v[12]{};
+                int n = 0;
+                while (n < 12 && all >> v[n]) {
+                    ++n;
+                }
+                if (n == 12) {
+                    auto& h = st.roundHold;
+                    h = identityTransform();
+                    h.translate = RE::NiPoint3{ v[0], v[1], v[2] };
+                    for (int r = 0; r < 3; ++r) {
+                        for (int c = 0; c < 3; ++c) {
+                            h.rotate.entry[r][c] = v[3 + r * 3 + c];
+                        }
+                    }
+                    st.roundHoldKnown = true;
+                    note("ZONES: a round from the belt is held as it was shown");
+                }
+            } else if (head == "point" && name == "hinge" && words >> hinge.x >> hinge.y >> hinge.z) {
                 hingeKnown = true;
             } else if (head == "box" && words >> word >> lo.x >> lo.y >> lo.z >> word >> hi.x >> hi.y >> hi.z) {
                 boxMiddle[name] = (lo + hi) * 0.5f;
@@ -2298,6 +2337,88 @@ namespace
         return { loose.translate.x, loose.translate.y, loose.translate.z, angles[0], angles[1], angles[2] };
     }
 
+    // ------------------------------------------------------------ cases thrown out of the gun
+    constexpr RE::TESFormID kCasingForm = 0x82B;   // MRF_MagCasing (index 30 of MRF_Mags)
+    constexpr std::int32_t kCasingKind = 30;
+    constexpr std::int32_t kCasingTokenBase = -1000;
+    std::int32_t g_nextCasingToken = kCasingTokenBase;
+    struct Casing
+    {
+        std::uint32_t     ref{ 0 };
+        Clock::time_point born{};
+    };
+    std::deque<Casing> g_casings;
+    RE::TESAmmo* g_casingModelFor{ nullptr };
+    bool g_casingModelReady{ false };
+
+    bool prepareCasingModel(const Gun& gun) noexcept
+    {
+        auto* ammo = gun.instance && readable(gun.instance, sizeof(RE::TESObjectWEAP::InstanceData)) ? gun.instance->ammo : nullptr;
+        if (g_casingModelFor == ammo) {
+            return g_casingModelReady;
+        }
+        g_casingModelFor = ammo;
+        g_casingModelReady = false;
+        auto* data = RE::TESDataHandler::GetSingleton();
+        auto* form = data ? data->LookupForm(kCasingForm, "ManualReloadF.esp") : nullptr;
+        if (!form || !ammo || !readable(ammo, sizeof(RE::TESAmmo))) {
+            note("Casing: %s", !form ? "MRF_MagCasing was not found in ManualReloadF.esp" : "the gun has no ammo");
+            return false;
+        }
+        const char* m = ammo->shellCasing.GetModel();
+        if (!m || !*m) {
+            note("Casing: ammo %08X has no case model: nothing is thrown out", ammo->GetFormID());
+            return false;
+        }
+        auto* misc = form->As<RE::TESObjectMISC>();
+        if (!misc) {
+            return false;
+        }
+        static_cast<RE::TESModel&>(static_cast<RE::BGSModelMaterialSwap&>(*misc)).SetModel(m);
+        g_casingModelReady = true;
+        note("Casing: model '%s' (ammo %08X)", m, ammo->GetFormID());
+        return true;
+    }
+
+    // `count` cases (or unfired rounds) out of the gun at `at`, thrown along `way` (world), a little apart
+    void ejectCasings(const Gun& gun, const RE::NiAVObject* root, const RE::NiPoint3& at, const RE::NiPoint3& way, std::uint32_t count, const char* why) noexcept
+    {
+        if (!g_settings.casings || count == 0 || !looksLikeObject(root) || !prepareCasingModel(gun)) {
+            return;
+        }
+        count = std::min(count, 8u);
+        const auto dir = normalized(way);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            RE::NiTransform pose = root->world;
+            const float spread = static_cast<float>(i) - 0.5f * static_cast<float>(count - 1);
+            pose.translate = at + axisOf(root->world, 1) * (spread * 0.8f * gunScale(root));
+            PendingCommand command;
+            command.type = kCasing;
+            command.kind = kCasingKind;
+            command.token = g_nextCasingToken--;
+            if (g_nextCasingToken < -900000) {
+                g_nextCasingToken = kCasingTokenBase;
+            }
+            command.pose = poseForScript(pose);
+            const float wobble = 0.15f * spread;
+            command.impulse = { dir.x + wobble, dir.y, dir.z, g_settings.casingImpulse };
+            pushCommand(command);
+        }
+        note("CASINGS: %u out (%s)", count, why);
+    }
+
+    void tidyCasings(Clock::time_point now) noexcept
+    {
+        while (!g_casings.empty() && (static_cast<int>(g_casings.size()) > std::max(1, g_settings.casingMax) ||
+                                      now - g_casings.front().born > std::chrono::milliseconds(static_cast<int>(g_settings.casingSeconds * 1000.0f)))) {
+            PendingCommand command;
+            command.type = kDelete;
+            command.ref = g_casings.front().ref;
+            pushCommand(command);
+            g_casings.pop_front();
+        }
+    }
+
     // A real magazine where the gun's magazine node would stand at `node`.
     std::int32_t spawnLoose(const RE::NiTransform& node, std::uint32_t rounds, const char* why) noexcept
     {
@@ -2508,6 +2629,10 @@ namespace
         for (const auto& mag : mags) {
             if (mag.token == kRoundToken) {
                 takeRound(mag.ref);
+                continue;
+            }
+            if (mag.token <= kCasingTokenBase) {
+                g_casings.push_back(Casing{ mag.ref, Clock::now() });
                 continue;
             }
             Loose loose;
@@ -3926,6 +4051,13 @@ namespace
         }
         if (!st.rackCycled && !st.slideLocked && st.rackPull >= g_settings.rackTravel * 0.85f) {
             st.rackCycled = true;
+            if (st.chamber || st.spentInChamber) {
+                // out of the ejection port, to the right and up
+                const auto port = looksLikeObject(bolt) ? bolt->world.translate : root->world.translate;
+                ejectCasings(gun, root, port, axisOf(root->world, 0) + axisOf(root->world, 2) * 0.6f, 1,
+                    st.chamber ? "an unfired round, racked out" : "the fired case, racked out");
+                st.spentInChamber = false;
+            }
             if (st.chamber) {
                 st.chamber = false;   // the round flies out (back to the ammo you carry)
             }
@@ -4309,6 +4441,51 @@ namespace
             poseFingers(false);
         }
         (void)scale;
+    }
+
+    std::string zonesPathOf(std::uint32_t weapon);
+
+    // writes "<key> x y z r00 .. r22" (a pose against the controller) into the gun's zones file, replacing the old one
+    bool writeHoldLine(std::uint32_t weapon, const char* key, const RE::NiTransform& hold) noexcept
+    {
+        const auto path = zonesPathOf(weapon);
+        const std::string prefix = std::string(key) + " ";
+        std::vector<std::string> lines;
+        {
+            std::ifstream in(path);
+            for (std::string line; std::getline(in, line);) {
+                if (line.rfind(prefix, 0) != 0) {
+                    lines.push_back(line);
+                }
+            }
+        }
+        char text[512];
+        std::snprintf(text, sizeof(text), "%s %.4f %.4f %.4f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f", key, hold.translate.x, hold.translate.y, hold.translate.z,
+            hold.rotate.entry[0][0], hold.rotate.entry[0][1], hold.rotate.entry[0][2], hold.rotate.entry[1][0], hold.rotate.entry[1][1], hold.rotate.entry[1][2],
+            hold.rotate.entry[2][0], hold.rotate.entry[2][1], hold.rotate.entry[2][2]);
+        lines.insert(lines.begin() + (lines.empty() || lines[0].rfind(";", 0) != 0 ? 0 : 1), text);
+        std::error_code ignored;
+        std::filesystem::create_directories("Data/F4SE/Plugins/ManualReloadF_zones", ignored);
+        std::ofstream out(path);
+        for (const auto& line : lines) {
+            out << line << "\n";
+        }
+        note("HOLD: saved to %s: %s", path.c_str(), text);
+        return static_cast<bool>(out);
+    }
+
+    // a pose against the controller, its rotation made square (a scaled node leaves its scale in the rows)
+    RE::NiTransform holdAgainst(const RE::NiTransform& wandIn, const RE::NiTransform& node) noexcept
+    {
+        auto wand = wandIn;
+        wand.scale = 1.0f;
+        auto hold = relative(wand, node);
+        hold.scale = 1.0f;
+        const auto x = normalized(axisOf(hold, 0));
+        auto y = axisOf(hold, 1);
+        y = normalized(y - x * dot(y, x));
+        setRows(hold, x, y, cross(x, y));
+        return hold;
     }
 
     // The reload button opens and closes the gun. Open, with the muzzle up, everything falls out of it. Rounds
@@ -4744,6 +4921,7 @@ namespace
                     b.ejectPushed = std::max(0.0f, b.ejectPushed + dot(rod - b.ejectPrev, run * (1.0f / length)));
                     if (b.ejectPushed > 0.6f * length && b.live + b.spent > 0) {
                         note("EJECTOR: pushed %.1f of %.1f: %u rounds back to the pouch, %u fired cases out", b.ejectPushed, length, b.live, b.spent);
+                        ejectCasings(gun, root, breechAt, barrel * -1.0f, b.live + b.spent, "pushed out by the ejector");
                         if (b.live > 0) {
                             hud("Патроны выброшены и вернулись в запас");
                         }
@@ -4771,6 +4949,7 @@ namespace
         if (!single && fullyOpen && b.live + b.spent > 0 && muzzleUp && now - b.upSince > std::chrono::milliseconds(250) &&
             now - b.opened > std::chrono::milliseconds(350)) {
             note("EMPTIED: %u rounds back to the pouch, %u fired cases gone", b.live, b.spent);
+            ejectCasings(gun, root, breechAt, barrel * -1.0f, b.live + b.spent, "fell out, muzzle up");
             if (b.live > 0) {
                 hud("Патроны высыпались и вернулись в запас");
             }
@@ -4875,7 +5054,37 @@ namespace
             }
             b.pushing = false;
         }
-        if (b.held > 0 && !(spare.valid && spare.grip)) {
+        // the stick click with a round in the hand: it hangs where it is, the hand takes it as it should be held, a
+        // second click keeps that hold for this gun (zones file "roundhold")
+        {
+            static Clock::time_point clickDown{};
+            static bool clickWas = false;
+            const bool click = spare.valid && (spare.buttons & buttonMask(g_settings.markButton)) != 0;
+            if (click && !clickWas) {
+                clickDown = now;
+            }
+            if (!click && clickWas && now - clickDown < std::chrono::milliseconds(500)) {
+                if (st.roundAdjusting) {
+                    st.roundAdjusting = false;
+                    if (spare.valid && gun.weapon) {
+                        st.roundHold = holdAgainst(spare.wand, st.roundFrozen);
+                        st.roundHoldKnown = true;
+                        writeHoldLine(gun.weapon->GetFormID(), "roundhold", st.roundHold);
+                        hud("Хват патрона сохранён: так он будет доставаться с пояса");
+                        buzz(freeIndex(), 3000);
+                    }
+                } else if (b.held > 0) {
+                    st.roundAdjusting = true;
+                    hud("Патрон завис: возьми его рукой как надо и нажми стик ещё раз");
+                    buzz(freeIndex(), 1500);
+                }
+            }
+            clickWas = click;
+        }
+        if (b.held == 0) {
+            st.roundAdjusting = false;
+        }
+        if (b.held > 0 && !st.roundAdjusting && !(spare.valid && spare.grip)) {
             note("The rounds in the hand are put away");
             b.held = 0;
         }
@@ -4899,7 +5108,7 @@ namespace
             }
             atChamber = nearest < g_settings.chamberReach;
         }
-        if (b.held > 0 && fullyOpen && atChamber) {
+        if (b.held > 0 && !st.roundAdjusting && fullyOpen && atChamber) {
             b.live += b.held;
             note("LOAD: %u round(s) in, %u of %u in the gun", b.held, b.live, capacity);
             b.held = 0;
@@ -4972,8 +5181,17 @@ namespace
             pose.scale = scale;
             pose.translate = spare.palm + y * ((revolver ? 2.0f : 0.0f) * scale);
             if (single) {
+                pose.translate = spare.palm + y * (6.0f * scale);   // held by its tail, the warhead ahead of the fingers
+            }
+            if (st.roundAdjusting) {
+                pose = st.roundFrozen;
+            } else if (st.roundHoldKnown) {
+                pose = compose(spare.wand, st.roundHold);
+                pose.scale = scale;
+            }
+            st.roundFrozen = pose;
+            if (single) {
                 if (looksLikeObject(bigRound)) {
-                    pose.translate = spare.palm + y * (6.0f * scale);   // held by its tail, the warhead ahead of the fingers
                     placeNode(bigRound, pose);
                 }
             } else if (revolver) {
@@ -5026,8 +5244,6 @@ namespace
     }
 
     // One line per thing: the magazine, the slide, the free hand, the real magazines around.
-    std::string zonesPathOf(std::uint32_t weapon);
-
     // The stick click with a magazine in the free hand: the way it is held now is how it comes from the belt from now on
     // (zones file "hold": where the magazine stands against the controller). Returns false with no magazine in the hand.
     bool saveHold(const Gun& gun) noexcept
@@ -5057,40 +5273,9 @@ namespace
         if (!found) {
             return false;
         }
-        auto wand = free.wand;
-        wand.scale = 1.0f;
-        auto hold = relative(wand, node);
-        hold.scale = 1.0f;
-        // keep the rotation square (a scaled node leaves its scale in the matrix rows)
-        const auto x = normalized(axisOf(hold, 0));
-        auto y = axisOf(hold, 1);
-        y = normalized(y - x * dot(y, x));
-        setRows(hold, x, y, cross(x, y));
-        st.holdInWand = hold;
+        st.holdInWand = holdAgainst(free.wand, node);
         st.holdInWandKnown = true;
-        const auto path = zonesPathOf(gun.weapon->GetFormID());
-        std::vector<std::string> lines;
-        {
-            std::ifstream in(path);
-            for (std::string line; std::getline(in, line);) {
-                if (line.rfind("hold ", 0) != 0) {
-                    lines.push_back(line);
-                }
-            }
-        }
-        char text[512];
-        std::snprintf(text, sizeof(text), "hold %.4f %.4f %.4f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f", hold.translate.x, hold.translate.y, hold.translate.z,
-            hold.rotate.entry[0][0], hold.rotate.entry[0][1], hold.rotate.entry[0][2], hold.rotate.entry[1][0], hold.rotate.entry[1][1], hold.rotate.entry[1][2],
-            hold.rotate.entry[2][0], hold.rotate.entry[2][1], hold.rotate.entry[2][2]);
-        lines.insert(lines.begin() + (lines.empty() || lines[0].rfind(";", 0) != 0 ? 0 : 1), text);
-        std::error_code ignored;
-        std::filesystem::create_directories("Data/F4SE/Plugins/ManualReloadF_zones", ignored);
-        std::ofstream out(path);
-        for (const auto& line : lines) {
-            out << line << "\n";
-        }
-        note("HOLD: the magazine's hold saved to %s: %s", path.c_str(), text);
-        return static_cast<bool>(out);
+        return writeHoldLine(gun.weapon->GetFormID(), "hold", st.holdInWand);
     }
 
     void writeState(const char* why, const Gun& gun, RE::NiAVObject* root, RE::NiAVObject* magazine, RE::NiAVObject* bolt) noexcept
@@ -5242,7 +5427,7 @@ namespace
             if (line.rfind("slide route", 0) == 0) {
                 continue;   // read in the second pass below
             }
-            if (head == "hold") {
+            if (head == "hold" || head == "roundhold") {
                 ed.keep.push_back(line);
                 continue;
             }
@@ -5872,6 +6057,7 @@ namespace
             return;
         }
         takeScriptNews();
+        tidyCasings(now);
         readHand(0);
         readHand(1);
         auto& st = g_state;
@@ -6146,6 +6332,7 @@ namespace
                     // a bolt action: the fired case stays in the chamber until the bolt is worked
                     st.rounds = ammo;
                     st.chamber = false;
+                    st.spentInChamber = true;
                     ammo = 0;
                     gun.data->ammoCount = 0;
                 } else if (st.place == kSeated) {

@@ -7,5 +7,6 @@ int Function CommandRefID() Native Global
 int Function CommandToken() Native Global
 float[] Function CommandPose() Native Global
 float[] Function FreshPose(int aiToken) Native Global
+float[] Function CommandImpulse() Native Global
 Function AddMag(ObjectReference akMag, int aiToken) Native Global
 Function Notify(int aiMessage) Native Global

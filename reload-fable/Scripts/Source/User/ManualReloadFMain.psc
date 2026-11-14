@@ -10,6 +10,7 @@ int Property CmdSpawn = 1 AutoReadOnly
 int Property CmdDelete = 2 AutoReadOnly
 int Property CmdSound = 3 AutoReadOnly
 int Property CmdRound = 4 AutoReadOnly
+int Property CmdCasing = 5 AutoReadOnly
 int Property RoundToken = -7 AutoReadOnly
 int Property TimerPoll = 1 AutoReadOnly
 
@@ -56,6 +57,8 @@ Function Handle()
 			PlaySound(ManualReloadF.CommandKind())
 		elseif cmd == CmdRound
 			MakeRound()
+		elseif cmd == CmdCasing
+			Casing(ManualReloadF.CommandKind(), ManualReloadF.CommandPose(), ManualReloadF.CommandImpulse(), ManualReloadF.CommandToken())
 		endif
 		n += 1
 		cmd = ManualReloadF.PollCommand()
@@ -90,6 +93,30 @@ Function Spawn(int kind, float[] pose, int token)
 	endif
 	mag.SetMotionType(1, true)   ; a normal physical object: it lies on the ground, ROCK can hold it
 	ManualReloadF.AddMag(mag, token)
+EndFunction
+
+; A case thrown out of the gun: a small physical object, pushed out of the port.
+Function Casing(int kind, float[] pose, float[] impulse, int token)
+	if kind < 0 || kind >= MRF_Mags.GetSize()
+		return
+	endif
+	ObjectReference c = Game.GetPlayer().PlaceAtMe(MRF_Mags.GetAt(kind), 1, true, true, true)
+	if !c
+		return
+	endif
+	c.SetPosition(pose[0], pose[1], pose[2])
+	c.SetAngle(pose[3], pose[4], pose[5])
+	c.Enable()
+	int n = 0
+	while !c.Is3DLoaded() && n < 15
+		Utility.Wait(0.02)
+		n += 1
+	endwhile
+	c.SetMotionType(1, true)
+	if impulse && impulse.Length == 4
+		c.ApplyHavokImpulse(impulse[0], impulse[1], impulse[2], impulse[3])
+	endif
+	ManualReloadF.AddMag(c, token)
 EndFunction
 
 ; The round seen through the open slide: the plugin moves its 3D, the object only has to exist.
