@@ -436,7 +436,13 @@ namespace
     constexpr int kFusionCoreKind = 21;    // MRF_MagFusionCore
     constexpr std::uint32_t kMinigun = 0x0001F669;
     constexpr int kMinigunKind = 22;       // MRF_MagMinigun: a box of 5mm stands for the drum (the game has no drum model of its own)
-    constexpr std::array<const char*, 23> kMagModels{
+    constexpr std::uint32_t kInstituteLaser = 0x001633CC;   // its cell is the laser gun's fusion cell
+    constexpr std::uint32_t kCryolator = 0x00171B2B;
+    constexpr int kPlasmaKind = 23;        // MRF_MagPlasma
+    constexpr int kGaussFirstKind = 24;    // MRF_MagGaussSmall .. MRF_MagGaussXL (24..26)
+    constexpr int kFlamerFirstKind = 27;   // MRF_MagFlamer, MRF_MagFlamerLarge (27, 28)
+    constexpr int kCryoKind = 29;          // MRF_MagCryo
+    constexpr std::array<const char*, 30> kMagModels{
         "weapons\\10mmpistol\\10mmmag01.nif", "weapons\\10mmpistol\\10mmmaglarge.nif",
         "weapons\\machinegun\\mgmagstraight.nif", "weapons\\machinegun\\mgmagdrum.nif",
         "weapons\\combatshotgun\\combatriflemagmedium.nif", "weapons\\combatshotgun\\combatriflemaglarge.nif",
@@ -449,6 +455,10 @@ namespace
         "ammo\\308\\308smallmag.nif", "ammo\\308\\308mediummag.nif", "ammo\\308\\308largemag.nif",
         "weapons\\laserweapons\\fusioncell.nif", "weapons\\handmade\\magazines\\syringermag.nif",
         "ammo\\fusioncore\\fusioncore.nif", "ammo\\5mm\\5mmammo.nif",
+        "weapons\\plasma\\plasmacell.nif",
+        "weapons\\gaussrifle\\gaussriflemagsmall.nif", "weapons\\gaussrifle\\gaussriflemaglarge.nif", "weapons\\gaussrifle\\gaussriflemagextralarge.nif",
+        "weapons\\flamer\\flamerpropellenttank.nif", "weapons\\flamer\\flamerpropellanttanklarge.nif",
+        "ammo\\cryoammo\\cryocell.nif",
     };
 
     // The magazine the equipped gun wears: its magazine mod's model, looked up in kMagModels (-1: none of ours).
@@ -4734,6 +4744,14 @@ namespace
             g_round.modelReady = false;
             std::string magModel;
             int kind = gun.weapon && gun.data ? magazineKindOf(player, gun.weapon, magModel) : -1;
+            if (kind < 0 && gun.weapon && gun.weapon->GetFormID() == kInstituteLaser) {
+                kind = kLaserCellKind;   // the Institute laser: the laser gun's cell
+                magModel = "Weapons\\LaserWeapons\\FusionCell.nif";
+            }
+            if (kind < 0 && gun.weapon && gun.weapon->GetFormID() == kCryolator) {
+                kind = kCryoKind;   // the cryolator: its cryo cell is the magazine
+                magModel = "Ammo\\CryoAmmo\\CryoCell.nif";
+            }
             if (kind < 0 && gun.weapon && gun.weapon->GetFormID() == kLaserGun) {
                 kind = kLaserCellKind;   // the laser gun has no magazine mod: its cell is the magazine
                 magModel = "Weapons\\LaserWeapons\\FusionCell.nif";
@@ -4754,7 +4772,7 @@ namespace
             st.chamber = total > 0;
             st.rounds = total > 0 ? total - 1 : 0;
             st.kind = kind >= 0 ? kind : (capacityOf(gun) > 12 ? 1 : 0);
-            st.cellFed = kind == kLaserCellKind || kind == kSyringerKind || kind == kFusionCoreKind || kind == kMinigunKind;   // nothing to rack
+            st.cellFed = kind == kLaserCellKind || kind == kSyringerKind || kind == kFusionCoreKind || kind == kMinigunKind || kind >= kPlasmaKind;   // nothing to rack
             note("Equipped weapon %08X, capacity %u, rounds %u, magazine '%s' (kind %d): %s", gun.weapon ? gun.weapon->GetFormID() : 0u,
                 capacityOf(gun), total, magModel.c_str(), kind, st.managed ? "reloaded by hand" : "not handled (no magazine of group 1)");
             if (gun.weapon) {
