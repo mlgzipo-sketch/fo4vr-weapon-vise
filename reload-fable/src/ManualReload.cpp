@@ -1870,18 +1870,27 @@ namespace
         } else {
             st.looseInNode = identityTransform();
         }
-        // the model drawn in the gun off its node: the real one is made where the drawn one is
-        if (st.kind >= 0 && st.kind < static_cast<int>(kLooseMiddle.size()) && bound.fRadius > 1.0f) {
-            const auto inGun = relative(magazine->world, pointTransform(bound.center)).translate;
-            const auto& m = kLooseMiddle[static_cast<std::size_t>(st.kind)];
-            const auto turned = axisOf(st.looseInNode, 0) * m.x + axisOf(st.looseInNode, 1) * m.y + axisOf(st.looseInNode, 2) * m.z;
-            const auto want = inGun - turned;
-            if (distance(want, st.looseInNode.translate) > 3.0f) {
-                if (!st.railLogged) {
-                    note("Rail: the gun wears its magazine %.1f off the node (middle at (%.2f, %.2f, %.2f)): a real one is made there too",
-                        distance(want, st.looseInNode.translate), inGun.x, inGun.y, inGun.z);
+        // the Thompson's drums (kinds 6, 7) are worn 13 off their node: the real one is made where the drawn one is.
+        // Measured on the drum's own geometry only (the node's whole bound takes in the rounds and the other children).
+        if (st.kind == 6 || st.kind == 7) {
+            auto* geometry = findNamed(magazine, st.kind == 6 ? "TGunDrumMagSmall:0" : "TGunDrumMag:0");
+            if (looksLikeObject(geometry) && geometry->worldBound.fRadius > 1.0f) {
+                const auto inGun = relative(magazine->world, pointTransform(geometry->worldBound.center)).translate;
+                const auto& m = kLooseMiddle[static_cast<std::size_t>(st.kind)];
+                const auto turned = axisOf(st.looseInNode, 0) * m.x + axisOf(st.looseInNode, 1) * m.y + axisOf(st.looseInNode, 2) * m.z;
+                auto want = inGun - turned;
+                const float off = distance(want, st.looseInNode.translate);
+                if (off < 8.0f || off > 20.0f) {
+                    // not what the drum's geometry says in ROCK's box (13.4 behind the node, logs of 0.47): taken from there
+                    want = st.looseInNode.translate + axisOf(st.looseInNode, 1) * -14.0f;
                 }
-                st.looseInNode.translate = want;
+                if (distance(want, st.looseInNode.translate) > 6.0f) {
+                    if (!st.railLogged) {
+                        note("Rail: the drum is worn %.1f off its node (middle at (%.2f, %.2f, %.2f)): a real one is made there too",
+                            distance(want, st.looseInNode.translate), inGun.x, inGun.y, inGun.z);
+                    }
+                    st.looseInNode.translate = want;
+                }
             }
         }
         st.railKnown = true;
@@ -2087,6 +2096,14 @@ namespace
     // Written from what ROCK measured when there is no file; read instead of it when there is.
     // At equip: the opening part's turn drawn in Blender (route cylinder / barrels / breech), so a gun opens by
     // hand even with no recording of the game's reload.
+    // a turn that is a turn: three unit axes at right angles, right-handed (a broken hold line is not used)
+    bool squareRotation(const RE::NiTransform& t) noexcept
+    {
+        const auto x = axisOf(t, 0), y = axisOf(t, 1), z = axisOf(t, 2);
+        return std::fabs(dot(x, x) - 1.0f) < 0.05f && std::fabs(dot(y, y) - 1.0f) < 0.05f && std::fabs(dot(x, y)) < 0.05f &&
+               dot(cross(x, y), z) > 0.9f;
+    }
+
     void loadZoneRoutes(std::uint32_t weapon) noexcept
     {
         auto& st = g_state;
@@ -2121,8 +2138,8 @@ namespace
                             h.rotate.entry[r][c] = v[3 + r * 3 + c];
                         }
                     }
-                    st.roundHoldKnown = true;
-                    note("ZONES: a round from the belt is held as it was shown");
+                    st.roundHoldKnown = squareRotation(h);
+                    note(st.roundHoldKnown ? "ZONES: a round from the belt is held as it was shown" : "ZONES: the roundhold line is broken: not used");
                 }
             } else if (head == "point" && name == "hinge" && words >> hinge.x >> hinge.y >> hinge.z) {
                 hingeKnown = true;
@@ -2356,7 +2373,10 @@ namespace
                         h.rotate.entry[r][c] = num(4 + r * 3 + c);
                     }
                 }
-                st.holdInWandKnown = true;
+                st.holdInWandKnown = squareRotation(h);
+                if (!st.holdInWandKnown) {
+                    note("ZONES: the hold line is broken (its turn is flat): not used, save it again");
+                } else
                 note("ZONES: a magazine from the belt comes as it was shown in the hand (at %.1f %.1f %.1f of the controller)", h.translate.x, h.translate.y, h.translate.z);
             } else if (words[0] == "point" && words.size() >= 5 && words[1] == "maghold") {
                 st.holdPointInGun = RE::NiPoint3{ num(2), num(3), num(4) };
@@ -5364,6 +5384,7 @@ namespace
                 }
                 if (!click && clickWas && now - clickDown < std::chrono::milliseconds(500) && gun.weapon) {
                     const auto hold = holdAgainst(spare.wand, object->world);
+                    if (squareRotation(hold))
                     writeHoldLine(gun.weapon->GetFormID(), "roundhold", hold);
                     st.roundHold = hold;
                     st.roundHoldKnown = true;
@@ -5644,7 +5665,12 @@ namespace
         if (!found) {
             return false;
         }
-        st.holdInWand = holdAgainst(free.wand, node);
+        const auto hold = holdAgainst(free.wand, node);
+        if (!squareRotation(hold)) {
+            note("HOLD: not saved, the magazine's turn could not be read (a node squashed flat)");
+            return false;
+        }
+        st.holdInWand = hold;
         st.holdInWandKnown = true;
         return writeHoldLine(gun.weapon->GetFormID(), "hold", st.holdInWand);
     }
