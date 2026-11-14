@@ -21,4 +21,5 @@ namespace manualreload::runtime
     // Startup and settings lines, always written.
     void logNote(std::string_view message) noexcept;
     void logWarning(std::string_view message) noexcept;
+    void flushLog() noexcept;
 }

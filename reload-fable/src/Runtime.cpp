@@ -67,7 +67,8 @@ namespace
         g_logger = std::make_shared<spdlog::logger>(example.pluginName, std::move(sink));
         g_logger->set_pattern("%Y-%m-%d %H:%M:%S.%e [%l] %v");
         g_logger->set_level(spdlog::level::info);
-        g_logger->flush_on(spdlog::level::info);
+        // writing every line at once to the log (it sits in OneDrive) stalls frames; lines are flushed every 2 s
+        g_logger->flush_on(spdlog::level::warn);
         g_verbose = readDebugLogSetting();
     }
 
@@ -105,6 +106,16 @@ namespace manualreload::runtime
         try {
             if (g_logger) {
                 g_logger->info("{}", message);
+            }
+        } catch (...) {
+        }
+    }
+
+    void flushLog() noexcept
+    {
+        try {
+            if (g_logger) {
+                g_logger->flush();
             }
         } catch (...) {
         }

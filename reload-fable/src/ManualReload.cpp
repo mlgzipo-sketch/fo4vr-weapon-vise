@@ -5152,6 +5152,36 @@ namespace
         }
     }
 
+    // the frame update with a clock on it: a frame that takes long is written to the log (to find hitches)
+    void timedUpdate() noexcept
+    {
+        using clock = std::chrono::steady_clock;
+        static clock::time_point lastFlush = clock::now();
+        static clock::time_point lastSlowNote{};
+        static int slowFrames = 0;
+        static double worst = 0.0;
+        const auto start = clock::now();
+        update();
+        const auto end = clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(end - start).count();
+        if (ms > 2.0) {
+            ++slowFrames;
+            worst = (std::max)(worst, ms);
+            if (end - lastSlowNote > std::chrono::seconds(5)) {
+                lastSlowNote = end;
+                char text[128];
+                std::snprintf(text, sizeof(text), "SLOW: ManualReloadF frame took %.1f ms (%d slow frames, worst %.1f ms)", ms, slowFrames, worst);
+                logNote(text);
+                slowFrames = 0;
+                worst = 0.0;
+            }
+        }
+        if (end - lastFlush > std::chrono::seconds(2)) {
+            lastFlush = end;
+            manualreload::runtime::flushLog();
+        }
+    }
+
     void FRIK_CALL onFrikFrame(std::uint32_t, void*) noexcept
     {
         static std::uint64_t frames = 0;
@@ -5159,7 +5189,7 @@ namespace
             logNote("frame update is running");
         }
         __try {
-            update();
+            timedUpdate();
         } __except (1) {
             static bool logged = false;
             if (!logged) {
