@@ -4892,18 +4892,29 @@ namespace
     std::vector<std::string> modesOf(const EditZone& z)
     {
         switch (z.type) {
-        case 0: return { "двигать, стик = размер весь", "размер X (вбок)", "размер Y (вдоль ствола)", "размер Z (вверх)" };
-        case 1: return { "двигать, стик = ширина", "двигать, стик = глубина", "поворот рукой (вокруг горла)" };
+        case 0: return { "двигать, стик = размер весь", "размер X (вбок)", "размер Y (вдоль ствола)", "размер Z (вверх)", "сдвиг X (вбок)",
+            "сдвиг Y (вдоль ствола)", "сдвиг Z (вверх)" };
+        case 1: return { "двигать, стик = ширина", "двигать, стик = глубина", "поворот рукой (вокруг горла)", "сдвиг X (вбок)", "сдвиг Y (вдоль ствола)",
+            "сдвиг Z (вверх)" };
         case 2: {
-            std::vector<std::string> modes{ "двигать весь", "поворот рукой (вокруг 1-й точки)" };
+            std::vector<std::string> modes{ "двигать весь", "поворот рукой (вокруг 1-й точки)", "сдвиг X (вбок)", "сдвиг Y (вдоль ствола)", "сдвиг Z (вверх)" };
             for (std::size_t i = 0; i < z.pts.size(); ++i) {
                 modes.push_back("точка " + std::to_string(i + 1) + (i == 0 ? " (покой)" : ""));
             }
             return modes;
         }
-        default: return { "двигать" };
+        default: return { "двигать", "сдвиг X (вбок)", "сдвиг Y (вдоль ствола)", "сдвиг Z (вверх)" };
         }
     }
+
+    // the mode moves the zone along one axis of the gun with the stick: 0 X, 1 Y, 2 Z; -1 not such a mode
+    int shiftAxisOf(const EditZone& z, int mode) noexcept
+    {
+        const int first = z.type == 0 ? 4 : z.type == 1 ? 3 : z.type == 2 ? 2 : 1;
+        return mode >= first && mode < first + 3 ? mode - first : -1;
+    }
+
+    constexpr int kRoutePointMode = 5;   // route modes from here on: one point each
 
     std::string zonesPathOf(std::uint32_t weapon)
     {
@@ -5190,8 +5201,8 @@ namespace
                 dotLine(out, z.pts[i - 1], z.pts[i], 0.45f, 24);
             }
             dotCluster(out, z.pts.front(), 0.35f);
-            if (chosen && mode >= 2 && mode - 2 < static_cast<int>(z.pts.size())) {
-                dotCluster(out, z.pts[mode - 2], 0.6f);
+            if (chosen && mode >= kRoutePointMode && mode - kRoutePointMode < static_cast<int>(z.pts.size())) {
+                dotCluster(out, z.pts[mode - kRoutePointMode], 0.6f);
             }
         } else {
             dotCluster(out, z.p, 0.4f);
@@ -5222,8 +5233,8 @@ namespace
         } else if (z.type == 1) {
             z.mouth = z.mouth + shift;
         } else if (z.type == 2) {
-            if (mode >= 2 && mode - 2 < static_cast<int>(z.pts.size())) {
-                z.pts[mode - 2] = z.pts[mode - 2] + shift;
+            if (mode >= kRoutePointMode && mode - kRoutePointMode < static_cast<int>(z.pts.size())) {
+                z.pts[mode - kRoutePointMode] = z.pts[mode - kRoutePointMode] + shift;
             } else {
                 for (auto& q : z.pts) {
                     q = q + shift;
@@ -5373,7 +5384,14 @@ namespace
         auto& cur = ed.zones[ed.sel];
         if (std::fabs(stick.y) > 0.25f && std::fabs(stick.x) < 0.5f) {
             const float rate = (std::fabs(stick.y) - 0.25f) / 0.75f * 4.0f;   // up to 4 units a second
-            editorSize(cur, ed.mode, (stick.y > 0.0f ? rate : -rate) * dt);
+            const float change = (stick.y > 0.0f ? rate : -rate) * dt;
+            if (const int along = shiftAxisOf(cur, ed.mode); along >= 0) {
+                RE::NiPoint3 shift{};
+                (along == 0 ? shift.x : along == 1 ? shift.y : shift.z) = change;
+                editorMove(cur, 0, shift);   // the whole zone
+            } else {
+                editorSize(cur, ed.mode, change);
+            }
             ed.dirty = true;
         }
 
