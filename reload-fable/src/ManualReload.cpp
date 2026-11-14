@@ -1004,8 +1004,12 @@ namespace
         bool            previousGrip{ false };
         std::uint64_t   buttons{ 0 };
         std::uint64_t   previousButtons{ 0 };
+        RE::NiTransform wristInWand{};   // where the drawn hand sat on the controller while nothing pinned it
+        RE::NiPoint3    palmInWand{};
+        bool            inWandKnown{ false };
     };
-    std::array<Hand, 2> g_hands;   // 0 right, 1 left
+    std::array<Hand, 2> g_hands;
+    bool g_pinned{ false };
 
     int freeIndex() noexcept { return 1 - g_settings.gunHand; }
     FRIKApiV2::Hand frikHand(int index) noexcept { return index == 0 ? FRIKApiV2::Hand::Right : FRIKApiV2::Hand::Left; }
@@ -1056,6 +1060,19 @@ namespace
                 hand.wrist.scale = 1.0f;
             }
         }
+        // While we pin the drawn hand onto a part, the arm chain reports our own pin back, and a
+        // grab that follows the palm then chases itself (the crank spinning, the gauss bolt
+        // shaking).  So while pinned, the palm and the wrist come from the controller, offset as
+        // they were the last time the hand was free.
+        const bool pinnedHere = g_pinned && index == freeIndex();
+        if (pinnedHere && hand.inWandKnown) {
+            hand.wrist = compose(hand.wand, hand.wristInWand);
+            hand.palm = compose(hand.wand, pointTransform(hand.palmInWand)).translate;
+        } else if (!pinnedHere) {
+            hand.wristInWand = relative(hand.wand, hand.wrist);
+            hand.palmInWand = relative(hand.wand, pointTransform(hand.palm)).translate;
+            hand.inWandKnown = true;
+        }
         hand.valid = true;
     }
 
@@ -1078,7 +1095,6 @@ namespace
     // ------------------------------------------------------------ the hand on the magazine (FRIK)
 
     constexpr const char* kFrikTag = "ManualReloadF";
-    bool g_pinned{ false };
     bool g_posed{ false };
 
     void pinHand(const RE::NiTransform& wrist) noexcept
@@ -1465,6 +1481,7 @@ namespace
         float             lever{ 0.0f };                // zones file "route lever" (the Fat Man's handle): 0 home .. 1 pulled back
         bool              leverHeld{ false };
         bool              leverRestKnown{ false };
+        bool              leverArmed{ false };   // the handle went out far enough for its return to count
         bool              leverDrawn{ false };
         bool              leverBlocked{ false };        // the handle is out: the gun does not fire
         RE::NiTransform   leverRestLocal{}, leverRestInRoot{};
@@ -1592,9 +1609,13 @@ namespace
         std::string        leverNodeName;                  // the node the handle hangs on (found once: WeaponBolt, WeaponExtra1..3)
         bool               leverNodeChecked{ false };
         float              lever{ 0.0f };                  // magazine guns (the gatling laser): 0 home .. 1 pulled out
-        bool               leverHeld{ false }, leverRestKnown{ false }, leverDrawn{ false }, leverTouch{ false };
+        bool               leverHeld{ false }, leverRestKnown{ false }, leverDrawn{ false }, leverTouch{ false }, leverArmed{ false };
         RE::NiTransform    leverRestLocal{}, leverRestInRoot{};
         bool               leverPinned{ false }, crankPinned{ false };
+        // parts that hang on the magazine node but belong to the gun (the cryolator's drum): they stay put
+        std::vector<std::pair<std::string, RE::NiTransform>> gunPartsOnMag;   // name, rest pose in the gun
+        bool               gunPartsChecked{ false };
+        std::vector<std::string> gunPartsHidden;                               // magazine branches culled instead of the whole node
         RE::NiTransform    wristInLever{}, wristInCrank{};
         bool               crankKnown{ false };            // zones file "route crank": a full circle (the laser musket)
         RE::NiPoint3       crankCenter{}, crankAxis{}, crankStart{};
@@ -2602,6 +2623,86 @@ namespace
     }
 
     // The rounds seen on top of a magazine: as many as it holds (up to the ones the model has).
+    bool isGunPartOnMag(std::string name) noexcept
+    {
+        for (auto& c : name) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        return name.find("drum") != std::string::npos;
+    }
+
+    // The cryolator hangs its drum under WeaponMagazine: without this the drum leaves with the cell.
+    // The drum is kept where it sits on the gun; when the magazine node would be hidden, only its
+    // other branches are hidden.
+    void keepGunPartsOnMag(RE::NiAVObject* root, RE::NiAVObject* magazine, bool seated) noexcept
+    {
+        auto& st = g_state;
+        if (!looksLikeObject(root) || !looksLikeObject(magazine)) {
+            return;
+        }
+        if (!st.gunPartsChecked && seated) {
+            st.gunPartsChecked = true;
+            forEachNode(magazine, [&](RE::NiAVObject* object, int depth) {
+                if (depth == 0) {
+                    return true;
+                }
+                const auto name = nodeName(object);
+                if (!name.empty() && isGunPartOnMag(name) && st.gunPartsOnMag.size() < 8) {
+                    st.gunPartsOnMag.emplace_back(name, relative(root->world, object->world));
+                    note("MAGAZINE: %s stays on the gun when the magazine comes out", name.c_str());
+                    return false;
+                }
+                return true;
+            });
+        }
+        if (st.gunPartsOnMag.empty()) {
+            return;
+        }
+        const bool wholeHidden = (magazine->flags.flags & 1ull) != 0;
+        if (seated || !wholeHidden) {
+            for (const auto& name : st.gunPartsHidden) {
+                setCulled(findNamed(magazine, name.c_str()), false);
+            }
+            st.gunPartsHidden.clear();
+        }
+        if (seated) {
+            return;
+        }
+        if (wholeHidden) {
+            setCulled(magazine, false);
+            forEachNode(magazine, [&](RE::NiAVObject* object, int depth) {
+                if (depth == 0) {
+                    return true;
+                }
+                const auto name = nodeName(object);
+                if (isGunPartOnMag(name)) {
+                    return false;
+                }
+                bool holds = false;
+                forEachNode(object, [&](RE::NiAVObject* inner, int) {
+                    if (holds) {
+                        return false;
+                    }
+                    holds = isGunPartOnMag(nodeName(inner));
+                    return !holds;
+                });
+                if (holds) {
+                    return true;   // go down to the drum
+                }
+                if (!(object->flags.flags & 1ull) && !name.empty() && st.gunPartsHidden.size() < 64) {
+                    setCulled(object, true);
+                    st.gunPartsHidden.push_back(name);
+                }
+                return false;
+            });
+        }
+        for (const auto& [name, rest] : st.gunPartsOnMag) {
+            if (auto* part = findNamed(magazine, name.c_str())) {
+                placeNode(part, compose(root->world, rest));
+            }
+        }
+    }
+
     void showRounds(RE::NiAVObject* magazine, std::uint32_t rounds) noexcept
     {
         if (!looksLikeObject(magazine)) {
@@ -2663,17 +2764,23 @@ namespace
                     const float top = alongRail(root, topOf(node), &side) + st.topAt * st.magRest.scale;
                     const float tilt = -dot(wayOutOf(node), axisWorld(root));   // -1: lined up with the well
                     // a cell or a core goes in either way round
-                    const bool upright = st.cellFed ? std::fabs(tilt) > 0.7f : tilt < (g_settings.core2 ? -0.7f : -0.5f);
+                    const bool upright = st.cellFed ? std::fabs(tilt) > 0.5f : tilt < (g_settings.core2 ? -0.7f : -0.5f);
                     const float mouth = st.length;
-                    const float sideMax = g_settings.core2 ? (st.zoneCatchSide > 0.0f ? st.zoneCatchSide : g_settings.catchSide) : g_settings.wellSide;
+                    // the gun's own collision stops a real magazine a hand's width short of the mouth, so
+                    // the catch reaches out past it and forgives the hand a little to the side
+                    float sideMax = g_settings.core2 ? (st.zoneCatchSide > 0.0f ? st.zoneCatchSide : g_settings.catchSide) : g_settings.wellSide;
                     // a cell, a core or a drum is taken anywhere along its short way in, not only at the mouth
                     const float below = st.cellFed ? mouth + 1.5f : (g_settings.core2 ? 1.5f : 3.0f);
-                    const float ahead = g_settings.core2 ? (st.zoneCatchAhead > 0.0f ? st.zoneCatchAhead : g_settings.catchAhead) : g_settings.captureAhead;
+                    float ahead = g_settings.core2 ? (st.zoneCatchAhead > 0.0f ? st.zoneCatchAhead : g_settings.catchAhead) : g_settings.captureAhead;
+                    if (g_settings.core2) {
+                        sideMax = std::max(sideMax, 3.5f);
+                        ahead = std::max(ahead, st.cellFed ? 13.0f : 9.0f);
+                    }
                     if (upright && side <= sideMax && top <= mouth + ahead && top >= mouth - below) {
                         st.rounds = loose.rounds;
                         st.place = kRailHand;
                         st.s = std::clamp(top, 0.0f, mouth + ahead);
-                        st.exitAt = st.s + 1.5f;
+                        st.exitAt = st.s + 4.0f;   // a shaky hand does not pull it straight back out
                         st.driveS0 = st.s;
                         st.driveAlong0 = alongRail(root, node.translate);
                         st.magInWand = relative(free.wand, node);
@@ -2699,7 +2806,7 @@ namespace
                     static Clock::time_point missTold{};
                     if (top < mouth + ahead + 6.0f && side < sideMax + 6.0f && now - missTold > std::chrono::milliseconds(400)) {
                         missTold = now;   // near the well and not taken: why
-                        note("NEAR WELL: magazine %08X top %.1f below the mouth (catch from %.1f), %.1f off the line (max %.1f), upright %.2f (needs > %.2f)",
+                        note("NEAR WELL: magazine %08X top %.1f past the mouth (catch from %.1f), %.1f off the line (max %.1f), upright %.2f (needs > %.2f)",
                             id, top - mouth, ahead, side, sideMax, -tilt, g_settings.core2 ? 0.7f : 0.5f);
                     }
                 }
@@ -3852,7 +3959,11 @@ namespace
                     startEject(gun, false, now);   // the handle all the way out: the core comes out
                 }
             }
-            if (st.lever <= 0.02f && before > 0.02f) {
+            if (st.lever > 0.2f) {
+                st.leverArmed = true;
+            }
+            if (st.lever <= 0.02f && before > 0.0f && st.leverArmed) {
+                st.leverArmed = false;
                 st.lever = 0.0f;
                 buzz(freeIndex(), 900);
                 playSound(3);
@@ -4336,7 +4447,11 @@ namespace
                         note("OPEN (the handle): %u rounds", b.live);
                     }
                 }
-                if (b.lever <= 0.02f && before > 0.02f) {
+                if (b.lever > 0.2f) {
+                    b.leverArmed = true;
+                }
+                if (b.lever <= 0.02f && before > 0.0f && b.leverArmed) {
+                    b.leverArmed = false;
                     b.lever = 0.0f;
                     buzz(freeIndex(), 900);
                     playSound(3);
@@ -5346,6 +5461,7 @@ namespace
             } else {
                 setCulled(magazine, true);
             }
+            keepGunPartsOnMag(root, magazine, st.place == kSeated);
             showRounds(magazine, shown);
         }
         st.lastDrawn = drawn;
