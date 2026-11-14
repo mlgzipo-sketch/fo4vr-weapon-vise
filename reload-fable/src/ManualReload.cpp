@@ -140,6 +140,7 @@ namespace
         float breakAngle{ -35.0f };     // how far a break-action gun opens (degrees; minus = barrels down)
         float flickSpeed{ 150.0f };     // the gun jerked this fast (game units a second) closes it
         float flickTurn{ 3.5f };        // ..or turned this fast (a flick of the wrist, radians a second)
+        float hingeHold{ 120.0f };      // open barrels swing on their hinge; a pull shut weaker than this (rad/s^2) does not move them
         float breechRadius{ 6.0f };     // rounds this close to the open breech go in
         float chamberReach{ 3.0f };     // ..or this close to a chamber of the zones file (gun units)
         bool  holdPoseOnExit{ false };  // a magazine pulled out of the well turns to the pose of one from the belt
@@ -182,7 +183,7 @@ namespace
             { "fHandRadius", 2, &s.handRadius }, { "fLooseLifetime", 2, &s.looseLifetime }, { "iMaxLoose", 1, &s.maxLoose },
             { "bAllGuns", 0, &s.allGuns }, { "bRockParts", 0, &s.rockParts }, { "bRockBeltHandover", 0, &s.rockBeltHandover },
             { "bHoldPoseOnExit", 0, &s.holdPoseOnExit }, { "bBreech", 0, &s.breech }, { "bRecordAnim", 0, &s.recordAnim }, { "bAutoRecord", 0, &s.autoRecord }, { "bRecordedBolt", 0, &s.recordedBolt }, { "bRealInHand", 0, &s.realInHand }, { "bCore2", 0, &s.core2 }, { "fContactMargin", 2, &s.contactMargin }, { "iMarkButton", 1, &s.markButton }, { "bStopEmptyReload", 0, &s.stopEmptyReload }, { "fCatchSide", 2, &s.catchSide }, { "fCatchAhead", 2, &s.catchAhead }, { "fPushFactor", 2, &s.pushFactor }, { "bTraceState", 0, &s.traceState }, { "fCylinderSwing", 2, &s.cylinderSwing },
-            { "fBreakAngle", 2, &s.breakAngle }, { "fFlickSpeed", 2, &s.flickSpeed }, { "fFlickTurn", 2, &s.flickTurn }, { "fBreechRadius", 2, &s.breechRadius }, { "fChamberReach", 2, &s.chamberReach }, { "bRockPlacesHeld", 0, &s.rockPlacesHeld }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
+            { "fBreakAngle", 2, &s.breakAngle }, { "fFlickSpeed", 2, &s.flickSpeed }, { "fFlickTurn", 2, &s.flickTurn }, { "fHingeHold", 2, &s.hingeHold }, { "fBreechRadius", 2, &s.breechRadius }, { "fChamberReach", 2, &s.chamberReach }, { "bRockPlacesHeld", 0, &s.rockPlacesHeld }, { "bNativeSound", 0, &s.nativeSound }, { "iSoundFlags", 1, &s.soundFlags }, { "bShowRound", 0, &s.showRound }, { "fRoundOpenAt", 2, &s.roundOpenAt }, { "fChamberUp", 2, &s.chamberUp },
             { "fChamberForward", 2, &s.chamberForward }, { "fRoundUp", 2, &s.roundUp }, { "fRoundRotX", 2, &s.roundRotX },
             { "fRoundRotY", 2, &s.roundRotY }, { "fRoundRotZ", 2, &s.roundRotZ }, { "fRoundScale", 2, &s.roundScale },
         };
@@ -1348,6 +1349,8 @@ namespace
         RE::NiPoint3      prevAt{};
         bool              prevKnown{ false };
         RE::NiPoint3      velocity{};
+        RE::NiPoint3      lastVelocity{};
+        float             omega{ 0.0f };    // the open barrels' swing on the hinge (rad/s)
         bool              driving{ false };   // the free hand turns the opening part about its hinge
         float             driveAngle0{ 0.0f };
         float             driveT0{ 0.0f };
@@ -1472,6 +1475,8 @@ namespace
         std::unordered_map<std::string, std::vector<RE::NiPoint3>> zoneRoutes;   // zones file: "route NAME x y z .."
         ArcFit             slideFit{};                     // the slide's way: a turn first (a bolt handle lifted), then straight
         ArcFit             zoneHinge{};                    // zones file "route cylinder/barrels/breech": the opening part's turn
+        std::string        magNodeName{ "WeaponMagazine" };   // the node that carries the magazine (pipe guns: the one above P-Mag)
+        bool               magNodeChecked{ false };
         bool               singleShot{ false };            // zones file "socket nuke/missile": one big round goes in at the breech
         RE::NiPoint3       breechMouth{};                  // ..where it goes in (gun root frame)
         float              breechReach{ 6.0f };
@@ -1917,6 +1922,15 @@ namespace
                     st.axis = normalized(axis);
                     const float scale = st.magRest.scale > 0.0f ? st.magRest.scale : 1.0f;
                     st.length = std::max(2.0f, dot(mouth - st.magRest.translate, st.axis) + st.topAt * scale);
+                    // a cell, a core or a drum sits whole in its box: it is out once it has moved its own size along the way
+                    // (also when the mouth was put in the middle of the magazine, which leaves almost no way out)
+                    const float straight = std::max({ std::fabs(st.axis.x), std::fabs(st.axis.y), std::fabs(st.axis.z) });
+                    const float raw = dot(mouth - st.magRest.translate, st.axis) + st.topAt * scale;
+                    if (st.magBoxKnown && ((st.cellFed && straight > 0.95f) || raw < 3.0f)) {
+                        const auto size = st.magHi - st.magLo;
+                        st.length = std::fabs(size.x * st.axis.x) + std::fabs(size.y * st.axis.y) + std::fabs(size.z * st.axis.z) + 0.5f;
+                        note("ZONES: the magazine's own size along the way out: it leaves after %.1f", st.length);
+                    }
                     note("ZONES: the well's mouth at (%.1f %.1f %.1f), way out (%.2f %.2f %.2f): the magazine leaves it after %.1f", mouth.x, mouth.y, mouth.z,
                         st.axis.x, st.axis.y, st.axis.z, st.length);
                     ++used;
@@ -3830,9 +3844,62 @@ namespace
             }
             b.freezeUntil = now + std::chrono::milliseconds(static_cast<int>(std::max(g_settings.freezeSeconds, 1.0f) * 1000.0f));
         }
-        if (!b.driving && !b.pushing) {
+        // a break action's barrels (or a launcher's breech) hang on a hinge: gravity and the gun's own jerks swing them;
+        // they fall open freely, and only a pull shut stronger than fHingeHold (a flick) carries them shut
+        const bool swinging = hinged && !revolver && b.open && b.known && g_play.openAngle > 0.1f;
+        if (!b.driving && !b.pushing && swinging) {
+            const float range = g_play.openAngle;
+            float theta = b.t * range;
+            RE::NiPoint3 heavy = b.restInRoot.translate + RE::NiPoint3{ 0.0f, 10.0f, 0.0f };
+            for (const char* name : { "barrels", "breech" }) {
+                if (const auto it = st.zoneBoxes.find(name); it != st.zoneBoxes.end()) {
+                    heavy = (it->second.first + it->second.second) * 0.5f;
+                    break;
+                }
+            }
+            const auto arm = rotateAbout(heavy - g_play.pivot, g_play.axis, theta);
+            const float arm2 = std::max(dot(arm, arm), 4.0f);
+            RE::NiPoint3 accel = (b.velocity - b.lastVelocity) * (1.0f / dt);
+            const float a2 = dot(accel, accel);
+            if (a2 > 6000.0f * 6000.0f) {
+                accel = accel * (6000.0f / std::sqrt(a2));
+            }
+            const RE::NiPoint3 pull = RE::NiPoint3{ 0.0f, 0.0f, -686.0f } - accel;   // gravity, and the gun moving away under it
+            const RE::NiPoint3 pullInGun{ dot(axisOf(root->world, 0), pull), dot(axisOf(root->world, 1), pull), dot(axisOf(root->world, 2), pull) };
+            float alpha = dot(cross(arm, pullInGun), g_play.axis) / arm2;
+            if (alpha < 0.0f && alpha > -g_settings.hingeHold && b.omega > -0.5f) {
+                alpha = 0.0f;   // the hinge's stiffness holds them open
+            }
+            b.omega = (b.omega + alpha * dt) * std::exp(-1.5f * dt);
+            theta += b.omega * dt;
+            if (theta >= range) {
+                theta = range;
+                if (b.omega > 0.0f) {
+                    if (b.omega > 2.0f) buzz(g_settings.gunHand, 500);
+                    b.omega = -b.omega * 0.2f;   // a small bounce at the stop
+                }
+            }
+            if (theta <= 0.03f * range) {
+                if (b.omega < -2.5f && now - b.opened > std::chrono::milliseconds(400)) {
+                    theta = 0.0f;
+                    b.t = 0.0f;
+                    b.omega = 0.0f;
+                    close("swung shut");
+                } else {
+                    theta = 0.03f * range;
+                    b.omega = std::max(b.omega, 0.0f);
+                }
+            }
+            if (b.open) {
+                b.t = theta / range;
+            }
+        } else if (!b.driving && !b.pushing) {
             b.t = approach(b.t, b.open ? 1.0f : 0.0f, 7.0f * dt);
+            b.omega = 0.0f;
+        } else {
+            b.omega = 0.0f;
         }
+        b.lastVelocity = b.velocity;
 
         // the pose: ours while it is open or moving, and held still while the game plays its own reload
         if (b.t > 0.0f || gunState == reloading || now < b.freezeUntil) {
@@ -3850,11 +3917,11 @@ namespace
             }
             refreshSubtree(mag, RE::NiPoint3{});
             if (played) {
-                const float eased = b.driving ? b.t : b.t * b.t * (3.0f - 2.0f * b.t);
+                const float eased = (b.driving || swinging) ? b.t : b.t * b.t * (3.0f - 2.0f * b.t);
                 posePlayed(root, eased);
             } else if (zoneHinge && b.t > 0.0f) {
                 // turned about the hinge drawn in Blender, from where it stands closed
-                const float eased = b.driving ? b.t : b.t * b.t * (3.0f - 2.0f * b.t);
+                const float eased = (b.driving || swinging) ? b.t : b.t * b.t * (3.0f - 2.0f * b.t);
                 const auto posed = turnedPose(b.restInRoot, st.zoneHinge.axis, st.zoneHinge.pivot, st.zoneHinge.angle * eased, RE::NiPoint3{});
                 mag->local = relative(mag->parent->world, compose(root->world, posed));
                 refreshSubtree(mag, RE::NiPoint3{});
@@ -3876,7 +3943,7 @@ namespace
         const auto barrel = axisOf(mag->world, 1);   // the cylinder's / the barrels' own line, forward
         const auto breechNode = looksLikeObject(child[0]) ? child[0] : mag;
         const auto breechAt = breechNode->world.translate - (revolver ? barrel * (2.0f * scale) : RE::NiPoint3{});
-        const bool fullyOpen = b.open && b.t >= 0.95f;
+        const bool fullyOpen = b.open && b.t >= (swinging ? 0.6f : 0.95f);   // hanging barrels need not be all the way down
         // zones (Blender): the palm against the opening part, taken back to where the part stands closed
         const auto partZone = [&]() -> const std::pair<RE::NiPoint3, RE::NiPoint3>* {
             for (const char* name : { "cylinder", "barrels", "breech" }) {
@@ -4101,7 +4168,8 @@ namespace
         if (hasLatch && !b.open && !b.driving && unlatched && now - b.unlatchedAt < std::chrono::milliseconds(1500) && b.unlatchedAt != Clock::time_point{} &&
             -flick > g_settings.flickTurn) {
             b.open = true;   // the latch pressed and the muzzle snapped down: the barrels fall open
-            b.t = 1.0f;
+            b.t = 0.05f;
+            b.omega = 4.0f;
             b.opened = now;
             b.toggled = now;
             gun.data->ammoCount = 0;
@@ -4110,7 +4178,7 @@ namespace
             buzz(g_settings.gunHand, 1200);
             note("OPEN (latch and a flick down, %.1f/s): %u rounds, %u fired cases", -flick, b.live, b.spent);
         }
-        if (fullyOpen && b.held == 0 && !b.driving && now - b.opened > std::chrono::milliseconds(600)) {
+        if (!swinging && fullyOpen && b.held == 0 && !b.driving && now - b.opened > std::chrono::milliseconds(600)) {
             const float jerk = revolver ? std::fabs(dot(b.velocity, axisOf(root->world, 0))) : b.velocity.z;
             if ((jerk > g_settings.flickSpeed * scale || flick > g_settings.flickTurn) && !(barrel.z > 0.3f && b.live + b.spent > 0)) {
                 note("Flick: moved %.0f, turned %.1f/s", jerk / std::max(scale, 0.01f), flick);
@@ -4408,9 +4476,35 @@ namespace
         st.lastGunState = gunState;
 
         // the moving parts: remembered at rest, held still while the game plays its reload
+        if (!st.magNodeChecked) {
+            st.magNodeChecked = true;
+            // pipe guns hang the magazine on another node (WeaponExtra3 > P-Mag); WeaponMagazine is left empty there
+            bool drawn = false;
+            if (auto* wm = findNamed(root, "WeaponMagazine")) {
+                forEachNode(wm, [&](RE::NiAVObject* object, int) {
+                    drawn = drawn || !object->IsNode();
+                    return !drawn;
+                });
+            }
+            if (!drawn) {
+                if (auto* pmag = findNamed(root, "P-Mag"); looksLikeObject(pmag) && looksLikeObject(pmag->parent)) {
+                    const auto name = nodeName(pmag->parent);
+                    if (!name.empty() && name != "WeaponMagazine") {
+                        st.magNodeName = name;
+                    }
+                }
+            }
+            note("Magazine node: '%s'%s", st.magNodeName.c_str(), drawn ? "" : " (WeaponMagazine has nothing drawn under it)");
+        }
         std::array<RE::NiAVObject*, 5> parts{};
         for (std::size_t i = 0; i < parts.size(); ++i) {
             parts[i] = findNamed(root, kMovingParts[i]);
+        }
+        if (st.magNodeName != kMovingParts[0]) {
+            parts[0] = findNamed(root, st.magNodeName.c_str());
+            for (std::size_t i = 1; i < parts.size(); ++i) {
+                if (st.magNodeName == kMovingParts[i]) parts[i] = nullptr;
+            }
         }
         auto* magazine = parts[0];
         auto* bolt = st.cellFed ? nullptr : parts[1];   // an energy gun's 'bolt' is not worked by hand
@@ -4927,7 +5021,7 @@ namespace
             link.keepTargets = free.grip && !justSeated && now > st.forceTargets && !(g_settings.core2 && st.handRef && !st.grabDone);
             link.chamber = st.chamber ? 2 : 1;
             const bool magOut = draw && (st.place == kRailAuto || st.place == kRailHand || st.place == kHand) && looksLikeObject(magazine);
-            link.magazine.node = kMovingParts[0];
+            link.magazine.node = st.magNodeName.c_str();
             link.magazine.grab = magOut && st.railKnown;
             link.magazine.point[0] = st.sideInNode.x;
             link.magazine.point[1] = st.sideInNode.y;
