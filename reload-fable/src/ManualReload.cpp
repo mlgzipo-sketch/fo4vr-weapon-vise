@@ -1646,9 +1646,13 @@ namespace
         bool               zonesChecked{ false };          // ManualReloadF_zones/<weapon>.txt read (or written) for this gun
         bool               zonesFromFile{ false };
         float              zoneCatchSide{ -1.0f };
+        RE::NiPoint3       zoneMouth{};                    // zones file: the well's mouth (the cylinder's origin), in the gun
+        bool               zoneMouthKnown{ false };
         float              zoneCatchAhead{ -1.0f };                 // core2: out this far along the well and the magazine has left it
     };
     State g_state;
+    RE::NiPoint3 g_liveTop{};               // the top of the magazine in the hand, last measured (shown with the zones)
+    std::chrono::steady_clock::time_point g_liveTopAt{};
     rocklink::Result g_rock;   // what ROCK answered last frame
 
     bool rockOn() noexcept { return g_settings.rockParts && g_rock.active; }
@@ -1895,6 +1899,46 @@ namespace
         return relative(root->world, pointTransform(world)).translate;
     }
 
+    // The catch, as drawn: the magazine's top (either end, for a cell) inside the well's cylinder, which runs
+    // from its mouth out along the way out as far as `ahead` (and `below` into the gun). `along` is how far out
+    // past the mouth that end is, `radial` how far off the cylinder's line.
+    bool inWellZone(const RE::NiAVObject* root, const RE::NiTransform& node, float sideMax, float ahead, float below, float* along, float* radial) noexcept
+    {
+        const auto& st = g_state;
+        float bestAlong = 1e9f, bestRadial = 1e9f;
+        bool inside = false;
+        const auto test = [&](const RE::NiPoint3& world) {
+            const auto d = inGun(root, world) - st.zoneMouth;
+            const float a = dot(d, st.axis);
+            const auto off = d - st.axis * a;
+            const float r = std::sqrt(dot(off, off));
+            const bool in = a <= ahead && a >= -below && r <= sideMax;
+            if (in || (!inside && r + std::max(0.0f, a - ahead) < bestRadial + std::max(0.0f, bestAlong - ahead))) {
+                bestAlong = a;
+                bestRadial = r;
+            }
+            inside = inside || in;
+        };
+        test(topOf(node));
+        if (st.cellFed) {
+            test(node.translate + (axisOf(node, 0) * st.sideInNode.x + axisOf(node, 1) * st.sideInNode.y + axisOf(node, 2) * st.bottomAt) * node.scale);
+        }
+        if (along) {
+            *along = bestAlong;
+        }
+        if (radial) {
+            *radial = bestRadial;
+        }
+        return inside;
+    }
+
+    // How far out of its seat a magazine node stands (the rail's own measure), whatever its top.
+    float seatAlong(const RE::NiAVObject* root, const RE::NiTransform& node) noexcept
+    {
+        const auto rel = inGun(root, node.translate) - g_state.magRest.translate;
+        return dot(rel, g_state.axis);
+    }
+
     // The magazine is touched: the palm is in its box as it stands now (moved out along the well by s).
     bool palmOnMagazine(const RE::NiAVObject* root, const RE::NiPoint3& palm) noexcept
     {
@@ -2081,6 +2125,8 @@ namespace
                 const RE::NiPoint3 axis{ num(6), num(7), num(8) };
                 if (dot(axis, axis) > 0.25f) {
                     st.axis = normalized(axis);
+                    st.zoneMouth = mouth;
+                    st.zoneMouthKnown = true;
                     const float scale = st.magRest.scale > 0.0f ? st.magRest.scale : 1.0f;
                     st.length = std::max(2.0f, dot(mouth - st.magRest.translate, st.axis) + st.topAt * scale);
                     st.zoneWell = true;
@@ -2766,10 +2812,12 @@ namespace
                     auto node = compose(mag3D->world, inverse(st.looseInNode));
                     node.scale = gunScale(root) * st.magRest.scale;
                     float side = 0.0f;
-                    const float top = alongRail(root, topOf(node), &side) + st.topAt * st.magRest.scale;
+                    float top = alongRail(root, topOf(node), &side) + st.topAt * st.magRest.scale;
                     const float tilt = -dot(wayOutOf(node), axisWorld(root));   // -1: lined up with the well
                     // a cell or a core goes in either way round
-                    const bool upright = st.cellFed ? std::fabs(tilt) > 0.5f : tilt < (g_settings.core2 ? -0.7f : -0.5f);
+                    // a cell, a core or a tank goes in however it is turned: it is put straight on the way in once caught
+                    // (its turn in the hand never matched what the eye takes for lined up: logs of 0.33-0.37)
+                    const bool upright = st.cellFed ? true : tilt < (g_settings.core2 ? -0.7f : -0.5f);
                     const float mouth = st.length;
                     // the gun's own collision stops a real magazine a hand's width short of the mouth, so
                     // the catch reaches out past it and forgives the hand a little to the side
@@ -2777,12 +2825,21 @@ namespace
                     // a cell, a core or a drum is taken anywhere along its short way in, not only at the mouth
                     const float below = st.cellFed ? mouth + 1.5f : (g_settings.core2 ? 1.5f : 3.0f);
                     const float ahead = g_settings.core2 ? (st.zoneCatchAhead > 0.0f ? st.zoneCatchAhead : g_settings.catchAhead) : g_settings.captureAhead;
-                    // the zone is taken as drawn (in Blender or in the game's zone editor): no minimum of its own
+                    // the zone is taken as drawn (in Blender or in the game's zone editor): no minimum of its own.
+                    // With a mouth in the zones file the cylinder itself is the test: the magazine's top inside it.
+                    if (st.zoneMouthKnown) {
+                        float along = 0.0f;
+                        inWellZone(root, node, sideMax, ahead, below, &along, &side);
+                        top = mouth + along;
+                    }
+                    g_liveTop = topOf(node);
+                    g_liveTopAt = now;
                     if (upright && side <= sideMax && top <= mouth + ahead && top >= mouth - below) {
                         st.rounds = loose.rounds;
                         st.place = kRailHand;
                         // a cell or a core held off by the gun's collision goes straight to the mouth of its socket
-                        st.s = std::clamp(top, 0.0f, st.cellFed ? mouth + 0.5f : mouth + ahead);
+                        const float seat = st.zoneMouthKnown ? seatAlong(root, node) : top;
+                        st.s = std::clamp(seat, 0.0f, st.cellFed ? mouth + 0.5f : mouth + ahead);
                         st.exitAt = st.s + 4.0f;   // a shaky hand does not pull it straight back out
                         st.driveS0 = st.s;
                         st.driveAlong0 = alongRail(root, node.translate);
@@ -4488,7 +4545,11 @@ namespace
                     b.leverDrawn = false;
                 }
                 if (st.leverPinned) {
-                    pinHand(compose(bolt->world, st.wristInLever));   // the hand stays on the handle it pulls
+                    {
+                        auto target = spare.wrist;   // the hand stays on the handle it pulls, turned as the controller is
+                        target.translate = compose(bolt->world, st.wristInLever).translate;
+                        pinHand(target);
+                    }
                     poseFingers(true);
                 }
             }
@@ -4870,6 +4931,7 @@ namespace
         std::array<Clock::time_point, 16> keyNext{};
         std::array<bool, 16> keyWas{};
         bool dirty{ false };
+        bool show{ false };   // after the editor: the zones stay drawn while this gun is out, with the magazine's top live
     };
     Editor g_ed;
     RE::NiPointer<RE::NiNode> g_dots[2];
@@ -5193,6 +5255,15 @@ namespace
                 dotLine(out, z.mouth + off, z.mouth + axis * z.ahead + off, 0.8f, 10);
             }
             dotLine(out, z.mouth, z.mouth + axis * (z.ahead + 3.0f), 0.35f, 24);   // the way out
+            if (z.head == "well" && g_state.railKnown) {
+                // the magazine's top as it sits in the gun: this point of the magazine has to come into the cylinder
+                const auto& r = g_state.magRest;
+                const auto top = r.translate + (axisOf(r, 0) * g_state.sideInNode.x + axisOf(r, 1) * g_state.sideInNode.y + axisOf(r, 2) * g_state.topAt) * r.scale;
+                dotCluster(out, top, 0.3f);
+                if (g_state.cellFed) {
+                    dotCluster(out, r.translate + (axisOf(r, 0) * g_state.sideInNode.x + axisOf(r, 1) * g_state.sideInNode.y + axisOf(r, 2) * g_state.bottomAt) * r.scale, 0.3f);
+                }
+            }
         } else if (z.type == 2) {
             for (std::size_t i = 1; i < z.pts.size(); ++i) {
                 dotLine(out, z.pts[i - 1], z.pts[i], 0.45f, 24);
@@ -5268,6 +5339,7 @@ namespace
             return;
         }
         ed.on = false;
+        ed.show = true;
         griphook::setEditing(false);
         hideDots();
         if (save && ed.dirty) {
@@ -5331,6 +5403,23 @@ namespace
         }
         ed.clickWas = click;
         if (!ed.on) {
+            if (ed.show) {
+                auto* shown = weapon == ed.weapon ? weaponRoot(player) : nullptr;
+                if (!looksLikeObject(shown) || menuOpen()) {
+                    ed.show = weapon == ed.weapon && !menuOpen();
+                    hideDots();
+                } else {
+                    std::vector<RE::NiPoint3> blue, yellow;
+                    for (const auto& zone : ed.zones) {
+                        zoneDots(zone, blue, false, 0);
+                    }
+                    if (now - g_liveTopAt < std::chrono::milliseconds(300)) {
+                        dotCluster(yellow, inGun(shown, g_liveTop), 0.5f);
+                    }
+                    showDots(shown, 0, blue);
+                    showDots(shown, 1, yellow);
+                }
+            }
             return false;
         }
         auto* root = weaponRoot(player);
@@ -6024,14 +6113,21 @@ namespace
                     break;
                 }
                 float side = 0.0f;
-                const float top = alongRail(root, topOf(target), &side) + st.topAt * st.magRest.scale;   // as if it were on the rail this far out
+                float top = alongRail(root, topOf(target), &side) + st.topAt * st.magRest.scale;   // as if it were on the rail this far out
                 // the same window as for a real magazine (zones file, cells either way round)
                 const float tilt = -dot(wayOutOf(target), axisWorld(root));
-                const bool upright = st.cellFed ? std::fabs(tilt) > 0.5f : tilt < -0.5f;
+                const bool upright = st.cellFed ? true : tilt < -0.5f;
                 const float mouth = st.length;
                 const float sideMax = g_settings.core2 ? (st.zoneCatchSide > 0.0f ? st.zoneCatchSide : g_settings.catchSide) : g_settings.wellSide;
                 const float ahead = g_settings.core2 ? (st.zoneCatchAhead > 0.0f ? st.zoneCatchAhead : g_settings.catchAhead) : g_settings.captureAhead;
                 const float below = st.cellFed ? mouth + 1.5f : 3.0f;
+                if (st.zoneMouthKnown) {
+                    float along = 0.0f;
+                    inWellZone(root, target, sideMax, ahead, below, &along, &side);
+                    top = mouth + along;
+                }
+                g_liveTop = topOf(target);
+                g_liveTopAt = now;
                 if (st.mustLeave) {
                     if (top > mouth + ahead + 2.5f || side > sideMax + 2.5f) {
                         st.mustLeave = false;
@@ -6039,7 +6135,8 @@ namespace
                 } else if (upright && side <= sideMax && top <= mouth + ahead && top >= mouth - below) {
                     // the mouth of the well takes the top of the magazine: from here it moves only along the well
                     st.place = kRailHand;
-                    st.s = std::clamp(top, 0.0f, st.cellFed ? mouth + 0.5f : mouth + ahead);
+                    const float seat = st.zoneMouthKnown ? seatAlong(root, target) : top;
+                    st.s = std::clamp(seat, 0.0f, st.cellFed ? mouth + 0.5f : mouth + ahead);
                     st.exitAt = st.s + 4.0f;
                     st.driveS0 = st.s;
                     st.driveAlong0 = alongRail(root, target.translate);
@@ -6165,7 +6262,11 @@ namespace
                 st.leverPinned = true;
                 st.wristInLever = relative(handle->world, free.wrist);
             }
-            pinHand(compose(handle->world, st.wristInLever));
+            {
+                auto target = free.wrist;   // where the handle goes, turned as the controller is (the wrist is not wrung)
+                target.translate = compose(handle->world, st.wristInLever).translate;
+                pinHand(target);
+            }
         } else if (st.racking && looksLikeObject(bolt) && free.valid) {
             if (!st.rackPinned) {
                 st.rackPinned = true;
