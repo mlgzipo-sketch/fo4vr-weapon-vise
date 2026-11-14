@@ -38,6 +38,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace
@@ -159,7 +160,10 @@ namespace
     };
     Settings g_settings;
 
-    bool realHand() noexcept { return g_settings.realInHand || g_settings.core2; }
+    // guns whose loose magazine ROCK would not take (it hung in the air): their magazine is drawn in the hand instead
+    std::unordered_set<std::uint32_t> g_noRealHandGuns;
+    bool g_noRealHandNow{ false };
+    bool realHand() noexcept { return (g_settings.realInHand || g_settings.core2) && !g_noRealHandNow; }
 
     void loadSettings() noexcept
     {
@@ -1580,6 +1584,8 @@ namespace
         float              lever{ 0.0f };                  // magazine guns (the gatling laser): 0 home .. 1 pulled out
         bool               leverHeld{ false }, leverRestKnown{ false }, leverDrawn{ false }, leverTouch{ false };
         RE::NiTransform    leverRestLocal{}, leverRestInRoot{};
+        bool               leverPinned{ false }, crankPinned{ false };
+        RE::NiTransform    wristInLever{}, wristInCrank{};
         bool               crankKnown{ false };            // zones file "route crank": a full circle (the laser musket)
         RE::NiPoint3       crankCenter{}, crankAxis{}, crankStart{};
         bool               crankRestKnown{ false };
@@ -2646,7 +2652,8 @@ namespace
                     float side = 0.0f;
                     const float top = alongRail(root, topOf(node), &side) + st.topAt * st.magRest.scale;
                     const float tilt = -dot(wayOutOf(node), axisWorld(root));   // -1: lined up with the well
-                    const bool upright = tilt < (g_settings.core2 ? -0.7f : -0.5f);
+                    // a cell or a core goes in either way round
+                    const bool upright = st.cellFed ? std::fabs(tilt) > 0.7f : tilt < (g_settings.core2 ? -0.7f : -0.5f);
                     const float mouth = st.length;
                     const float sideMax = g_settings.core2 ? (st.zoneCatchSide > 0.0f ? st.zoneCatchSide : g_settings.catchSide) : g_settings.wellSide;
                     // a cell, a core or a drum is taken anywhere along its short way in, not only at the mouth
@@ -3658,6 +3665,12 @@ namespace
         const int state = rocklink::forceGrabState(&failure);
         if (!(free.valid && free.grip) || now - st.handRefAt > std::chrono::milliseconds(2000)) {
             note("CORE2: ROCK did not take magazine %08X (grab state %d, failure %d, held %08X): it falls", st.handRef, state, failure, held);
+            if (st.weapon && !st.grabDone) {
+                // ROCK never took it: from now on this gun's magazine is drawn in the hand (grip it again to take it)
+                g_noRealHandGuns.insert(st.weapon->GetFormID());
+                g_noRealHandNow = true;
+                note("CORE2: magazines of %08X are drawn in the hand from now on", st.weapon->GetFormID());
+            }
             rocklink::cancelGrab();   // a request still queued would keep the magazine claimed: it would hang in the air, not to be taken
             st.handRef = 0;
             return;
@@ -3925,6 +3938,19 @@ namespace
         const auto posed = turnedPose(st.crankRest, axis, st.crankCenter, st.crankAngle, RE::NiPoint3{});
         crank->local = relative(crank->parent->world, compose(root->world, posed));
         refreshSubtree(crank, RE::NiPoint3{});
+        // the hand stays on the handle it turns
+        if (st.crankHeld && spare.valid) {
+            if (!st.crankPinned) {
+                st.crankPinned = true;
+                st.wristInCrank = relative(crank->world, spare.wrist);
+            }
+            pinHand(compose(crank->world, st.wristInCrank));
+            poseFingers(true);
+        } else if (st.crankPinned) {
+            st.crankPinned = false;
+            unpinHand();
+            poseFingers(false);
+        }
         (void)scale;
     }
 
@@ -4157,6 +4183,12 @@ namespace
             if (b.open) {
                 b.t = theta / range;
             }
+        } else if (!b.driving && !b.pushing && single && !st.leverKnown && b.open) {
+            // a launcher opened by the button only cracks open: the hand lifts it the rest of the way by its handle
+            if (b.t < 0.15f) {
+                b.t = approach(b.t, 0.15f, 3.0f * dt);
+            }
+            b.omega = 0.0f;
         } else if (!b.driving && !b.pushing) {
             b.t = approach(b.t, b.open ? 1.0f : 0.0f, 7.0f * dt);
             b.omega = 0.0f;
@@ -4305,6 +4337,16 @@ namespace
                 close("the handle pushed forward");
             }
             if (looksLikeObject(bolt) && looksLikeObject(bolt->parent)) {
+                if (b.leverHeld && spare.valid) {
+                    if (!st.leverPinned) {
+                        st.leverPinned = true;
+                        st.wristInLever = relative(bolt->world, spare.wrist);
+                    }
+                } else if (st.leverPinned) {
+                    st.leverPinned = false;
+                    unpinHand();
+                    poseFingers(false);
+                }
                 if (b.lever > 0.0f) {
                     poseLever(root, bolt, b.lever, b.leverRestInRoot);
                     b.leverDrawn = true;
@@ -4312,6 +4354,10 @@ namespace
                     bolt->local = b.leverRestLocal;
                     refreshSubtree(bolt, RE::NiPoint3{});
                     b.leverDrawn = false;
+                }
+                if (st.leverPinned) {
+                    pinHand(compose(bolt->world, st.wristInLever));   // the hand stays on the handle it pulls
+                    poseFingers(true);
                 }
             }
         }
@@ -4703,6 +4749,7 @@ namespace
             const bool pistol10 = gun.weapon && gun.data && gun.weapon->GetFormID() == k10mmPistol;
             st.managed = gun.weapon && gun.data && (pistol10 || (kind >= 0 && g_settings.allGuns));
             st.equippedAt = now;
+            g_noRealHandNow = gun.weapon && g_noRealHandGuns.count(gun.weapon->GetFormID()) > 0;
             const auto total = gun.data ? gun.data->ammoCount : 0u;
             st.chamber = total > 0;
             st.rounds = total > 0 ? total - 1 : 0;
@@ -5304,6 +5351,13 @@ namespace
         if (rockHolds) {
             st.rackPinned = false;
             unpinHand();
+        } else if (st.leverHeld && free.valid && looksLikeObject(leverNodeOf(root))) {
+            auto* handle = leverNodeOf(root);   // the hand stays on the handle it pulls
+            if (!st.leverPinned) {
+                st.leverPinned = true;
+                st.wristInLever = relative(handle->world, free.wrist);
+            }
+            pinHand(compose(handle->world, st.wristInLever));
         } else if (st.racking && looksLikeObject(bolt) && free.valid) {
             if (!st.rackPinned) {
                 st.rackPinned = true;
@@ -5318,7 +5372,10 @@ namespace
                 unpinHand();
             }
         }
-        poseFingers(!rockHolds && (st.place == kRailHand || st.place == kHand || st.racking));
+        if (!st.leverHeld) {
+            st.leverPinned = false;
+        }
+        poseFingers(!rockHolds && (st.place == kRailHand || st.place == kHand || st.racking || st.leverHeld));
 
         // a magazine from the belt: once it is in the hand the grip is shown again, so that ROCK closes the hand on it
         if (st.handoverDue && now >= st.handoverAt) {
