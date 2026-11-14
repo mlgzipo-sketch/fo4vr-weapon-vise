@@ -140,7 +140,7 @@ namespace
         float breakAngle{ -35.0f };     // how far a break-action gun opens (degrees; minus = barrels down)
         float flickSpeed{ 150.0f };     // the gun jerked this fast (game units a second) closes it
         float flickTurn{ 3.5f };        // ..or turned this fast (a flick of the wrist, radians a second)
-        float hingeHold{ 120.0f };      // open barrels swing on their hinge; a pull shut weaker than this (rad/s^2) does not move them
+        float hingeHold{ 0.0f };      // open barrels swing on their hinge; a pull shut weaker than this (rad/s^2) does not move them
         float breechRadius{ 6.0f };     // rounds this close to the open breech go in
         float chamberReach{ 3.0f };     // ..or this close to a chamber of the zones file (gun units)
         bool  holdPoseOnExit{ false };  // a magazine pulled out of the well turns to the pose of one from the belt
@@ -1350,6 +1350,8 @@ namespace
         bool              prevKnown{ false };
         RE::NiPoint3      velocity{};
         RE::NiPoint3      lastVelocity{};
+        RE::NiPoint3      accel{};          // the gun's acceleration, smoothed (tracking noise would shake the barrels)
+        Clock::time_point upSince{};        // the muzzle has pointed up since
         float             omega{ 0.0f };    // the open barrels' swing on the hinge (rad/s)
         bool              driving{ false };   // the free hand turns the opening part about its hinge
         float             driveAngle0{ 0.0f };
@@ -1467,6 +1469,8 @@ namespace
         bool               rockWasOnMagazine{ false };
         // core2: the parts as ROCK measured them at rest (gun root frame), the palm touching them
         bool               slideBoxKnown{ false };
+        bool               zoneSlide{ false };   // the slide box came from the zones file: ROCK's boxes do not replace it
+        bool               zoneWell{ false };    // ..and the well's mouth and travel
         RE::NiPoint3       slideLo{}, slideHi{};
         std::vector<RE::NiPoint3> route;                   // zones file: the slide / handle's way (a polyline, gun root frame), first point at rest
         std::vector<float> routeAt;                        // ..each point's share of the way's length (0..1)
@@ -1699,7 +1703,7 @@ namespace
                 const float top = (halfLength - out) / scale;
                 note("ROCK box of the magazine: (%.1f %.1f %.1f)..(%.1f %.1f %.1f); baseplate %.2f below the node (was %.2f), top %.2f above (node says %.2f)",
                     lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], -st.bottomAt, -before, top, st.topAt);
-                if (std::fabs(top - st.topAt) > 2.5f) {
+                if (std::fabs(top - st.topAt) > 2.5f && !st.zoneWell) {
                     // the node is not at the magazine (SMG and others): the box is the truth
                     st.topAt = top;
                     st.length = g_settings.railLength > 0.0f ? g_settings.railLength : std::min(2.0f * halfLength, top + 1.2f + std::max(0.0f, -out));
@@ -1709,8 +1713,10 @@ namespace
         }
         if (!st.boltBoxUsed && atRest && looksLikeObject(bolt) && rocklink::partBox(1, lo, hi)) {
             st.boltBoxUsed = true;
-            st.slideLo = { lo[0], lo[1], lo[2] };
-            st.slideHi = { hi[0], hi[1], hi[2] };
+            if (!st.zoneSlide) {
+                st.slideLo = { lo[0], lo[1], lo[2] };
+                st.slideHi = { hi[0], hi[1], hi[2] };
+            }
             st.slideBoxKnown = true;
             const float at = std::clamp(g_settings.slideGrabAt, 0.0f, 1.0f);
             const float high = std::clamp(g_settings.slideGrabHigh, 0.0f, 1.0f);
@@ -1718,6 +1724,9 @@ namespace
             float handle[3]{};
             if (rocklink::boltHandle(handle)) {
                 st.slideCenter = { handle[0], handle[1], handle[2] };   // a charging handle: the hand goes to the handle itself
+            }
+            if (st.zoneSlide) {
+                st.slideCenter = (st.slideLo + st.slideHi) * 0.5f;   // where the slide box was drawn in Blender
             }
             st.slideCenterKnown = true;
             st.slidePointInBolt = relative(bolt->world, pointTransform(compose(root->world, pointTransform(st.slideCenter)).translate)).translate;
@@ -1912,7 +1921,10 @@ namespace
                 if (words[0] == "magazine") {
                     st.magLo = lo, st.magHi = hi, st.magBoxKnown = true;
                 } else {
-                    st.slideLo = lo, st.slideHi = hi, st.slideBoxKnown = true;
+                    st.slideLo = lo, st.slideHi = hi, st.slideBoxKnown = true, st.zoneSlide = true;
+                    if (st.slideCenterKnown) {
+                        st.slideCenter = (lo + hi) * 0.5f;
+                    }
                 }
                 ++used;
             } else if (words[0] == "well" && words.size() >= 9 && words[1] == "mouth" && words[5] == "axis") {
@@ -1922,6 +1934,7 @@ namespace
                     st.axis = normalized(axis);
                     const float scale = st.magRest.scale > 0.0f ? st.magRest.scale : 1.0f;
                     st.length = std::max(2.0f, dot(mouth - st.magRest.translate, st.axis) + st.topAt * scale);
+                    st.zoneWell = true;
                     // a cell, a core or a drum sits whole in its box: it is out once it has moved its own size along the way
                     // (also when the mouth was put in the middle of the magazine, which leaves almost no way out)
                     const float straight = std::max({ std::fabs(st.axis.x), std::fabs(st.axis.y), std::fabs(st.axis.z) });
@@ -3630,7 +3643,7 @@ namespace
             return;
         }
         if (!st.crankRestKnown) {
-            if (now - st.equippedAt < std::chrono::milliseconds(1500)) {
+            if (now - st.equippedAt < std::chrono::milliseconds(700)) {
                 return;
             }
             st.crankRest = relative(root->world, crank->world);
@@ -3759,7 +3772,7 @@ namespace
 
         // the closed pose
         if (!b.known) {
-            const bool idle = gunState == static_cast<std::uint32_t>(g_settings.idleGunState) && now - st.equippedAt > std::chrono::milliseconds(1500);
+            const bool idle = gunState == static_cast<std::uint32_t>(g_settings.idleGunState) && now - st.equippedAt > std::chrono::milliseconds(700);
             if (!idle) {
                 return;
             }
@@ -3871,7 +3884,8 @@ namespace
             }
             const auto arm = rotateAbout(heavy - g_play.pivot, g_play.axis, theta);
             const float arm2 = std::max(dot(arm, arm), 4.0f);
-            RE::NiPoint3 accel = (b.velocity - b.lastVelocity) * (1.0f / dt);
+            b.accel = b.accel * 0.75f + (b.velocity - b.lastVelocity) * (0.25f / dt);
+            RE::NiPoint3 accel = b.accel;
             const float a2 = dot(accel, accel);
             if (a2 > 6000.0f * 6000.0f) {
                 accel = accel * (6000.0f / std::sqrt(a2));
@@ -3879,7 +3893,7 @@ namespace
             const RE::NiPoint3 pull = RE::NiPoint3{ 0.0f, 0.0f, -686.0f } - accel;   // gravity, and the gun moving away under it
             const RE::NiPoint3 pullInGun{ dot(axisOf(root->world, 0), pull), dot(axisOf(root->world, 1), pull), dot(axisOf(root->world, 2), pull) };
             float alpha = dot(cross(arm, pullInGun), g_play.axis) / arm2;
-            if (alpha < 0.0f && alpha > -g_settings.hingeHold && b.omega > -0.5f) {
+            if (g_settings.hingeHold > 0.0f && alpha < 0.0f && alpha > -g_settings.hingeHold && b.omega > -0.5f) {
                 alpha = 0.0f;   // the hinge's stiffness holds them open
             }
             b.omega = (b.omega + alpha * dt) * std::exp(-1.5f * dt);
@@ -4040,7 +4054,13 @@ namespace
         }
 
         // muzzle up: everything falls out
-        if (!single && fullyOpen && b.live + b.spent > 0 && barrel.z > (revolver ? 0.5f : 0.3f) && now - b.opened > std::chrono::milliseconds(350)) {
+        // (held up for a moment and fairly still: a jerk to shut it does not throw them out on the way)
+        const bool muzzleUp = barrel.z > (revolver ? 0.5f : 0.3f) && dot(b.velocity, b.velocity) < 90.0f * 90.0f * scale * scale;
+        if (!muzzleUp) {
+            b.upSince = now;
+        }
+        if (!single && fullyOpen && b.live + b.spent > 0 && muzzleUp && now - b.upSince > std::chrono::milliseconds(250) &&
+            now - b.opened > std::chrono::milliseconds(350)) {
             note("EMPTIED: %u rounds back to the pouch, %u fired cases gone", b.live, b.spent);
             if (b.live > 0) {
                 hud("Патроны высыпались и вернулись в запас");
@@ -4540,7 +4560,7 @@ namespace
         const bool frozen = g_settings.blockReload && (gunState == reloading || now < st.freezeUntil || pressed || st.slideLocked || st.lastAmmo == 0);
         const bool quiet = !frozen && st.place == kSeated && st.s <= 0.0f && gunState == static_cast<std::uint32_t>(g_settings.idleGunState) &&
                            !st.racking && st.rackPull <= 0.0f && !st.slideLocked && now - st.lastShot > std::chrono::milliseconds(600) &&
-                           now - st.equippedAt > std::chrono::milliseconds(1500) && now - st.lastDrive > std::chrono::milliseconds(700);
+                           now - st.equippedAt > std::chrono::milliseconds(700) && now - st.lastDrive > std::chrono::milliseconds(700);
         if (quiet && gun.data->ammoCount > 0 && !(g_settings.core2 && st.idleKnown)) {
             // core2: taken once, with the gun at rest after it is drawn; later the game's own reload may have moved the parts
             bool all = true;
