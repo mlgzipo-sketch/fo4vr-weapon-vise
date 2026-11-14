@@ -1329,6 +1329,42 @@ namespace
         return out;
     }
 
+    // A point on a polyline at share t (0..1) of its length.
+    RE::NiPoint3 alongWay(const std::vector<RE::NiPoint3>& pts, const std::vector<float>& at, float t) noexcept
+    {
+        if (pts.empty()) {
+            return RE::NiPoint3{};
+        }
+        for (std::size_t i = 1; i < pts.size() && i < at.size(); ++i) {
+            if (t <= at[i]) {
+                const float span = std::max(at[i] - at[i - 1], 1e-5f);
+                const float f = std::clamp((t - at[i - 1]) / span, 0.0f, 1.0f);
+                return pts[i - 1] + (pts[i] - pts[i - 1]) * f;
+            }
+        }
+        return pts.back();
+    }
+
+    // The share of the way (0..1) nearest to q, and how far q is from it.
+    float nearestOnWay(const std::vector<RE::NiPoint3>& pts, const std::vector<float>& at, const RE::NiPoint3& q, float* away) noexcept
+    {
+        float best = 1e9f, bestT = 0.0f;
+        for (std::size_t i = 1; i < pts.size() && i < at.size(); ++i) {
+            const auto seg = pts[i] - pts[i - 1];
+            const float len2 = std::max(dot(seg, seg), 1e-6f);
+            const float f = std::clamp(dot(q - pts[i - 1], seg) / len2, 0.0f, 1.0f);
+            const float d = distance(q, pts[i - 1] + seg * f);
+            if (d < best) {
+                best = d;
+                bestT = at[i - 1] + (at[i] - at[i - 1]) * f;
+            }
+        }
+        if (away) {
+            *away = best;
+        }
+        return bestT;
+    }
+
     // Guns that open instead of taking a magazine: a revolver's cylinder swings out, a break-action gun folds.
     struct Breech
     {
@@ -1367,6 +1403,12 @@ namespace
         float             ejectPushed{ 0.0f };          // how far the hand has pushed the ejector rod
         RE::NiPoint3      ejectPrev{};
         bool              ejectTouch{ false };
+        float             lever{ 0.0f };                // zones file "route lever" (the Fat Man's handle): 0 home .. 1 pulled back
+        bool              leverHeld{ false };
+        bool              leverRestKnown{ false };
+        bool              leverDrawn{ false };
+        bool              leverBlocked{ false };        // the handle is out: the gun does not fire
+        RE::NiTransform   leverRestLocal{}, leverRestInRoot{};
     };
 
     struct State
@@ -1484,6 +1526,10 @@ namespace
         bool               singleShot{ false };            // zones file "socket nuke/missile": one big round goes in at the breech
         RE::NiPoint3       breechMouth{};                  // ..where it goes in (gun root frame)
         float              breechReach{ 6.0f };
+        bool               leverKnown{ false };            // zones file "route lever": the handle (WeaponBolt) that opens the breech
+        std::vector<RE::NiPoint3> leverPts;
+        std::vector<float> leverAt;
+        ArcFit             leverFit{};                     // ..turned first, then pulled straight
         bool               crankKnown{ false };            // zones file "route crank": a full circle (the laser musket)
         RE::NiPoint3       crankCenter{}, crankAxis{}, crankStart{};
         bool               crankRestKnown{ false };
@@ -1810,7 +1856,7 @@ namespace
             std::istringstream words(line);
             std::string head, name;
             words >> head >> name;
-            if (head != "route" || (name != "cylinder" && name != "barrels" && name != "breech" && name != "crank")) {
+            if (head != "route" || (name != "cylinder" && name != "barrels" && name != "breech" && name != "crank" && name != "lever")) {
                 continue;
             }
             std::vector<RE::NiPoint3> pts;
@@ -1852,6 +1898,17 @@ namespace
                 a = total > 0.0f ? a / total : 0.0f;
             }
             const auto fit = fitArc(pts, at);
+            if (name == "lever") {
+                if (pts.size() >= 2 && total > 0.5f) {
+                    st.leverKnown = true;
+                    st.leverPts = pts;
+                    st.leverAt = at;
+                    st.leverFit = fit;
+                    note("ZONES: the handle turns %.0f deg (first %.0f%% of its way), then goes straight; way %.1f long", fit.arc ? fit.angle * 57.29578f : 0.0f,
+                        fit.arc ? fit.arcAt * 100.0f : 0.0f, total);
+                }
+                continue;
+            }
             if (fit.arc && fit.angle > 0.2f) {
                 st.zoneHinge = fit;
                 note("ZONES: %s opens %.0f deg about (%.2f %.2f %.2f) at (%.1f %.1f %.1f) (route from Blender)", name.c_str(), fit.angle * 57.29578f, fit.axis.x,
@@ -3786,6 +3843,13 @@ namespace
             });
             b.known = true;
             b.restInRoot = relative(root->world, mag->world);
+            if (st.leverKnown) {
+                if (auto* bolt = findNamed(root, "WeaponBolt"); looksLikeObject(bolt) && looksLikeObject(bolt->parent)) {
+                    b.leverRestLocal = bolt->local;
+                    b.leverRestInRoot = relative(root->world, bolt->world);
+                    b.leverRestKnown = true;
+                }
+            }
             if (!st.zonesChecked && gun.weapon) {
                 st.zonesChecked = true;
                 zonesFor(gun.weapon->GetFormID(), false);
@@ -3810,12 +3874,24 @@ namespace
 
         // the rounds
         auto ammo = gun.data->ammoCount;
+        const bool leverOut = st.leverKnown && b.lever > 0.05f;
         if (b.open) {
             if (ammo != 0) {
                 gun.data->ammoCount = 0;   // an open gun does not fire, and the game's own refill is undone
             }
             b.lastAmmo = 0;
+        } else if (leverOut) {
+            if (ammo != 0) {
+                gun.data->ammoCount = 0;   // the handle is pulled out: no shot until it is put back
+            }
+            b.leverBlocked = true;
         } else {
+            if (b.leverBlocked) {
+                b.leverBlocked = false;   // the handle is home again: the round in it can be fired
+                gun.data->ammoCount = b.live;
+                ammo = b.live;
+                b.lastAmmo = b.live;
+            }
             if (ammo > b.lastAmmo && g_settings.blockReload) {
                 note("Game refill %u -> %u reverted", b.lastAmmo, ammo);
                 ammo = b.lastAmmo;
@@ -3871,7 +3947,7 @@ namespace
         }
         // a break action's barrels (or a launcher's breech) hang on a hinge: gravity and the gun's own jerks swing them;
         // they fall open freely, and only a pull shut stronger than fHingeHold (a flick) carries them shut
-        const bool swinging = hinged && !revolver && b.open && b.known && g_play.openAngle > 0.1f;
+        const bool swinging = hinged && !revolver && !st.leverKnown && b.open && b.known && g_play.openAngle > 0.1f;
         if (!b.driving && !b.pushing && swinging) {
             const float range = g_play.openAngle;
             float theta = b.t * range;
@@ -4018,7 +4094,73 @@ namespace
             }
             b.unlatchedAt = now;
         }
-        const bool unlatched = !hasLatch || now - b.unlatchedAt < std::chrono::milliseconds(1500);
+        const bool unlatched = (!hasLatch || now - b.unlatchedAt < std::chrono::milliseconds(1500)) && (!st.leverKnown || b.lever > 0.9f);
+
+        // the handle (zones file "route lever", the Fat Man): pulled back along its way it opens the breech,
+        // pushed home it closes it; while it is out the gun does not fire
+        bool leverTouch = false;
+        if (st.leverKnown && b.leverRestKnown && b.known) {
+            auto* bolt = findNamed(root, "WeaponBolt");
+            const auto palmInRoot = spare.valid ? relative(root->world, pointTransform(spare.palm)).translate : RE::NiPoint3{};
+            const auto handleAt = alongWay(st.leverPts, st.leverAt, b.lever);
+            leverTouch = spare.valid && b.held == 0 && distance(palmInRoot, handleAt) < 6.0f;
+            const bool grab = spare.valid && spare.grip && !spare.previousGrip;
+            if (grab && griphook::owned() && leverTouch && !b.driving) {
+                b.leverHeld = true;
+                buzz(freeIndex(), 600);
+                detail("The free hand takes the handle at %.2f", b.lever);
+            }
+            if (b.leverHeld && !(spare.valid && spare.grip)) {
+                b.leverHeld = false;
+                detail("The handle is let go at %.2f", b.lever);
+            }
+            if (b.leverHeld) {
+                float away = 0.0f;
+                const float want = nearestOnWay(st.leverPts, st.leverAt, palmInRoot, &away);
+                const float before = b.lever;
+                b.lever = std::clamp(want, before - 0.12f, before + 0.12f);
+                if (b.lever >= 0.95f && before < 0.95f) {
+                    buzz(freeIndex(), 900);
+                    if (!b.open) {
+                        b.open = true;   // the handle all the way back: the breech opens
+                        b.opened = now;
+                        b.toggled = now;
+                        gun.data->ammoCount = 0;
+                        b.lastAmmo = 0;
+                        playSound(1);
+                        buzz(g_settings.gunHand, 1200);
+                        note("OPEN (the handle): %u rounds", b.live);
+                    }
+                }
+                if (b.lever <= 0.02f && before > 0.02f) {
+                    b.lever = 0.0f;
+                    buzz(freeIndex(), 900);
+                    playSound(3);
+                    note("The handle is home: %u round(s), ready to fire", b.live);
+                }
+            }
+            if (b.leverHeld && b.open && b.lever < 0.5f && !b.driving && b.held == 0) {
+                close("the handle pushed forward");
+            }
+            if (looksLikeObject(bolt) && looksLikeObject(bolt->parent)) {
+                if (b.lever > 0.0f) {
+                    const auto& fit = st.leverFit;
+                    const float turnShare = fit.arc ? std::clamp(b.lever / std::max(fit.arcAt, 0.01f), 0.0f, 1.0f) : 0.0f;
+                    const float straightFrom = fit.arc ? fit.arcAt : 0.0f;
+                    const RE::NiPoint3 lin = b.lever > straightFrom ? alongWay(st.leverPts, st.leverAt, b.lever) - alongWay(st.leverPts, st.leverAt, straightFrom)
+                                                                    : RE::NiPoint3{};
+                    const auto posed = fit.arc ? turnedPose(b.leverRestInRoot, fit.axis, fit.pivot, fit.angle * turnShare, lin)
+                                               : turnedPose(b.leverRestInRoot, RE::NiPoint3{ 0.0f, 0.0f, 1.0f }, RE::NiPoint3{}, 0.0f, lin);
+                    bolt->local = relative(bolt->parent->world, compose(root->world, posed));
+                    refreshSubtree(bolt, RE::NiPoint3{});
+                    b.leverDrawn = true;
+                } else if (b.leverDrawn) {
+                    bolt->local = b.leverRestLocal;
+                    refreshSubtree(bolt, RE::NiPoint3{});
+                    b.leverDrawn = false;
+                }
+            }
+        }
 
         // the ejector rod (zones file: box + route "ejector"): pushed along its way by the hand, it throws out what is in
         const auto ejectBox = st.zoneBoxes.find("ejector");
@@ -4266,7 +4408,8 @@ namespace
         // an open gun: the free hand's grip near it or at the belt is this plugin's (no second-hand hold, no ROCK grab)
         if (!spare.grip) {
             const bool mine = spare.valid && ((b.open && (atBelt || distance(spare.palm, root->world.translate) < g_settings.gunRadius)) ||
-                                              (!b.open && hinged && unlatched && touchesPart(0.0f)));   // closed: only on the opening part, unlatched
+                                              (!b.open && hinged && unlatched && touchesPart(0.0f)) ||   // closed: only on the opening part, unlatched
+                                              leverTouch);
             st.armReason = mine ? (atBelt ? kArmBelt : kArmBlock) : kArmNone;
             griphook::setArmed(mine);
         }
