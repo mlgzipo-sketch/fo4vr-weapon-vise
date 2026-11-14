@@ -2420,6 +2420,15 @@ namespace
         note("TAKE: the free hand has the magazine, %.1f out of the well", st.s);
     }
 
+    // The well's way out as the magazine itself carries it (its own frame at rest), turned with a loose magazine:
+    // a cell or a drum that leaves sideways is lined up when this points along the well, not its own Z.
+    RE::NiPoint3 wayOutOf(const RE::NiTransform& node) noexcept
+    {
+        const auto& st = g_state;
+        const RE::NiPoint3 w{ dot(axisOf(st.magRest, 0), st.axis), dot(axisOf(st.magRest, 1), st.axis), dot(axisOf(st.magRest, 2), st.axis) };
+        return axisOf(node, 0) * w.x + axisOf(node, 1) * w.y + axisOf(node, 2) * w.z;
+    }
+
     // How a magazine from the belt sits in the hand: upright in the fist, rounds forward.
     RE::NiTransform holdPose(const Hand& hand, float scale) noexcept
     {
@@ -2516,11 +2525,12 @@ namespace
                     node.scale = gunScale(root) * st.magRest.scale;
                     float side = 0.0f;
                     const float top = alongRail(root, topOf(node), &side) + st.topAt * st.magRest.scale;
-                    const float tilt = dot(axisOf(node, 2), axisWorld(root));
+                    const float tilt = -dot(wayOutOf(node), axisWorld(root));   // -1: lined up with the well
                     const bool upright = tilt < (g_settings.core2 ? -0.7f : -0.5f);
                     const float mouth = st.length;
                     const float sideMax = g_settings.core2 ? (st.zoneCatchSide > 0.0f ? st.zoneCatchSide : g_settings.catchSide) : g_settings.wellSide;
-                    const float below = g_settings.core2 ? 1.5f : 3.0f;
+                    // a cell, a core or a drum is taken anywhere along its short way in, not only at the mouth
+                    const float below = st.cellFed ? mouth + 1.5f : (g_settings.core2 ? 1.5f : 3.0f);
                     const float ahead = g_settings.core2 ? (st.zoneCatchAhead > 0.0f ? st.zoneCatchAhead : g_settings.catchAhead) : g_settings.captureAhead;
                     if (upright && side <= sideMax && top <= mouth + ahead && top >= mouth - below) {
                         st.rounds = loose.rounds;
@@ -4195,8 +4205,15 @@ namespace
             }
         };
         const std::uint32_t filled = b.live + b.spent;
+        // a mini nuke / a missile is a node of the gun's own model (CNuke / CMissile): seen only when it is in or in the hand
+        RE::NiAVObject* bigRound = single ? findNamed(root, "CNuke") : nullptr;
+        if (single && !looksLikeObject(bigRound)) {
+            bigRound = findNamed(root, "CMissile");
+        }
         if (single) {
-            // the round is part of the gun's model: nothing to show or hide
+            if (looksLikeObject(bigRound)) {
+                setCulled(bigRound, !(b.live > 0 || b.held > 0));
+            }
         } else if (revolver) {
             show(4, b.live > 0 || b.held > 0);   // the bullets
             show(3, filled > 0);                 // the cases
@@ -4205,7 +4222,7 @@ namespace
             show(0, filled >= 1 || (b.held > 0 && filled == 0));
             show(1, filled >= 2 || (b.held > 0 && filled == 1));
         }
-        if (b.held > 0 && spare.valid && !single) {
+        if (b.held > 0 && spare.valid) {
             const auto y = normalized(axisOf(spare.wrist, 0));   // along the fingers
             auto z = axisOf(spare.wrist, 2);
             z = normalized(z - y * dot(z, y));
@@ -4213,7 +4230,12 @@ namespace
             setRows(pose, cross(y, z), y, z);
             pose.scale = scale;
             pose.translate = spare.palm + y * ((revolver ? 2.0f : 0.0f) * scale);
-            if (revolver) {
+            if (single) {
+                if (looksLikeObject(bigRound)) {
+                    pose.translate = spare.palm + y * (6.0f * scale);   // held by its tail, the warhead ahead of the fingers
+                    placeNode(bigRound, pose);
+                }
+            } else if (revolver) {
                 placeNode(child[2], pose);
                 placeNode(child[4], pose);
             } else {
@@ -4830,7 +4852,7 @@ namespace
                 }
                 float side = 0.0f;
                 const float top = alongRail(root, topOf(target), &side) + st.topAt * st.magRest.scale;   // as if it were on the rail this far out
-                const bool upright = dot(axisOf(target, 2), axisWorld(root)) < -0.5f;
+                const bool upright = -dot(wayOutOf(target), axisWorld(root)) < -0.5f;
                 const float mouth = st.length;
                 if (st.mustLeave) {
                     if (top > mouth + g_settings.captureAhead + 2.5f || side > g_settings.wellSide + 2.5f) {
