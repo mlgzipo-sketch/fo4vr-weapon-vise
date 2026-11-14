@@ -1552,6 +1552,9 @@ namespace
         RE::NiTransform    blendFrom{};
         Clock::time_point  blendStart{};
         float              blendSeconds{ 0.0f };
+        RE::NiTransform    alignOffset{};                  // caught: the magazine as it was taken, in the rail's pose at the catch
+        float              alignFromS{ 0.0f };             // how far out it was caught: it turns onto the rail as it goes in from there
+        bool               alignActive{ false };
         RE::NiPoint3       lastMagAt{};
         RE::NiPoint3       velocity{};
         bool               velocityValid{ false };
@@ -2574,6 +2577,39 @@ namespace
         return blend(g_state.blendFrom, target, t * t * (3.0f - 2.0f * t));
     }
 
+    // Caught: the magazine keeps the turn it had in the hand and lines up with the well only as it is pushed in
+    // (fully lined up a little before it is seated), so nothing jumps at the mouth and the hand is not turned.
+    void startAlign(const RE::NiTransform& rail, const RE::NiTransform& caught, float s) noexcept
+    {
+        auto& st = g_state;
+        st.blendSeconds = 0.0f;
+        st.alignOffset = relative(rail, caught);
+        st.alignOffset.scale = 1.0f;
+        st.alignFromS = s;
+        st.alignActive = s > 0.5f;
+        if (!st.alignActive) {
+            startBlend(caught, 0.12f);
+        }
+    }
+
+    RE::NiTransform aligned(const RE::NiTransform& rail) noexcept
+    {
+        auto& st = g_state;
+        if (!st.alignActive) {
+            return rail;
+        }
+        const float end = st.alignFromS * 0.35f;
+        const float t = std::clamp((st.s - end) / std::max(0.01f, st.alignFromS - end), 0.0f, 1.0f);
+        if (t <= 0.0f) {
+            st.alignActive = false;
+            return rail;
+        }
+        const float k = t * t * (3.0f - 2.0f * t);
+        auto caught = compose(rail, st.alignOffset);
+        caught.scale = rail.scale;
+        return blend(rail, caught, k);
+    }
+
     void releaseHand() noexcept
     {
         unpinHand();
@@ -2725,8 +2761,15 @@ namespace
         for (auto& c : name) {
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         }
-        // the cryolator's drum; the gatling laser's arms and claws that hold the core
-        return name.find("drum") != std::string::npos || name.find("arms") != std::string::npos || name.find("claw") != std::string::npos;
+        // the cryolator's drum; the gatling laser's arms and claws that hold the core (the minigun's drum is its magazine and comes off)
+        const int kind = g_state.kind;
+        if (kind == kCryoKind) {
+            return name.find("drum") != std::string::npos;
+        }
+        if (kind == kFusionCoreKind) {
+            return name.find("arms") != std::string::npos || name.find("claw") != std::string::npos;
+        }
+        return false;
     }
 
     // The cryolator hangs its drum under WeaponMagazine: without this the drum leaves with the cell.
@@ -2895,7 +2938,7 @@ namespace
                         st.mustLeave = false;
                         st.velocityValid = false;
                         st.dropActive = false;
-                        startBlend(node, 0.12f);
+                        startAlign(railPose(root, st.s), node, st.s);
                         gone.push_back(id);
                         rocklink::releaseHeld(freeIndex(), id);
                         if (st.handRef == id) {
@@ -6194,7 +6237,7 @@ namespace
                     st.exitAt = st.s + 4.0f;
                     st.driveS0 = st.s;
                     st.driveAlong0 = alongRail(root, target.translate);
-                    startBlend(st.lastDrawnValid ? st.lastDrawn : target, 0.12f);
+                    startAlign(railPose(root, st.s), st.lastDrawnValid ? st.lastDrawn : target, st.s);
                     buzz(freeIndex(), 900);
                     note("CATCH: the well has the magazine, %.1f out, %.1f off the line", st.s, side);
                 } else {
@@ -6235,7 +6278,7 @@ namespace
             drawn = railPose(root, st.s);
             draw = true;
         } else if (st.place == kRailHand) {
-            drawn = blended(railPose(root, st.s), now);
+            drawn = blended(aligned(railPose(root, st.s)), now);
             draw = carried = true;
         } else if (st.place == kHand) {
             drawn = blended(compose(free.wand, st.magInWand), now);
@@ -6352,6 +6395,7 @@ namespace
         }
         if (st.place != kRailHand) {
             st.railPinned = false;
+            st.alignActive = false;
         }
         poseFingers(!rockHolds && (st.place == kRailHand || st.place == kHand || st.racking || st.leverHeld));
         // a magazine on the rail is moved by the plugin alone: if ROCK saw the grip it would take the gun's
