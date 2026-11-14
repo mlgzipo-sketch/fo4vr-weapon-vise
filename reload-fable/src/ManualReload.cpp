@@ -1575,6 +1575,11 @@ namespace
         std::vector<RE::NiPoint3> leverPts;
         std::vector<float> leverAt;
         ArcFit             leverFit{};                     // ..turned first, then pulled straight
+        std::string        leverNodeName;                  // the node the handle hangs on (found once: WeaponBolt, WeaponExtra1..3)
+        bool               leverNodeChecked{ false };
+        float              lever{ 0.0f };                  // magazine guns (the gatling laser): 0 home .. 1 pulled out
+        bool               leverHeld{ false }, leverRestKnown{ false }, leverDrawn{ false }, leverTouch{ false };
+        RE::NiTransform    leverRestLocal{}, leverRestInRoot{};
         bool               crankKnown{ false };            // zones file "route crank": a full circle (the laser musket)
         RE::NiPoint3       crankCenter{}, crankAxis{}, crankStart{};
         bool               crankRestKnown{ false };
@@ -3729,6 +3734,118 @@ namespace
     }
 
     // The laser musket: the free hand takes the crank's handle and winds it round; each full turn charges one more shot.
+    // The node the handle (zones "route lever") hangs on: of WeaponBolt and WeaponExtra1..3, the one with a model
+    // nearest to where the handle is drawn.
+    RE::NiAVObject* leverNodeOf(RE::NiAVObject* root) noexcept
+    {
+        auto& st = g_state;
+        if (!st.leverNodeChecked) {
+            st.leverNodeChecked = true;
+            RE::NiPoint3 where = st.leverPts.empty() ? RE::NiPoint3{} : st.leverPts.front();
+            if (const auto box = st.zoneBoxes.find("lever"); box != st.zoneBoxes.end()) {
+                where = (box->second.first + box->second.second) * 0.5f;
+            }
+            float best = 1e9f;
+            for (const char* name : { "WeaponBolt", "WeaponExtra1", "WeaponExtra2", "WeaponExtra3" }) {
+                auto* node = findNamed(root, name);
+                if (!looksLikeObject(node)) {
+                    continue;
+                }
+                float nearest = 1e9f;
+                forEachNode(node, [&](RE::NiAVObject* object, int depth) {
+                    if (depth > 0 && !object->IsNode()) {
+                        const auto c = relative(root->world, pointTransform(object->worldBound.center)).translate;
+                        nearest = std::min(nearest, distance(c, where));
+                    }
+                    return true;
+                });
+                note("LEVER: node %s, its model %.1f from the handle", name, nearest);
+                if (nearest < best) {
+                    best = nearest;
+                    st.leverNodeName = name;
+                }
+            }
+            note("LEVER: the handle hangs on %s", st.leverNodeName.empty() ? "nothing" : st.leverNodeName.c_str());
+        }
+        return st.leverNodeName.empty() ? nullptr : findNamed(root, st.leverNodeName.c_str());
+    }
+
+    // The handle on its way: turned about the drawn arc first, then moved along the rest of the way.
+    void poseLever(RE::NiAVObject* root, RE::NiAVObject* node, float lever, const RE::NiTransform& restInRoot) noexcept
+    {
+        const auto& st = g_state;
+        const auto& fit = st.leverFit;
+        const float turnShare = fit.arc ? std::clamp(lever / std::max(fit.arcAt, 0.01f), 0.0f, 1.0f) : 0.0f;
+        const float straightFrom = fit.arc ? fit.arcAt : 0.0f;
+        const RE::NiPoint3 lin = lever > straightFrom ? alongWay(st.leverPts, st.leverAt, lever) - alongWay(st.leverPts, st.leverAt, straightFrom)
+                                                      : RE::NiPoint3{};
+        const auto posed = fit.arc ? turnedPose(restInRoot, fit.axis, fit.pivot, fit.angle * turnShare, lin)
+                                   : turnedPose(restInRoot, RE::NiPoint3{ 0.0f, 0.0f, 1.0f }, RE::NiPoint3{}, 0.0f, lin);
+        node->local = relative(node->parent->world, compose(root->world, posed));
+        refreshSubtree(node, RE::NiPoint3{});
+    }
+
+    void startEject(const Gun& gun, bool hold, Clock::time_point now) noexcept;
+
+    // A magazine gun with a handle (the gatling laser): pulled out, it throws the core out; put back home.
+    void updateMagLever(const Gun& gun, RE::NiAVObject* root, Clock::time_point now) noexcept
+    {
+        auto& st = g_state;
+        st.leverTouch = false;
+        if (!st.leverKnown || !looksLikeObject(root)) {
+            return;
+        }
+        auto* node = leverNodeOf(root);
+        if (!looksLikeObject(node) || !looksLikeObject(node->parent)) {
+            return;
+        }
+        if (!st.leverRestKnown) {
+            if (now - st.equippedAt < std::chrono::milliseconds(700)) {
+                return;
+            }
+            st.leverRestLocal = node->local;
+            st.leverRestInRoot = relative(root->world, node->world);
+            st.leverRestKnown = true;
+        }
+        const auto& spare = g_hands[freeIndex()];
+        const auto palmIn = spare.valid ? relative(root->world, pointTransform(spare.palm)).translate : RE::NiPoint3{};
+        st.leverTouch = spare.valid && distance(palmIn, alongWay(st.leverPts, st.leverAt, st.lever)) < 5.0f;
+        const bool press = spare.valid && spare.grip && !spare.previousGrip;
+        if (press && st.leverTouch && griphook::owned()) {
+            st.leverHeld = true;
+            buzz(freeIndex(), 600);
+            note("LEVER: the free hand takes the handle at %.2f", st.lever);
+        }
+        if (st.leverHeld && !(spare.valid && spare.grip)) {
+            st.leverHeld = false;
+            note("LEVER: let go at %.2f", st.lever);
+        }
+        if (st.leverHeld) {
+            const float before = st.lever;
+            st.lever = std::clamp(nearestOnWay(st.leverPts, st.leverAt, palmIn, nullptr), before - 0.12f, before + 0.12f);
+            if (st.lever >= 0.95f && before < 0.95f) {
+                buzz(freeIndex(), 900);
+                if (st.place == kSeated && st.railKnown) {
+                    startEject(gun, false, now);   // the handle all the way out: the core comes out
+                }
+            }
+            if (st.lever <= 0.02f && before > 0.02f) {
+                st.lever = 0.0f;
+                buzz(freeIndex(), 900);
+                playSound(3);
+                note("LEVER: home");
+            }
+        }
+        if (st.lever > 0.0f) {
+            poseLever(root, node, st.lever, st.leverRestInRoot);
+            st.leverDrawn = true;
+        } else if (st.leverDrawn) {
+            node->local = st.leverRestLocal;
+            refreshSubtree(node, RE::NiPoint3{});
+            st.leverDrawn = false;
+        }
+    }
+
     void updateCrank(RE::PlayerCharacter* player, const Gun& gun, RE::NiAVObject* root, Clock::time_point now) noexcept
     {
         auto& st = g_state;
@@ -3889,7 +4006,7 @@ namespace
             b.known = true;
             b.restInRoot = relative(root->world, mag->world);
             if (st.leverKnown) {
-                if (auto* bolt = findNamed(root, "WeaponBolt"); looksLikeObject(bolt) && looksLikeObject(bolt->parent)) {
+                if (auto* bolt = leverNodeOf(root); looksLikeObject(bolt) && looksLikeObject(bolt->parent)) {
                     b.leverRestLocal = bolt->local;
                     b.leverRestInRoot = relative(root->world, bolt->world);
                     b.leverRestKnown = true;
@@ -4145,7 +4262,7 @@ namespace
         // pushed home it closes it; while it is out the gun does not fire
         bool leverTouch = false;
         if (st.leverKnown && b.leverRestKnown && b.known) {
-            auto* bolt = findNamed(root, "WeaponBolt");
+            auto* bolt = leverNodeOf(root);
             const auto palmInRoot = spare.valid ? relative(root->world, pointTransform(spare.palm)).translate : RE::NiPoint3{};
             const auto handleAt = alongWay(st.leverPts, st.leverAt, b.lever);
             leverTouch = spare.valid && b.held == 0 && distance(palmInRoot, handleAt) < 6.0f;
@@ -4189,15 +4306,7 @@ namespace
             }
             if (looksLikeObject(bolt) && looksLikeObject(bolt->parent)) {
                 if (b.lever > 0.0f) {
-                    const auto& fit = st.leverFit;
-                    const float turnShare = fit.arc ? std::clamp(b.lever / std::max(fit.arcAt, 0.01f), 0.0f, 1.0f) : 0.0f;
-                    const float straightFrom = fit.arc ? fit.arcAt : 0.0f;
-                    const RE::NiPoint3 lin = b.lever > straightFrom ? alongWay(st.leverPts, st.leverAt, b.lever) - alongWay(st.leverPts, st.leverAt, straightFrom)
-                                                                    : RE::NiPoint3{};
-                    const auto posed = fit.arc ? turnedPose(b.leverRestInRoot, fit.axis, fit.pivot, fit.angle * turnShare, lin)
-                                               : turnedPose(b.leverRestInRoot, RE::NiPoint3{ 0.0f, 0.0f, 1.0f }, RE::NiPoint3{}, 0.0f, lin);
-                    bolt->local = relative(bolt->parent->world, compose(root->world, posed));
-                    refreshSubtree(bolt, RE::NiPoint3{});
+                    poseLever(root, bolt, b.lever, b.leverRestInRoot);
                     b.leverDrawn = true;
                 } else if (b.leverDrawn) {
                     bolt->local = b.leverRestLocal;
@@ -4328,7 +4437,7 @@ namespace
             }
         }
         // the open palm pushes it shut (no grip needed): only a move towards closed carries it
-        const bool touching = hinged && b.open && !b.driving && b.held == 0 && spare.valid && !spare.grip && !atBelt &&
+        const bool touching = hinged && !single && b.open && !b.driving && b.held == 0 && spare.valid && !spare.grip && !atBelt &&
                               touchesPart(8.0f);
         if (touching) {
             const float angle = hingeAngle(root, spare.palm);
@@ -5182,6 +5291,7 @@ namespace
             refreshSubtree(bolt, RE::NiPoint3{});
         }
         rackByHand(gun, root, bolt, dt);
+        updateMagLever(gun, root, now);
         st.prevHandLocal = inGun(root, free.wand.translate);
         st.prevHandKnown = free.valid;
         drawRound(gun, root);
@@ -5251,6 +5361,9 @@ namespace
                 } else if (g_settings.blockTwoHand && st.place != kSeated && distance(free.palm, root->world.translate) < g_settings.gunRadius) {
                     reason = kArmBlock;
                 }
+            }
+            if (st.leverTouch && !st.leverHeld) {
+                reason = kArmBlock;   // the handle (gatling laser): the grip is ours
             }
             st.armReason = reason;
             // at the magazine and at the slide ROCK must see the press (it takes the part); elsewhere it is hidden as before
