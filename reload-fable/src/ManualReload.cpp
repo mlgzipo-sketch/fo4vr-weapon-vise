@@ -441,7 +441,7 @@ namespace
     constexpr int kSyringerKind = 20;      // MRF_MagSyringer
     constexpr int kFusionCoreKind = 21;    // MRF_MagFusionCore
     constexpr std::uint32_t kMinigun = 0x0001F669;
-    constexpr int kMinigunKind = 22;       // MRF_MagMinigun: a box of 5mm stands for the drum (the game has no drum model of its own)
+    constexpr int kMinigunKind = 22;       // MRF_MagMinigun: the drum cut out of the minigun's own model (Meshes\\ManualReloadF\\MinigunDrum.nif)
     constexpr std::uint32_t kInstituteLaser = 0x001633CC;   // its cell is the laser gun's fusion cell
     constexpr std::uint32_t kCryolator = 0x00171B2B;
     constexpr std::uint32_t kAlienBlaster = 0x000FF995;   // its cover (WeaponExtra1) swings open, one cell (WeaponMagazine) feeds it
@@ -1990,10 +1990,6 @@ namespace
             }
             inside = inside || in;
         };
-        if (st.kind == kMinigunKind) {
-            // the minigun's drum is stood in for by a box of 5mm held in the hand: the box itself counts
-            test(node.translate);
-        }
         if (st.catchPointKnown) {
             test(catchPointOf(node, false));
             if (st.cellFed) {
