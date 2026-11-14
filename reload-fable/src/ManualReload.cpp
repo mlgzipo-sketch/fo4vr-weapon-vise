@@ -6173,6 +6173,12 @@ namespace
             st.leverPinned = false;
         }
         poseFingers(!rockHolds && (st.place == kRailHand || st.place == kHand || st.racking || st.leverHeld));
+        // a magazine on the rail is moved by the plugin alone: if ROCK saw the grip it would take the gun's
+        // magazine part with this hand and pull it straight back out (the laser cell, 0.35)
+        if (st.place == kRailHand && free.grip && !griphook::owned()) {
+            griphook::setOwned(true);
+            detail("RAIL: the grip is hidden from ROCK again");
+        }
 
         // a magazine from the belt: once it is in the hand the grip is shown again, so that ROCK closes the hand on it
         if (st.handoverDue && now >= st.handoverAt) {
