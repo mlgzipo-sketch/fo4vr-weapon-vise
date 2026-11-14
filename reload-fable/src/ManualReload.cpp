@@ -4925,7 +4925,8 @@ namespace
             }
         }
         auto* magazine = parts[0];
-        auto* bolt = st.cellFed ? nullptr : parts[1];   // an energy gun's 'bolt' is not worked by hand
+        // an energy gun's 'bolt' is not worked by hand, nor the assault rifle's (a fresh magazine chambers by itself)
+        auto* bolt = (st.cellFed || st.kind == 2 || st.kind == 3) ? nullptr : parts[1];
         if (st.hasBolt != looksLikeObject(bolt)) {
             st.hasBolt = looksLikeObject(bolt);
             note("Slide / bolt node: %s", st.hasBolt ? "found" : "none (rounds are chambered by the magazine)");
