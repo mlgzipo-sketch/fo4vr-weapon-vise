@@ -6057,7 +6057,7 @@ namespace
             return;
         }
         takeScriptNews();
-        tidyCasings(now);
+        tidyCasings(Clock::now());
         readHand(0);
         readHand(1);
         auto& st = g_state;
