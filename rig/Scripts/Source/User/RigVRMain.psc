@@ -16,6 +16,7 @@ ObjectReference[] Spawned   ; objects made for drawing (ring buffer), removed af
 int SpawnedNext
 bool Busy
 bool KitGiven
+int KitsToIgnore             ; kits this script removes itself: their 'dropped' event sets nothing up
 bool SlingGiven             ; 0.2: the back sling came after the first starter kit
 
 Event OnInit()
@@ -59,6 +60,7 @@ Function GiveNewItems()
 	; 0.4 test build set up a mannequin for every old item it took away (each one folded the last into a kit): one kit is enough
 	int kits = Game.GetPlayer().GetItemCount(Kit)
 	if kits > 1
+		KitsToIgnore += kits - 1
 		Game.GetPlayer().RemoveItem(Kit, kits - 1, true)
 	endif
 EndFunction
@@ -254,6 +256,10 @@ EndFunction
 Function ItemDropped(ObjectReference item, int kind)
 	Actor player = Game.GetPlayer()
 	if kind != 0
+		return
+	endif
+	if KitsToIgnore > 0
+		KitsToIgnore -= 1
 		return
 	endif
 	float a = player.GetAngleZ()

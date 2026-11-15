@@ -670,11 +670,7 @@ namespace
             }
             return true;
         });
-        if (fresh) {
-            // let the engine set the new branch up as it does for its own models (transforms, bounds, flags)
-            alignas(16) std::array<std::byte, 0x80> update{};
-            node->UpdateTransformAndBounds(*reinterpret_cast<RE::NiUpdateData*>(update.data()));
-        }
+        (void)fresh;
         const auto bound = recomputeBound(node);
         // the parent's bound must reach the model, or the renderer culls it with the parent
         RE::NiAVObject* up = parent;
@@ -686,7 +682,6 @@ namespace
             }
             up = up->parent;
         }
-        parent->UpdateWorldBound();
     }
 
     void beginFrameModels() noexcept
@@ -1247,6 +1242,29 @@ namespace
 
     // ------------------------------------------------------------ where the rig is: the mannequin or your body
 
+    // A node by name under `root` (searched by hand: GetObjectByName sits elsewhere in the VR vtable).
+    RE::NiNode* findNode(RE::NiAVObject* root, const std::string& name) noexcept
+    {
+        static std::map<std::pair<RE::NiAVObject*, std::string>, RE::NiNode*> cache;
+        const auto key = std::make_pair(root, name);
+        if (auto it = cache.find(key); it != cache.end() && looksLikeObject(it->second) && it->second->name.c_str() &&
+                                         _stricmp(it->second->name.c_str(), name.c_str()) == 0) {
+            return it->second;
+        }
+        RE::NiNode* found = nullptr;
+        forEachNode(root, [&](RE::NiAVObject* object, int) {
+            if (found) return false;
+            const char* n = object->name.c_str();
+            if (n && _stricmp(n, name.c_str()) == 0) {
+                found = object->IsNode();
+                return false;
+            }
+            return true;
+        });
+        if (found) cache[key] = found;
+        return found;
+    }
+
     // A place to hang models: on the mannequin everything goes under its root (its space is the body space); on the
     // body each model goes under the bone it follows.
     struct Holder
@@ -1261,9 +1279,7 @@ namespace
             if (!body) {
                 return root;
             }
-            auto* object = looksLikeObject(skeleton) ? skeleton->GetObjectByName(RE::BSFixedString(bone.c_str())) : nullptr;
-            auto* node = looksLikeObject(object) ? object->IsNode() : nullptr;
-            return node;
+            return findNode(skeleton, bone);
         }
 
         // local transform under parentFor(bone) for a pose in body space
