@@ -80,6 +80,12 @@ namespace
         kSling = 7,       // a long gun on the back
     };
 
+    // Pouches without a model yet are left out for now (not on the shelf, not in the starter kit).
+    constexpr bool typeEnabled(int type) noexcept
+    {
+        return type == kMag || type == kHolster || type == kDump || type == kSling;
+    }
+
     const char* pouchName(int type) noexcept
     {
         switch (type) {
@@ -106,26 +112,24 @@ namespace
 
     struct SlotPlace
     {
-        int   group;     // 0 belt (anchored at the hips), 1 chest
+        int   group;     // 0 belt (anchored at the hips), 1 chest, -1 not used
         float x, y, z;   // right, forward, up from the anchor (game units)
         float yaw;       // the pouch turned this much around the vertical (degrees, + = to the right)
     };
 
-    // Default places: 6 on the chest panel, 5 around the belt, 2 on the back (for long guns). Each can be moved in RigVR.ini (Slot0=x,y,z,yaw).
+    // Default places, from the user's Blender layout (centre of each model, its front turned away from the body):
+    // 0 magazine pouch at the belt front, 1 bag on the left hip, 2 pistol holster on the right hip, 3 carbine over the right
+    // shoulder, then 4 carbine over the left shoulder, 5 a second magazine pouch on the chest, 6 the bag on the back.
+    // 7..12 are not used. Each can be moved in RigVR.ini (SlotN=x,y,z,yaw[,group]; SlotN=off).
     std::array<SlotPlace, kSlots> g_places{ {
-        { 1, -8.0f, 9.0f, 4.0f, 0.0f },
-        { 1, 0.0f, 9.5f, 4.0f, 0.0f },
-        { 1, 8.0f, 9.0f, 4.0f, 0.0f },
-        { 1, -8.0f, 9.0f, -6.0f, 0.0f },
-        { 1, 0.0f, 9.5f, -6.0f, 0.0f },
-        { 1, 8.0f, 9.0f, -6.0f, 0.0f },
-        { 0, -13.0f, 1.0f, -2.0f, -90.0f },
-        { 0, -9.0f, 8.0f, 0.0f, -35.0f },
-        { 0, 9.0f, 8.0f, 0.0f, 35.0f },
-        { 0, 13.0f, 1.0f, -4.0f, 90.0f },
-        { 0, 0.0f, -10.5f, 0.0f, 180.0f },
-        { 1, -9.0f, -10.0f, 6.0f, 180.0f },
-        { 1, 9.0f, -10.0f, 6.0f, 180.0f },
+        { 0, 0.0f, 8.1f, 6.05f, 0.0f },
+        { 0, -13.9f, 1.1f, 7.3f, -90.0f },
+        { 0, 11.5f, 3.25f, 6.25f, 90.0f },
+        { 1, 6.55f, -8.4f, 7.65f, 180.0f },
+        { 1, -6.55f, -8.4f, 7.65f, 180.0f },
+        { 1, 0.0f, 10.5f, 0.0f, 0.0f },
+        { 0, 0.0f, -13.9f, 7.3f, 180.0f },
+        { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 },
     } };
 
     int capacityOf(int type) noexcept
@@ -260,12 +264,20 @@ namespace
                 }
                 if (key.rfind("Slot", 0) == 0 && key.size() <= 6) {
                     const int index = std::atoi(key.c_str() + 4);
-                    float v[4]{};
-                    if (index >= 0 && index < kSlots && parseFloats(valueText, v, 4)) {
+                    float v[5]{ 0.0f, 0.0f, 0.0f, 0.0f, -2.0f };
+                    if (index >= 0 && index < kSlots && valueText.find("off") != std::string::npos) {
+                        g_places[index].group = -1;
+                    } else if (index >= 0 && index < kSlots && parseFloats(valueText, v, 4)) {
                         g_places[index].x = v[0];
                         g_places[index].y = v[1];
                         g_places[index].z = v[2];
                         g_places[index].yaw = v[3];
+                        parseFloats(valueText, v, 5);
+                        if (v[4] == 0.0f || v[4] == 1.0f) {
+                            g_places[index].group = static_cast<int>(v[4]);
+                        } else if (g_places[index].group < 0) {
+                            g_places[index].group = v[2] > 15.0f ? 1 : 0;
+                        }
                     }
                     continue;
                 }
@@ -900,6 +912,7 @@ namespace
     std::mutex g_rigLock;   // GetState runs on a script thread
     Rig g_rig;
     bool g_rigLoaded{ false };
+    bool g_tidied{ false };   // places checked after this load
     bool g_dirty{ false };
     Clock::time_point g_lastSave{};
 
@@ -943,12 +956,44 @@ namespace
             }
         }
         g_rigLoaded = true;
+        g_tidied = false;
         int pouches = 0;
         for (const auto& p : g_rig.slots) pouches += p.type != kEmpty ? 1 : 0;
         note("Rig loaded: %s, mannequin %08X, %d pouches", g_rig.worn ? "worn" : "on the mannequin", g_rig.mannequin, pouches);
     }
 
     void markDirty() noexcept { g_dirty = true; }
+
+    // After a load: a pouch on a place that is no longer used moves to a free place; a pouch of a type left out
+    // for now (or with no free place) goes back to the inventory. Its contents stay in the inventory either way.
+    void tidyPlaces() noexcept
+    {
+        if (g_tidied) {
+            return;
+        }
+        g_tidied = true;
+        for (int i = 0; i < kSlots; ++i) {
+            auto& pouch = g_rig.slots[i];
+            if (pouch.type == kEmpty || (g_places[i].group >= 0 && typeEnabled(pouch.type))) {
+                continue;
+            }
+            int to = -1;
+            for (int j = 0; j < kSlots && to < 0 && typeEnabled(pouch.type); ++j) {
+                if (g_places[j].group >= 0 && g_rig.slots[j].type == kEmpty) {
+                    to = j;
+                }
+            }
+            if (to >= 0) {
+                g_rig.slots[to] = pouch;
+                note("Pouch type %d moved from place %d (not used now) to %d", pouch.type, i, to);
+            } else {
+                pushSimple(kGiveItem, 0, g_shared.forms[pouch.type]);
+                note("Pouch type %d on place %d given back to the inventory", pouch.type, i);
+            }
+            pouch = Pouch{};
+            markDirty();
+        }
+    }
 
     bool addToPouch(Pouch& pouch, std::uint32_t form) noexcept
     {
@@ -1067,10 +1112,26 @@ namespace
         if (!data) {
             return;
         }
+        // a model in Meshes\RigVR\Custom\ with the hologram's file name replaces it (no ini needed; the mod's zip never overwrites it)
+        for (int k = 0; k < kKinds; ++k) {
+            auto& km = g_kindModels[k];
+            const std::string file = (k < 4 ? std::string{} : std::string{ "Pouch" }) + kKindNames[k] + ".nif";
+            if (km.model.empty() && std::ifstream("Data/Meshes/RigVR/Custom/" + file).good()) {
+                km.model = "RigVR\\Custom\\" + file;
+            }
+        }
+        // the pouches as inventory items (seen when dropped) use the same model
+        constexpr std::uint32_t kItemIDs[kKinds]{ 0, 0, 0, 0, 0x80B, 0x80C, 0x80D, 0x80E, 0x80F, 0x810, 0x81A };
         for (int k = 0; k < kKinds; ++k) {
             const auto& km = g_kindModels[k];
             if (km.model.empty()) {
                 continue;
+            }
+            if (kItemIDs[k]) {
+                auto* item = data->LookupForm(kItemIDs[k], "RigVR.esp");
+                if (item && item->GetFormType() == RE::ENUM_FORM_ID::kMISC) {
+                    static_cast<RE::TESModel&>(static_cast<RE::BGSModelMaterialSwap&>(*static_cast<RE::TESObjectMISC*>(item))).SetModel(km.model.c_str());
+                }
             }
             auto* form = data->LookupForm(kKindStatIDs[k], "RigVR.esp");
             if (!form || form->GetFormType() != RE::ENUM_FORM_ID::kSTAT) {
@@ -1251,7 +1312,7 @@ namespace
     RE::NiTransform slotPose(const Frames& f, int slot, float extraScale = 1.0f) noexcept
     {
         const auto& p = g_places[slot];
-        const auto& frame = p.group == 0 ? f.belt : f.chest;
+        const auto& frame = p.group == 1 ? f.chest : f.belt;
         const float s = f.scale * extraScale;
         return uprightTransform(frame.at(p.x * s, p.y * s, p.z), frame.yaw + p.yaw * kDegrees);
     }
@@ -1307,7 +1368,7 @@ namespace
         float bestDistance = radius;
         for (int i = 0; i < kSlots; ++i) {
             const bool filled = g_rig.slots[i].type != kEmpty;
-            if (filled != wantFilled) {
+            if (filled != wantFilled || g_places[i].group < 0) {
                 continue;
             }
             const float d = distance(slotPose(f, i).translate, palm) * (g_rig.slots[i].type == kSling ? g_settings.slotRadius / g_settings.backRadius :
@@ -1376,7 +1437,7 @@ namespace
 
         // the shelf: one of each pouch you carry and have not hung up
         for (int t = 1; t <= kPouchTypes; ++t) {
-            const auto have = inventoryCount(player, g_shared.forms[t]);
+            const auto have = typeEnabled(t) ? inventoryCount(player, g_shared.forms[t]) : 0u;
             const bool inHand = st.heldType == t;
             if (have > (inHand ? 1u : 0u)) {
                 want(kVisTray + t - 1, kStatPouch0 + t, trayPose(f, t - 1));
@@ -1456,7 +1517,7 @@ namespace
                 continue;
             }
             // fold the mannequin up: hold the grip on its head
-            const auto head = f.chest.at(0.0f, 0.0f, 116.0f - g_settings.chestHeight);
+            const auto head = f.chest.at(0.0f, -2.0f, 14.0f);   // just above the mannequin's neck
             if (distance(head, hand.palm) < 10.0f) {
                 st.packStart = now;
                 st.packHand = h;
@@ -1486,8 +1547,8 @@ namespace
         }
 
         // put the rig on / hang it back: both hands take the mannequin by the shoulders, both grips at once
-        const auto leftShoulder = f.chest.at(-13.0f, 0.0f, 10.0f);
-        const auto rightShoulder = f.chest.at(13.0f, 0.0f, 10.0f);
+        const auto leftShoulder = f.chest.at(-10.0f, -2.0f, 6.0f);
+        const auto rightShoulder = f.chest.at(10.0f, -2.0f, 6.0f);
         const bool both = g_hands[0].grip && g_hands[1].grip;
         if (!both) {
             st.wearArmed = true;
@@ -1515,7 +1576,7 @@ namespace
 
         // free places
         for (int i = 0; i < kSlots; ++i) {
-            if (rigHere && g_rig.slots[i].type == kEmpty && st.heldType != kEmpty) {
+            if (rigHere && g_rig.slots[i].type == kEmpty && st.heldType != kEmpty && g_places[i].group >= 0) {
                 want(kVisGhost + i, kStatGhost, slotPose(f, i));
             } else {
                 hideVisual(kVisGhost + i);
@@ -1788,6 +1849,7 @@ namespace
         if (!g_rigLoaded) {
             return;
         }
+        tidyPlaces();
         takeNewRefs();
         readHand(0);
         readHand(1);

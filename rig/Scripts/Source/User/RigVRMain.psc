@@ -73,13 +73,11 @@ EndFunction
 Function GiveStarterKit()
 	Actor player = Game.GetPlayer()
 	player.AddItem(Kit, 1, true)
+	; for now only the pouches that have a model: magazines, holster, bag, back sling (first aid, grenades, ammo loops later)
 	player.AddItem(RigVR_PouchItems.GetAt(0), 2, true)
-	player.AddItem(RigVR_PouchItems.GetAt(6), 1, true)   ; two back slings in all
-	int i = 1
-	while i < RigVR_PouchItems.GetSize()
-		player.AddItem(RigVR_PouchItems.GetAt(i), 1, true)
-		i += 1
-	endwhile
+	player.AddItem(RigVR_PouchItems.GetAt(3), 1, true)
+	player.AddItem(RigVR_PouchItems.GetAt(4), 1, true)
+	player.AddItem(RigVR_PouchItems.GetAt(6), 2, true)
 	RigVR.Notify(20)
 EndFunction
 
