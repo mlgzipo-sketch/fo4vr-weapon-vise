@@ -650,11 +650,13 @@ namespace
         if (!looksLikeObject(node)) {
             return;
         }
+        bool fresh = false;
         if (node->parent != parent) {
             if (auto* old = node->parent; looksLikeObject(old)) {
                 old->DetachChild(node);
             }
             parent->AttachChild(node, true);
+            fresh = true;
             detail("Model %s attached under %s", inst->base.c_str(), parent->name.c_str());
         }
         setCulled(node, false);
@@ -668,6 +670,11 @@ namespace
             }
             return true;
         });
+        if (fresh) {
+            // let the engine set the new branch up as it does for its own models (transforms, bounds, flags)
+            alignas(16) std::array<std::byte, 0x80> update{};
+            node->UpdateTransformAndBounds(*reinterpret_cast<RE::NiUpdateData*>(update.data()));
+        }
         const auto bound = recomputeBound(node);
         // the parent's bound must reach the model, or the renderer culls it with the parent
         RE::NiAVObject* up = parent;
@@ -679,6 +686,7 @@ namespace
             }
             up = up->parent;
         }
+        parent->UpdateWorldBound();
     }
 
     void beginFrameModels() noexcept
