@@ -2028,6 +2028,8 @@ namespace
     }
 
     // the holster / carbine holder the gun in the hand is put into: the palm or the middle of the gun at it
+    // (with a gun in the hand only empty places count, with an empty hand only full ones: a full holster near the
+    // carbine holder must not take its turn)
     int gunPlaceNear(const Holder& h, const RE::NiPoint3& palmBody, bool withMiddle) noexcept
     {
         RE::NiPoint3 middle{};
@@ -2037,6 +2039,7 @@ namespace
         for (std::size_t i = 0; i < g_rig.pouches.size(); ++i) {
             const auto& p = g_rig.pouches[i];
             if (p.kind != kHolster && p.kind != kSling) continue;
+            if ((p.total() > 0) == withMiddle) continue;
             float d = distance(pouchMiddle(p), palmBody);
             if (hasMiddle) d = std::min(d, distance(pouchMiddle(p), middle));
             const float ratio = d / reachOf(p.kind);
@@ -2158,6 +2161,9 @@ namespace
                     st.holsterAt = now;
                     markDirty();
                     continue;
+                }
+                if (gun && hand.released() && (pouch.total() > 0 || cooling)) {
+                    note("Gun let go at pouch %d but it %s", index, pouch.total() > 0 ? "already holds a gun" : "was used a moment ago");
                 }
                 if (hand.pressed() && pouch.total() > 0 && gunNow) {
                     note("Pouch %d holds a gun but the hand holds one too: put that one away first", index);
