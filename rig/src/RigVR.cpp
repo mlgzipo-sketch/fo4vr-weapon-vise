@@ -152,6 +152,7 @@ namespace
         bool  messages{ true };
         float slotRadius{ 8.0f };      // the palm this close to a pouch / a free place
         float backRadius{ 16.0f };     // ..and this close to a gun place on the back (you cannot see it)
+        float holsterRadius{ 12.0f };  // ..and this close to a holster
         float mannequinReach{ 150.0f };// the mannequin is used within this distance
         float wearRadius{ 12.0f };     // both hands this close to the mannequin's shoulders to put the rig on / hang it back
         float wearWindow{ 0.5f };      // ..both grips pressed within this many seconds
@@ -198,7 +199,7 @@ namespace
         auto& s = g_settings;
         const Entry entries[]{
             { "iGunHand", 1, &s.gunHand }, { "iGripButton", 1, &s.gripButton }, { "bHaptics", 0, &s.haptics },
-            { "bMessages", 0, &s.messages }, { "fSlotRadius", 2, &s.slotRadius }, { "fBackRadius", 2, &s.backRadius }, { "fMannequinReach", 2, &s.mannequinReach },
+            { "bMessages", 0, &s.messages }, { "fSlotRadius", 2, &s.slotRadius }, { "fBackRadius", 2, &s.backRadius }, { "fHolsterRadius", 2, &s.holsterRadius }, { "fMannequinReach", 2, &s.mannequinReach },
             { "fWearRadius", 2, &s.wearRadius }, { "fWearWindow", 2, &s.wearWindow }, { "fPackSeconds", 2, &s.packSeconds },
             { "fStoreRadius", 2, &s.storeRadius }, { "fMouthRadius", 2, &s.mouthRadius }, { "fHolsterCooldown", 2, &s.holsterCooldown },
             { "fBeltHeight", 2, &s.beltHeight }, { "fChestHeight", 2, &s.chestHeight }, { "fBeltUp", 2, &s.beltUp },
@@ -1169,6 +1170,7 @@ namespace
         Clock::time_point packStart{};
         int packHand{ -1 };
         Clock::time_point holsterAt{};
+        RE::TESObjectWEAP* lastGun{ nullptr };
         Clock::time_point lastFrame{};
         std::array<int, 2> hover{ -1, -1 };   // pouch slot each hand is at (body)
         bool wearArmed{ true };
@@ -1206,7 +1208,8 @@ namespace
             if (filled != wantFilled) {
                 continue;
             }
-            const float d = distance(slotPose(f, i).translate, palm) * (g_rig.slots[i].type == kSling ? g_settings.slotRadius / g_settings.backRadius : 1.0f);
+            const float d = distance(slotPose(f, i).translate, palm) * (g_rig.slots[i].type == kSling ? g_settings.slotRadius / g_settings.backRadius :
+                                                                          g_rig.slots[i].type == kHolster ? g_settings.slotRadius / g_settings.holsterRadius : 1.0f);
             if (d < bestDistance) {
                 bestDistance = d;
                 best = i;
@@ -1456,7 +1459,9 @@ namespace
             hideVisual(kVisRig);
         }
 
-        auto* gun = equippedGun(player);
+        auto* gunNow = equippedGun(player);
+        auto* gun = gunNow ? gunNow : st.lastGun;   // let go this frame: ROCK may already have dropped it
+        st.lastGun = gunNow;
         const bool cooling = std::chrono::duration<float>(now - st.holsterAt).count() < g_settings.holsterCooldown;
         RE::NiTransform cursorPose{};
         bool cursor = false;
@@ -1478,17 +1483,19 @@ namespace
             const bool gunPlace = pouch.type == kHolster || pouch.type == kSling;
             if (gunPlace && gunHand) {
                 // holster: let go of (or press) the grip with a gun at an empty holster to put it away
-                if (gun && pouch.total() == 0 && (hand.released() || hand.pressed()) && !cooling) {
+                if (gun && pouch.total() == 0 && (hand.released() || (gunNow && hand.pressed())) && !cooling) {
                     pouch.items[0] = Stack{ gun->GetFormID(), 1 };
                     pushSimple(kUnequip, 0, gun->GetFormID());
                     st.holsterAt = now;
+                    st.lastGun = nullptr;
+                    hud(pouch.type == kSling ? "Оружие за спиной" : "Оружие в кобуре");
                     sound(0);
                     buzz(h, 2500);
                     markDirty();
                     continue;
                 }
                 // ..and grip at a full holster with an empty hand to draw it
-                if (!gun && pouch.total() > 0 && hand.pressed() && !cooling) {
+                if (!gunNow && pouch.total() > 0 && hand.pressed() && !cooling) {
                     const auto form = pouch.items[0].form;
                     pouch = Pouch{ pouch.type };
                     if (inventoryCount(player, form) > 0) {
@@ -1515,6 +1522,11 @@ namespace
                     auto* base = ref->GetObjectReference();
                     if (addToPouch(pouch, base->GetFormID())) {
                         pushSimple(kStoreRef, ref->GetFormID());
+                        char text[200]{};
+                        const auto name = RE::TESFullName::GetFullName(*base);
+                        std::snprintf(text, sizeof(text), "%s: %.*s (%d/%d)", pouchName(pouch.type), static_cast<int>(name.size()), name.data(),
+                            pouch.total(), capacityOf(pouch.type));
+                        hud(text);
                         sound(3);
                         buzz(h, 1500);
                         markDirty();
@@ -1555,6 +1567,12 @@ namespace
                 // the grenade stays in the pouch as a reservation: put it back
                 addToPouch(pouch, form);
                 continue;
+            }
+            if (auto* item = lookupForm(form)) {
+                char text[200]{};
+                const auto name = RE::TESFullName::GetFullName(*item);
+                std::snprintf(text, sizeof(text), "%.*s (осталось %d)", static_cast<int>(name.size()), name.data(), pouch.total());
+                hud(text);
             }
             PendingCommand c;
             c.type = kDropToHand;
