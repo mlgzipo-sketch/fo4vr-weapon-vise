@@ -193,6 +193,21 @@ namespace
         return true;
     }
 
+    // Each drawn object (static index 0..10) can use any model: sModel_Mag=Path\\To\\Model.nif in [Models],
+    // turned (degrees), moved (game units, in the place's frame: right, forward, up) and scaled to sit right.
+    constexpr int kKinds = 11;
+    const char* const kKindNames[kKinds]{ "Mannequin", "Rig", "Ghost", "Cursor", "Mag", "Med", "Grenade", "Holster", "Dump", "Bandolier", "Sling" };
+    constexpr std::uint32_t kKindStatIDs[kKinds]{ 0x800, 0x801, 0x802, 0x803, 0x804, 0x805, 0x806, 0x807, 0x808, 0x809, 0x819 };
+
+    struct KindModel
+    {
+        std::string model;
+        float scale{ 1.0f };
+        float rot[3]{};
+        float offset[3]{};
+    };
+    std::array<KindModel, kKinds> g_kindModels;
+
     void loadSettings() noexcept
     {
         struct Entry { const char* key; int type; void* value; };
@@ -220,6 +235,29 @@ namespace
                     key.pop_back();
                 }
                 const auto valueText = line.substr(equals + 1);
+                bool kindKey = false;
+                for (int k = 0; k < kKinds && !kindKey; ++k) {
+                    const std::string name = kKindNames[k];
+                    auto& km = g_kindModels[k];
+                    if (key == "sModel_" + name) {
+                        const auto first = valueText.find_first_not_of(" \t");
+                        const auto last = valueText.find_last_not_of(" \t\r");
+                        km.model = first == std::string::npos ? std::string{} : valueText.substr(first, last - first + 1);
+                        kindKey = true;
+                    } else if (key == "fScale_" + name) {
+                        km.scale = std::strtof(valueText.c_str(), nullptr);
+                        kindKey = true;
+                    } else if (key == "fRot_" + name) {
+                        parseFloats(valueText, km.rot, 3);
+                        kindKey = true;
+                    } else if (key == "fOffset_" + name) {
+                        parseFloats(valueText, km.offset, 3);
+                        kindKey = true;
+                    }
+                }
+                if (kindKey) {
+                    continue;
+                }
                 if (key.rfind("Slot", 0) == 0 && key.size() <= 6) {
                     const int index = std::atoi(key.c_str() + 4);
                     float v[4]{};
@@ -982,6 +1020,70 @@ namespace
     constexpr int kVisuals = kVisHeld + 1;
     std::array<Visual, kVisuals> g_vis;
 
+    // Rows of a rotation by x, then y, then z degrees (the frame's own axes).
+    RE::NiMatrix3 rotationXYZ(const float* degrees) noexcept
+    {
+        RE::NiMatrix3 m;
+        m.entry[0][0] = 1.0f; m.entry[0][1] = 0.0f; m.entry[0][2] = 0.0f;
+        m.entry[1][0] = 0.0f; m.entry[1][1] = 1.0f; m.entry[1][2] = 0.0f;
+        m.entry[2][0] = 0.0f; m.entry[2][1] = 0.0f; m.entry[2][2] = 1.0f;
+        for (int axis = 0; axis < 3; ++axis) {
+            const float a = degrees[axis] * 3.14159265f / 180.0f;
+            if (a == 0.0f) {
+                continue;
+            }
+            const float c = std::cos(a);
+            const float sn = std::sin(a);
+            RE::NiMatrix3 r;
+            const int i = (axis + 1) % 3;
+            const int j = (axis + 2) % 3;
+            for (int x = 0; x < 3; ++x)
+                for (int y = 0; y < 3; ++y)
+                    r.entry[x][y] = x == y ? 1.0f : 0.0f;
+            r.entry[i][i] = c; r.entry[i][j] = sn;
+            r.entry[j][i] = -sn; r.entry[j][j] = c;
+            m = m * r;
+        }
+        return m;
+    }
+
+    RE::NiTransform withKindModel(int kind, const RE::NiTransform& pose) noexcept
+    {
+        if (kind < 0 || kind >= kKinds) {
+            return pose;
+        }
+        const auto& km = g_kindModels[kind];
+        RE::NiTransform local;
+        local.rotate = rotationXYZ(km.rot);
+        local.translate = { km.offset[0], km.offset[1], km.offset[2] };
+        local.scale = km.scale > 0.001f ? km.scale : 1.0f;
+        return compose(pose, local);
+    }
+
+    // Models from RigVR.ini replace the hologram outlines (once the game data is loaded).
+    void applyKindModels() noexcept
+    {
+        auto* data = RE::TESDataHandler::GetSingleton();
+        if (!data) {
+            return;
+        }
+        for (int k = 0; k < kKinds; ++k) {
+            const auto& km = g_kindModels[k];
+            if (km.model.empty()) {
+                continue;
+            }
+            auto* form = data->LookupForm(kKindStatIDs[k], "RigVR.esp");
+            if (!form || form->GetFormType() != RE::ENUM_FORM_ID::kSTAT) {
+                note("Model for %s: RigVR.esp record %03X not found", kKindNames[k], kKindStatIDs[k]);
+                continue;
+            }
+            auto* stat = static_cast<RE::TESObjectSTAT*>(form);
+            static_cast<RE::TESModel&>(static_cast<RE::BGSModelMaterialSwap&>(*stat)).SetModel(km.model.c_str());
+            note("Model for %s: %s (scale %.2f, turn %.0f %.0f %.0f, shift %.1f %.1f %.1f)", kKindNames[k], km.model.c_str(), km.scale,
+                km.rot[0], km.rot[1], km.rot[2], km.offset[0], km.offset[1], km.offset[2]);
+        }
+    }
+
     void want(int index, int kind, const RE::NiTransform& pose) noexcept
     {
         auto& v = g_vis[index];
@@ -1078,7 +1180,7 @@ namespace
                 continue;
             }
             setCulled(root, false);
-            place3D(root, v.pose);
+            place3D(root, withKindModel(v.kind, v.pose));
             // the reference itself must stay near what is drawn, or the game unloads / culls it
             if (distance(ref->GetPosition(), v.pose.translate) > 300.0f && now - v.lastMove > std::chrono::seconds(2)) {
                 PendingCommand c;
@@ -1756,6 +1858,7 @@ namespace
         static bool done = false;
         if (!done) {
             done = true;
+            applyKindModels();
             const int error = FRIKApiV2::initialize(3);
             if (error != 0) {
                 note("FRIK API v2.3+ unavailable (error %d); RigVR cannot run", error);
