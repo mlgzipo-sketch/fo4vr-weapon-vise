@@ -1932,8 +1932,8 @@ namespace
         if (mannequin) {
             const auto holder = mannequinHolder(mannequin);
             if (holder.valid) {
-                const bool near = distance(mannequin->GetPosition(), player->GetPosition()) < g_settings.mannequinReach;
-                atMannequin(player, holder, now, near && !menu);
+                const bool nearby = distance(mannequin->GetPosition(), player->GetPosition()) < g_settings.mannequinReach;
+                atMannequin(player, holder, now, nearby && !menu);
             }
         }
         if (g_rig.rigOn && g_rig.worn) {
