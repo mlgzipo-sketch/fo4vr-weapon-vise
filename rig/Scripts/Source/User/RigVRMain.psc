@@ -188,8 +188,9 @@ Function Handle()
 			endif
 		elseif cmd == 11
 			if f
+				int want = RigVR.CommandKind()
 				player.UnequipItem(f, false, true)
-				Recollect(f)
+				Recollect(f, want)
 			endif
 		elseif cmd == 12
 			PlaySound(RigVR.CommandKind())
@@ -208,18 +209,16 @@ Function Handle()
 EndFunction
 
 ; A gun put in the holster / on the back: if ROCK dropped it as the grip was let go, it comes back.
-Function Recollect(Form f)
+; A gun put away may have been dropped by the hand first: pick that one up again, until you have as many as you had
+; while holding it (never more).
+Function Recollect(Form f, int want)
 	Actor player = Game.GetPlayer()
 	int tries = 0
-	while tries < 4
-		ObjectReference[] near = player.FindAllReferencesOfType(f, 150.0)
-		int i = 0
-		while near && i < near.Length
-			if near[i] && !near[i].IsDisabled()
-				player.AddItem(near[i], 1, true)
-			endif
-			i += 1
-		endwhile
+	while tries < 6 && player.GetItemCount(f) < want
+		ObjectReference r = Game.FindClosestReferenceOfTypeFromRef(f, player, 200.0)
+		if r && !r.IsDisabled() && !r.IsDeleted()
+			player.AddItem(r, 1, true)
+		endif
 		Utility.Wait(0.15)
 		tries += 1
 	endwhile

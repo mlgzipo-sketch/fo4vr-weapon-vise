@@ -121,7 +121,7 @@ namespace
     float reachOf(int kind) noexcept
     {
         switch (kind) {
-        case kSling: return 14.0f;
+        case kSling: return 18.0f;
         case kHolster: return 10.0f;
         case kDump: return 11.0f;
         default: return 8.0f;
@@ -167,6 +167,7 @@ namespace
         float mouthRadius{ 12.0f };    // a chem / food from a pouch this close to the mouth is used
         float holsterCooldown{ 1.0f };
         float upSnapDegrees{ 25.0f };  // a pouch held this close to upright hangs straight
+        float areaSmooth{ 7.0f };      // the faces of an area this close to where a pouch hangs set which way it faces
         float shoulderX{ 14.7f };      // the mannequin's shoulders in its own space (right, forward, up)
         float shoulderY{ -3.4f };
         float shoulderZ{ 105.0f };
@@ -187,7 +188,7 @@ namespace
             { "bMessages", 0, &s.messages }, { "fHoldRadius", 2, &s.holdRadius }, { "fSnapRadius", 2, &s.snapRadius },
             { "fShowAreas", 2, &s.showAreas }, { "fMannequinReach", 2, &s.mannequinReach }, { "fWearRadius", 2, &s.wearRadius },
             { "fWearWindow", 2, &s.wearWindow }, { "fPackSeconds", 2, &s.packSeconds }, { "fStoreRadius", 2, &s.storeRadius },
-            { "fMouthRadius", 2, &s.mouthRadius }, { "fHolsterCooldown", 2, &s.holsterCooldown }, { "fUpSnapDegrees", 2, &s.upSnapDegrees },
+            { "fMouthRadius", 2, &s.mouthRadius }, { "fHolsterCooldown", 2, &s.holsterCooldown }, { "fUpSnapDegrees", 2, &s.upSnapDegrees }, { "fAreaSmooth", 2, &s.areaSmooth },
             { "fShoulderX", 2, &s.shoulderX }, { "fShoulderY", 2, &s.shoulderY }, { "fShoulderZ", 2, &s.shoulderZ }, { "fHeadZ", 2, &s.headZ }, { "fBodyScale", 2, &s.bodyScale }, { "fBodyScaleZ", 2, &s.bodyScaleZ },
         };
         try {
@@ -699,6 +700,45 @@ namespace
             }
             up = up->parent;
         }
+    }
+
+    // A gun put away is seen as a copy of the gun's own node as it was in the hand (with all its mods): one copy per
+    // holster / carbine holder, kept while the gun is there.
+    struct GunVisual
+    {
+        Instance* inst{ nullptr };
+        std::uint32_t form{ 0 };
+        RE::NiTransform inPouch{};   // the gun in the pouch's own space
+    };
+    std::array<GunVisual, 16> g_gunVisuals{};
+
+    // the gun in the hand now (or last seen there): a copy of its node, its place in the world and the middle of it
+    struct GunSnapshot
+    {
+        RE::NiPointer<RE::NiNode> copy;
+        std::uint32_t form{ 0 };
+        RE::NiAVObject* source{ nullptr };   // the model under the Weapon node the copy was made from
+        RE::NiTransform world{};
+        RE::NiPoint3 middle{};
+        bool seen{ false };                  // in the hand this frame
+    } g_gunSnapshot;
+
+    RE::NiNode* cloneNode(RE::NiNode* source) noexcept
+    {
+        if (!looksLikeObject(source)) {
+            return nullptr;
+        }
+        RE::NiCloningProcess process{};
+        process.copyType = RE::NiCloningProcess::CopyType::kCopyExact;
+        process.appendChar = '$';
+        process.scale = { 1.0f, 1.0f, 1.0f };
+        auto* object = source->CreateClone(process);
+        if (!object) {
+            return nullptr;
+        }
+        source->ProcessClone(process);
+        auto* av = static_cast<RE::NiAVObject*>(object);
+        return looksLikeObject(av) ? av->IsNode() : nullptr;
     }
 
     void beginFrameModels() noexcept
@@ -1404,27 +1444,42 @@ namespace
         }
     }
 
+    // where a gun hangs in a holster (muzzle down, its right side out from the rig, its top towards the holster's -X)
+    // or in a carbine holder when it was not hung there by hand
+    RE::NiTransform fixedGunPose(int kind) noexcept
+    {
+        RE::NiTransform gun = identity();
+        setRow(gun.rotate, 0, { 0.0f, 1.0f, 0.0f });
+        setRow(gun.rotate, 1, { 0.0f, 0.0f, -1.0f });
+        setRow(gun.rotate, 2, { -1.0f, 0.0f, 0.0f });
+        const auto& o = kind == kHolster ? g_settings.holsterGun : g_settings.slingGun;
+        gun.translate = { o[0], o[1], o[2] };
+        return gun;
+    }
+
     void drawPouch(const Holder& h, const Pouch& p) noexcept
     {
         const auto& bone = boneOf(p);
         auto* parent = h.parentFor(bone);
         if (!parent) return;
         show(acquire(pouchModel(p.kind)), parent, h.localFor(bone, p.pose));
-        // a gun put away in a holster / carbine holder stays seen there (its plain model, without its mods)
+        const auto index = static_cast<std::size_t>(&p - g_rig.pouches.data());
+        if (index < g_rig.pouches.size() && index < g_gunVisuals.size() && p.items[0].form) {
+            auto& v = g_gunVisuals[index];
+            if (v.inst && v.form == p.items[0].form && looksLikeObject(v.inst->node.get())) {
+                v.inst->used = true;
+                show(v.inst, parent, compose(h.localFor(bone, p.pose), v.inPouch));
+                return;
+            }
+        }
+        // a gun put away before this game was started: its plain model (modular guns have none to show)
         if ((p.kind == kHolster || p.kind == kSling) && p.items[0].form) {
             auto* form = lookupForm(p.items[0].form);
             if (form && form->GetFormType() == RE::ENUM_FORM_ID::kWEAP) {
                 auto* weapon = static_cast<RE::TESObjectWEAP*>(form);
                 const char* path = static_cast<RE::TESModel&>(static_cast<RE::BGSModelMaterialSwap&>(*weapon)).GetModel();
-                if (path && *path) {
-                    // muzzle down into the holster, the gun's right side out from the rig, its top towards the holster's -X
-                    RE::NiTransform gun = identity();
-                    setRow(gun.rotate, 0, { 0.0f, 1.0f, 0.0f });
-                    setRow(gun.rotate, 1, { 0.0f, 0.0f, -1.0f });
-                    setRow(gun.rotate, 2, { -1.0f, 0.0f, 0.0f });
-                    const auto& o = p.kind == kHolster ? g_settings.holsterGun : g_settings.slingGun;
-                    gun.translate = { o[0], o[1], o[2] };
-                    show(acquire(path), parent, h.localFor(bone, compose(p.pose, gun)));
+                if (path && *path && !std::strstr(path, "Dummy")) {
+                    show(acquire(path), parent, h.localFor(bone, compose(p.pose, fixedGunPose(p.kind))));
                 }
             }
         }
@@ -1500,8 +1555,9 @@ namespace
             if (!ref || ref == player || !readable(ref, sizeof(RE::TESObjectREFR)) || ref->IsDisabled() || ref->IsDeleted()) continue;
             auto* base = ref->GetObjectReference();
             if (!base || !readable(base, sizeof(RE::TESForm)) || !bagAccepts(base) || kindOfItem(base) != kEmpty) continue;
-            if (!ref->Get3D()) continue;
-            const float d = distance(ref->GetPosition(), palm);
+            auto* root = ref->Get3D();
+            if (!looksLikeObject(root)) continue;
+            const float d = distance(root->world.translate, palm);   // a held item's own position lags behind its 3D
             if (d < bestDistance) {
                 bestDistance = d;
                 best = ref;
@@ -1542,9 +1598,20 @@ namespace
         if (s.area < 0 || length(bestNormal) < 0.5f) {
             return s;
         }
-        // out of the rig: away from the body's middle line
-        RE::NiPoint3 out = bestNormal;
-        if (dot(out, RE::NiPoint3{ bestPoint.x, bestPoint.y, 0.0f }) < 0.0f) {
+        // out of the rig: away from the body's middle line; the area's faces around the point are averaged, so the pouch
+        // is not turned by one small face
+        const RE::NiPoint3 radial{ bestPoint.x, bestPoint.y, 0.0f };
+        RE::NiPoint3 sum{};
+        for (const auto& t : g_def.areas[s.area].tris) {
+            const auto c = (t[0] + t[1] + t[2]) * (1.0f / 3.0f);
+            const float d = distance(c, bestPoint);
+            if (d > g_settings.areaSmooth) continue;
+            auto n = cross(t[1] - t[0], t[2] - t[0]);   // its length weighs it by its size
+            if (dot(n, radial) < 0.0f) n = n * -1.0f;
+            sum += n * (1.0f - d / (g_settings.areaSmooth * 1.5f));
+        }
+        RE::NiPoint3 out = length(sum) > 1.0e-4f ? normalized(sum) : bestNormal;
+        if (dot(out, radial) < 0.0f) {
             out = out * -1.0f;
         }
         const RE::NiPoint3 worldUp{ 0.0f, 0.0f, 1.0f };
@@ -1578,6 +1645,12 @@ namespace
         int packHand{ -1 };
         Clock::time_point holsterAt{};
         RE::TESObjectWEAP* lastGun{ nullptr };
+        RE::TESObjectWEAP* countedGun{ nullptr };
+        std::uint32_t gunCount{ 0 };          // how many of the gun in the hand you had while holding it
+        int bagPouch{ -1 };                   // an item let go in the bag that was not found at once is looked for a moment
+        int bagHand{ 0 };
+        Clock::time_point bagAt{};
+        bool weaponLogged{ false };
         bool wearArmed{ true };
         bool bodyLogged{ false };
     } g_state;
@@ -1832,6 +1905,132 @@ namespace
 
     // ------------------------------------------------------------ on the body
 
+    // The Weapon node of your body (the gun in the hand hangs under it).
+    RE::NiNode* weaponNode(RE::PlayerCharacter* player) noexcept
+    {
+        RE::NiAVObject* roots[3]{ player->Get3D(true), player->Get3D(false), player->Get3D() };
+        for (auto* root : roots) {
+            if (!looksLikeObject(root)) continue;
+            auto* node = findNode(root, "Weapon");
+            if (node && node->GetRuntimeData().children.size() > 0) {
+                return node;
+            }
+        }
+        return nullptr;
+    }
+
+    // Keeps a copy of the gun in the hand (made again when the gun or its model changes) and where it is.
+    void watchGun(RE::PlayerCharacter* player, RE::TESObjectWEAP* gun) noexcept
+    {
+        auto& g = g_gunSnapshot;
+        g.seen = false;
+        if (!gun) {
+            return;
+        }
+        auto* node = weaponNode(player);
+        if (!node) {
+            if (!g_state.weaponLogged) {
+                g_state.weaponLogged = true;
+                note("Weapon node not found: a gun put away is shown by its plain model");
+            }
+            return;
+        }
+        auto& children = node->GetRuntimeData().children;
+        RE::NiAVObject* model = children.size() > 0 ? children[0].get() : nullptr;
+        if (!looksLikeObject(model)) {
+            return;
+        }
+        if (g.form != gun->GetFormID() || g.source != model || !g.copy) {
+            auto* copy = cloneNode(node);
+            g.copy.reset(copy);
+            g.form = gun->GetFormID();
+            g.source = model;
+            note("Gun %08X copied for the holster (model %s, %u under Weapon): %s", g.form, model->name.c_str() ? model->name.c_str() : "-",
+                static_cast<unsigned>(children.size()), copy ? "ok" : "FAILED");
+        }
+        g.world = node->world;
+        g.middle = model->worldBound.fRadius > 0.0f ? model->worldBound.center : node->world.translate;
+        g.seen = true;
+    }
+
+    // Shows the gun just put into pouch `index`: the copy of it, hung as it was let go (carbine holder) or straight.
+    void keepGunVisual(const Holder& h, int index, std::uint32_t form) noexcept
+    {
+        if (index < 0 || index >= static_cast<int>(g_gunVisuals.size())) {
+            return;
+        }
+        auto& v = g_gunVisuals[index];
+        auto& g = g_gunSnapshot;
+        if (!g.copy || g.form != form) {
+            v.form = 0;
+            return;
+        }
+        if (!v.inst) {
+            auto inst = std::make_unique<Instance>();
+            inst->base = "gun in pouch " + std::to_string(index);
+            v.inst = inst.get();
+            g_instances.push_back(std::move(inst));
+        }
+        if (auto* old = v.inst->node.get(); looksLikeObject(old) && old->parent && looksLikeObject(old->parent)) {
+            old->parent->DetachChild(old);
+        }
+        v.inst->node = g.copy;
+        v.form = form;
+        g.copy.reset();      // the next gun in the hand gets a copy of its own
+        g.source = nullptr;
+        const auto& p = g_rig.pouches[index];
+        v.inPouch = fixedGunPose(p.kind);
+        if (p.kind == kSling) {
+            const auto& bone = boneOf(p);
+            auto* parent = h.parentFor(bone);
+            if (parent) {
+                const auto pouchWorld = compose(parent->world, h.localFor(bone, p.pose));
+                v.inPouch = relative(pouchWorld, g.world);
+            }
+        }
+    }
+
+    // the holster / carbine holder the gun in the hand is put into: the palm or the middle of the gun at it
+    int gunPlaceNear(const Holder& h, const RE::NiPoint3& palmBody, bool withMiddle) noexcept
+    {
+        RE::NiPoint3 middle{};
+        const bool hasMiddle = withMiddle && palmInBody(h, g_gunSnapshot.middle, middle);
+        int best = -1;
+        float bestRatio = 1.0f;
+        for (std::size_t i = 0; i < g_rig.pouches.size(); ++i) {
+            const auto& p = g_rig.pouches[i];
+            if (p.kind != kHolster && p.kind != kSling) continue;
+            float d = distance(pouchMiddle(p), palmBody);
+            if (hasMiddle && p.kind == kSling) d = std::min(d, distance(pouchMiddle(p), middle));
+            const float ratio = d / reachOf(p.kind);
+            if (ratio < bestRatio) {
+                bestRatio = ratio;
+                best = static_cast<int>(i);
+            }
+        }
+        return best;
+    }
+
+    void storeInBag(RE::PlayerCharacter* player, Pouch& pouch, RE::TESObjectREFR* ref, int hi) noexcept
+    {
+        auto* base = ref->GetObjectReference();
+        if (addToPouch(pouch, base->GetFormID())) {
+            pushSimple(kStoreRef, ref->GetFormID());
+            char text[200]{};
+            const auto name = RE::TESFullName::GetFullName(*base);
+            std::snprintf(text, sizeof(text), "Сумка: %.*s (%d/%d)", static_cast<int>(name.size()), name.data(), pouch.total(),
+                capacityOf(pouch.kind));
+            hud(text);
+            note("Bag: %08X stored", base->GetFormID());
+            sound(3);
+            buzz(hi, 1500);
+            markDirty();
+        } else {
+            hud("Сумка полна");
+        }
+        (void)player;
+    }
+
     void onBody(RE::PlayerCharacter* player, const Holder& h, Clock::time_point now) noexcept
     {
         auto& st = g_state;
@@ -1848,26 +2047,59 @@ namespace
         auto* gunNow = equippedGun(player);
         auto* gun = gunNow ? gunNow : st.lastGun;   // let go this frame: ROCK may already have dropped it
         st.lastGun = gunNow;
+        watchGun(player, gunNow);
+        if (gunNow) {
+            const auto count = inventoryCount(player, gunNow->GetFormID());
+            if (gunNow != st.countedGun) {
+                st.countedGun = gunNow;
+                st.gunCount = count;
+            } else {
+                st.gunCount = std::max(st.gunCount, count);
+            }
+        }
         const bool cooling = std::chrono::duration<float>(now - st.holsterAt).count() < g_settings.holsterCooldown;
+
+        // an item let go in the bag a moment ago that was not found then
+        if (st.bagPouch >= 0) {
+            if (now - st.bagAt > std::chrono::milliseconds(400) || st.bagPouch >= static_cast<int>(g_rig.pouches.size())) {
+                st.bagPouch = -1;
+            } else {
+                auto& pouch = g_rig.pouches[st.bagPouch];
+                RE::NiTransform space;
+                if (h.space(space)) {
+                    const auto middle = toWorld(space, h.inflate(pouch.pose).translate + row(pouch.pose.rotate, 1) * depthOf(pouch.kind));
+                    if (auto* ref = looseItemNear(player, middle)) {
+                        storeInBag(player, pouch, ref, st.bagHand);
+                        st.bagPouch = -1;
+                    }
+                }
+            }
+        }
 
         for (int hi = 0; hi < 2; ++hi) {
             const auto& hand = g_hands[hi];
             if (!hand.valid) continue;
             RE::NiPoint3 palm;
             if (!palmInBody(h, hand.palm, palm)) continue;
-            const int index = nearestPouch(palm);
+            const bool gunHand = hi == g_settings.gunHand;
+            int index = gunHand ? gunPlaceNear(h, palm, gun != nullptr) : -1;
+            if (index < 0) index = nearestPouch(palm);
             if (index < 0) continue;
             auto& pouch = g_rig.pouches[index];
-            const bool gunHand = hi == g_settings.gunHand;
             const bool gunPlace = pouch.kind == kHolster || pouch.kind == kSling;
 
             if (gunPlace && gunHand) {
                 // holster: let go of (or press) the grip with a gun at an empty holster to put it away
                 if (gun && pouch.total() == 0 && (hand.released() || (gunNow && hand.pressed())) && !cooling) {
                     pouch.items[0] = Stack{ gun->GetFormID(), 1 };
-                    pushSimple(kUnequip, 0, gun->GetFormID());
+                    keepGunVisual(h, index, gun->GetFormID());
+                    const auto want = st.countedGun == gun ? st.gunCount : inventoryCount(player, gun->GetFormID());
+                    pushSimple(kUnequip, 0, gun->GetFormID(), static_cast<std::int32_t>(want));
+                    note("Gun %08X put away in %s %d (you have %u)", gun->GetFormID(), pouch.kind == kSling ? "carbine holder" : "holster",
+                        index, want);
                     st.holsterAt = now;
                     st.lastGun = nullptr;
+                    st.countedGun = nullptr;
                     hud(pouch.kind == kSling ? "Оружие в держателе" : "Оружие в кобуре");
                     sound(0);
                     buzz(hi, 2500);
@@ -1878,7 +2110,9 @@ namespace
                 if (!gunNow && pouch.total() > 0 && hand.pressed() && !cooling) {
                     const auto form = pouch.items[0].form;
                     pouch.items = {};
-                    if (inventoryCount(player, form) > 0) {
+                    const auto have = inventoryCount(player, form);
+                    note("Gun %08X taken from pouch %d (you have %u)", form, index, have);
+                    if (have > 0) {
                         pushSimple(kEquip, 0, form);
                         sound(1);
                         buzz(hi, 2000);
@@ -1888,6 +2122,9 @@ namespace
                     st.holsterAt = now;
                     markDirty();
                     continue;
+                }
+                if (hand.pressed() && pouch.total() > 0 && gunNow) {
+                    note("Pouch %d holds a gun but the hand holds one too: put that one away first", index);
                 }
                 continue;
             }
@@ -1899,20 +2136,12 @@ namespace
             // the bag: let go of an item in it and it goes in, grip in it with an empty hand to take the last one out
             if (hand.released()) {
                 if (auto* ref = looseItemNear(player, hand.palm)) {
-                    auto* base = ref->GetObjectReference();
-                    if (addToPouch(pouch, base->GetFormID())) {
-                        pushSimple(kStoreRef, ref->GetFormID());
-                        char text[200]{};
-                        const auto name = RE::TESFullName::GetFullName(*base);
-                        std::snprintf(text, sizeof(text), "Сумка: %.*s (%d/%d)", static_cast<int>(name.size()), name.data(), pouch.total(),
-                            capacityOf(pouch.kind));
-                        hud(text);
-                        sound(3);
-                        buzz(hi, 1500);
-                        markDirty();
-                    } else {
-                        hud("Сумка полна");
-                    }
+                    storeInBag(player, pouch, ref, hi);
+                } else {
+                    st.bagPouch = index;   // the hand may still hold it this frame: look again for a moment
+                    st.bagHand = hi;
+                    st.bagAt = now;
+                    detail("Bag: nothing let go near the palm yet");
                 }
                 continue;
             }
