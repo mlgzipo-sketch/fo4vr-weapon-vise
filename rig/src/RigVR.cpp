@@ -173,6 +173,8 @@ namespace
         float headZ{ 116.0f };
         float bodyScale{ 1.15f };     // the rig on you is this much bigger than on the mannequin (sits over armour)
         float bodyScaleZ{ 85.0f };    // ..around this height
+        float holsterGun[3]{ 0.0f, 3.0f, 11.0f };   // where a holstered gun's grip is in the holster (right, out, up)
+        float slingGun[3]{ 0.0f, 6.0f, 9.0f };      // ..and in the carbine holder
     };
     Settings g_settings;
 
@@ -199,6 +201,19 @@ namespace
                 auto key = line.substr(0, equals);
                 while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) {
                     key.pop_back();
+                }
+                if (key == "fHolsterGun" || key == "fSlingGun") {
+                    float* out = key == "fHolsterGun" ? s.holsterGun : s.slingGun;
+                    const char* at = line.c_str() + equals + 1;
+                    for (int i = 0; i < 3; ++i) {
+                        char* end = nullptr;
+                        const float v = std::strtof(at, &end);
+                        if (end == at) break;
+                        out[i] = v;
+                        at = end;
+                        while (*at == ',' || *at == ' ') ++at;
+                    }
+                    continue;
                 }
                 const float value = std::strtof(line.c_str() + equals + 1, nullptr);
                 for (const auto& entry : entries) {
@@ -1395,6 +1410,24 @@ namespace
         auto* parent = h.parentFor(bone);
         if (!parent) return;
         show(acquire(pouchModel(p.kind)), parent, h.localFor(bone, p.pose));
+        // a gun put away in a holster / carbine holder stays seen there (its plain model, without its mods)
+        if ((p.kind == kHolster || p.kind == kSling) && p.items[0].form) {
+            auto* form = lookupForm(p.items[0].form);
+            if (form && form->GetFormType() == RE::ENUM_FORM_ID::kWEAP) {
+                auto* weapon = static_cast<RE::TESObjectWEAP*>(form);
+                const char* path = static_cast<RE::TESModel&>(static_cast<RE::BGSModelMaterialSwap&>(*weapon)).GetModel();
+                if (path && *path) {
+                    // muzzle down into the holster, the gun's right side out from the rig, its top towards the holster's -X
+                    RE::NiTransform gun = identity();
+                    setRow(gun.rotate, 0, { 0.0f, 1.0f, 0.0f });
+                    setRow(gun.rotate, 1, { 0.0f, 0.0f, -1.0f });
+                    setRow(gun.rotate, 2, { -1.0f, 0.0f, 0.0f });
+                    const auto& o = p.kind == kHolster ? g_settings.holsterGun : g_settings.slingGun;
+                    gun.translate = { o[0], o[1], o[2] };
+                    show(acquire(path), parent, h.localFor(bone, compose(p.pose, gun)));
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------ pouch items in the hands
