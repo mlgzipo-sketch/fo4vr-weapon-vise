@@ -728,17 +728,36 @@ namespace
         if (!looksLikeObject(source)) {
             return nullptr;
         }
+        // the game's own clone (CreateClone + ProcessClone): its virtual slots sit elsewhere in the VR build, so the
+        // function is called by its address in Fallout4VR.exe 1.2.72, after checking its first bytes are the expected ones
+        using Clone = RE::NiObject* (*)(RE::NiObject*, RE::NiCloningProcess*);
+        static Clone clone = [] {
+            constexpr std::uintptr_t rva = 0x1C13FF0;
+            constexpr std::uint8_t expected[]{ 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20,
+                0x48, 0x8B, 0x01, 0x48, 0x8B, 0xFA, 0x48, 0x8B, 0xF1, 0xFF, 0x90, 0xE0, 0, 0, 0 };
+            const auto* at = reinterpret_cast<const std::uint8_t*>(REL::Module::get().base() + rva);
+            const bool ok = std::memcmp(at, expected, sizeof(expected)) == 0;
+            note("Game clone function %s", ok ? "found" : "NOT found (other game version): a gun put away is not shown");
+            return ok ? reinterpret_cast<Clone>(REL::Module::get().base() + rva) : nullptr;
+        }();
+        if (!clone) {
+            return nullptr;
+        }
         RE::NiCloningProcess process{};
         process.copyType = RE::NiCloningProcess::CopyType::kCopyExact;
         process.appendChar = '$';
         process.scale = { 1.0f, 1.0f, 1.0f };
-        auto* object = source->CreateClone(process);
-        if (!object) {
+        auto* object = clone(source, &process);
+        auto* av = static_cast<RE::NiAVObject*>(object);
+        if (!looksLikeObject(av)) {
             return nullptr;
         }
-        source->ProcessClone(process);
-        auto* av = static_cast<RE::NiAVObject*>(object);
-        return looksLikeObject(av) ? av->IsNode() : nullptr;
+        auto* node = av->IsNode();
+        if (!node || node == source) {
+            return nullptr;
+        }
+        node->parent = nullptr;
+        return node;
     }
 
     void beginFrameModels() noexcept
@@ -1259,6 +1278,24 @@ namespace
 
     bool addToPouch(Pouch& pouch, std::uint32_t form) noexcept
     {
+        if (pouch.kind == kDump) {
+            // the bag takes anything (it all goes to the inventory); it remembers the last kinds put in, the newest last
+            Stack moved{ form, 1 };
+            std::vector<Stack> kept;
+            for (const auto& st : pouch.items) {
+                if (!st.form) continue;
+                if (st.form == form) {
+                    moved.count = st.count + 1;
+                } else {
+                    kept.push_back(st);
+                }
+            }
+            kept.push_back(moved);
+            while (kept.size() > pouch.items.size()) kept.erase(kept.begin());
+            pouch.items = {};
+            for (std::size_t i = 0; i < kept.size(); ++i) pouch.items[i] = kept[i];
+            return true;
+        }
         if (pouch.total() >= capacityOf(pouch.kind)) {
             return false;
         }
@@ -1940,7 +1977,7 @@ namespace
         if (!looksLikeObject(model)) {
             return;
         }
-        if (g.form != gun->GetFormID() || g.source != model || !g.copy) {
+        if (g.form != gun->GetFormID() || g.source != model) {   // a failed copy is not tried again for the same model
             auto* copy = cloneNode(node);
             g.copy.reset(copy);
             g.form = gun->GetFormID();
@@ -2018,8 +2055,7 @@ namespace
             pushSimple(kStoreRef, ref->GetFormID());
             char text[200]{};
             const auto name = RE::TESFullName::GetFullName(*base);
-            std::snprintf(text, sizeof(text), "Сумка: %.*s (%d/%d)", static_cast<int>(name.size()), name.data(), pouch.total(),
-                capacityOf(pouch.kind));
+            std::snprintf(text, sizeof(text), "В инвентарь: %.*s", static_cast<int>(name.size()), name.data());
             hud(text);
             note("Bag: %08X stored", base->GetFormID());
             sound(3);
