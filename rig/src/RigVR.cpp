@@ -171,6 +171,8 @@ namespace
         float shoulderY{ -3.4f };
         float shoulderZ{ 105.0f };
         float headZ{ 116.0f };
+        float bodyScale{ 1.15f };     // the rig on you is this much bigger than on the mannequin (sits over armour)
+        float bodyScaleZ{ 85.0f };    // ..around this height
     };
     Settings g_settings;
 
@@ -184,7 +186,7 @@ namespace
             { "fShowAreas", 2, &s.showAreas }, { "fMannequinReach", 2, &s.mannequinReach }, { "fWearRadius", 2, &s.wearRadius },
             { "fWearWindow", 2, &s.wearWindow }, { "fPackSeconds", 2, &s.packSeconds }, { "fStoreRadius", 2, &s.storeRadius },
             { "fMouthRadius", 2, &s.mouthRadius }, { "fHolsterCooldown", 2, &s.holsterCooldown }, { "fUpSnapDegrees", 2, &s.upSnapDegrees },
-            { "fShoulderX", 2, &s.shoulderX }, { "fShoulderY", 2, &s.shoulderY }, { "fShoulderZ", 2, &s.shoulderZ }, { "fHeadZ", 2, &s.headZ },
+            { "fShoulderX", 2, &s.shoulderX }, { "fShoulderY", 2, &s.shoulderY }, { "fShoulderZ", 2, &s.shoulderZ }, { "fHeadZ", 2, &s.headZ }, { "fBodyScale", 2, &s.bodyScale }, { "fBodyScaleZ", 2, &s.bodyScaleZ },
         };
         try {
             std::ifstream file("Data/F4SE/Plugins/RigVR.ini");
@@ -1271,60 +1273,63 @@ namespace
     {
         bool valid{ false };
         bool body{ false };
-        RE::NiNode* root{ nullptr };       // the mannequin's 3D
-        RE::NiAVObject* skeleton{ nullptr };   // your body's 3D
+        RE::NiAVObject* skeleton{ nullptr };   // your body's 3D (the one with the bones FRIK moves)
+        RE::NiNode* anchor{ nullptr };         // on the mannequin: models hang under your skeleton's root, placed at the mannequin
+        RE::NiTransform manWorld{};            // the mannequin in the world (body space of the mannequin)
 
         RE::NiNode* parentFor(const std::string& bone) const noexcept
         {
+            return body ? findNode(skeleton, bone) : anchor;
+        }
+
+        // on you the rig sits this much further out than on the mannequin (over armour)
+        RE::NiTransform inflate(const RE::NiTransform& pose) const noexcept
+        {
             if (!body) {
-                return root;
+                return pose;
             }
-            return findNode(skeleton, bone);
+            const float k = g_settings.bodyScale;
+            const RE::NiPoint3 c{ 0.0f, 0.0f, g_settings.bodyScaleZ };
+            RE::NiTransform t = pose;
+            t.translate = c + (pose.translate - c) * k;
+            t.scale = pose.scale * k;
+            return t;
         }
 
         // local transform under parentFor(bone) for a pose in body space
         RE::NiTransform localFor(const std::string& bone, const RE::NiTransform& bodyPose) const noexcept
         {
             if (!body) {
-                return bodyPose;
+                return looksLikeObject(anchor) ? relative(anchor->world, compose(manWorld, bodyPose)) : bodyPose;
             }
             const auto it = g_def.binds.find(bone);
-            return it == g_def.binds.end() ? bodyPose : relative(it->second, bodyPose);
+            return it == g_def.binds.end() ? bodyPose : relative(it->second, inflate(bodyPose));
         }
 
-        // a pose in body space as it is in the world now
-        bool world(const std::string& bone, const RE::NiTransform& bodyPose, RE::NiTransform& out) const noexcept
+        // body space in the world now (without the inflation)
+        bool space(RE::NiTransform& out) const noexcept
         {
-            auto* parent = parentFor(bone);
-            if (!looksLikeObject(parent)) {
+            if (!body) {
+                out = manWorld;
+                return true;
+            }
+            auto* pelvis = parentFor("Pelvis");
+            const auto it = g_def.binds.find("Pelvis");
+            if (!pelvis || it == g_def.binds.end()) {
                 return false;
             }
-            out = compose(parent->world, localFor(bone, bodyPose));
+            out = compose(pelvis->world, relative(it->second, identity()));
             return true;
         }
     };
 
-    Holder mannequinHolder(RE::TESObjectREFR* mannequin) noexcept
+    // the root of your body's 3D that holds the bones (null if none does)
+    RE::NiAVObject* findSkeleton(RE::PlayerCharacter* player) noexcept
     {
-        Holder h;
-        auto* root = mannequin ? mannequin->Get3D() : nullptr;
-        h.root = looksLikeObject(root) ? root->IsNode() : nullptr;
-        h.valid = h.root != nullptr;
-        return h;
-    }
-
-    Holder bodyHolder(RE::PlayerCharacter* player) noexcept
-    {
-        Holder h;
-        h.body = true;
-        // the body FRIK shows: whichever of the player's 3D roots has the Pelvis bone
         RE::NiAVObject* roots[3]{ player->Get3D(false), player->Get3D(true), player->Get3D() };
         for (auto* root : roots) {
-            if (!looksLikeObject(root)) continue;
-            h.skeleton = root;
-            if (h.parentFor("Pelvis")) {
-                h.valid = true;
-                return h;
+            if (looksLikeObject(root) && findNode(root, "Pelvis")) {
+                return root;
             }
         }
         static bool logged = false;
@@ -1334,7 +1339,32 @@ namespace
                 note("Body root %d: %s, Pelvis not found under it", i, looksLikeObject(roots[i]) ? roots[i]->name.c_str() : "none");
             }
         }
-        h.skeleton = nullptr;
+        return nullptr;
+    }
+
+    // On the mannequin the models hang under your skeleton's root (a static object's own node is not drawn again when
+    // children are added to it), placed every frame where the mannequin stands.
+    Holder mannequinHolder(RE::PlayerCharacter* player, RE::TESObjectREFR* mannequin) noexcept
+    {
+        Holder h;
+        auto* root = mannequin ? mannequin->Get3D() : nullptr;
+        auto* skeleton = findSkeleton(player);
+        if (!looksLikeObject(root) || !skeleton) {
+            return h;
+        }
+        h.manWorld = root->world;
+        h.manWorld.scale = 1.0f;
+        h.anchor = skeleton->IsNode();
+        h.valid = h.anchor != nullptr;
+        return h;
+    }
+
+    Holder bodyHolder(RE::PlayerCharacter* player) noexcept
+    {
+        Holder h;
+        h.body = true;
+        h.skeleton = findSkeleton(player);
+        h.valid = h.skeleton != nullptr;
         return h;
     }
 
@@ -1573,18 +1603,16 @@ namespace
     // the palm in body space for a holder (mannequin root, or the body through the pelvis bone)
     bool palmInBody(const Holder& h, const RE::NiPoint3& palm, RE::NiPoint3& out) noexcept
     {
-        if (!h.body) {
-            out = toLocal(h.root->world, palm);
-            return true;
-        }
-        auto* pelvis = h.parentFor("Pelvis");
-        const auto it = g_def.binds.find("Pelvis");
-        if (!pelvis || it == g_def.binds.end()) {
+        RE::NiTransform space;
+        if (!h.space(space)) {
             return false;
         }
-        // body space = pelvis world composed with the inverse of its bind
-        const auto bodyWorld = compose(pelvis->world, relative(it->second, identity()));
-        out = toLocal(bodyWorld, palm);
+        out = toLocal(space, palm);
+        if (h.body) {
+            // undo the inflation, so pouches are found where they are drawn
+            const RE::NiPoint3 c{ 0.0f, 0.0f, g_settings.bodyScaleZ };
+            out = c + (out - c) * (1.0f / std::max(0.5f, g_settings.bodyScale));
+        }
         return true;
     }
 
@@ -1601,7 +1629,7 @@ namespace
         if (!interact) {
             return;
         }
-        const auto& manWorld = h.root->world;
+        const auto& manWorld = h.manWorld;
         bool areasShown = false;
         // both palms on the mannequin's shoulders: that is putting the rig on / off, not taking a pouch
         const RE::NiPoint3 right{ g_settings.shoulderX, g_settings.shoulderY, g_settings.shoulderZ };
@@ -1632,7 +1660,7 @@ namespace
                         areasShown = true;
                         for (const auto& area : g_def.areas) {
                             if ((area.kinds & (1u << held.kind)) && !area.highlight.empty()) {
-                                show(acquire(area.highlight), h.root, identity());
+                                show(acquire(area.highlight), h.anchor, h.localFor("", identity()));
                             }
                         }
                     }
@@ -1985,7 +2013,7 @@ namespace
             mannequin = nullptr;
         }
         if (mannequin) {
-            const auto holder = mannequinHolder(mannequin);
+            const auto holder = mannequinHolder(player, mannequin);
             if (holder.valid) {
                 const bool nearby = distance(mannequin->GetPosition(), player->GetPosition()) < g_settings.mannequinReach;
                 atMannequin(player, holder, now, nearby && !menu);
