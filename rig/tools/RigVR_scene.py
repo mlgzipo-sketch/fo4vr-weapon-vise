@@ -56,6 +56,8 @@ TEXTURES = {
     'pad_004': ('BagPad', 'BagPad', 'BagPad'), 'Material.001': ('Holster', 'Holster', 'Holster'),
     'armor': ('Armor', 'Flat', 'Matte'), 'Mannequin': ('Mannequin', 'Flat', 'Matte'),
     'Mannequin 2': ('MannequinMetal', 'Flat', 'Shiny'),
+    'pouch_002.002': ('MagPouch', 'MagPouch', 'MagPouch'), 'cover.002': ('MagCover', 'MagCover', 'MagCover'),
+    'strap_013.002': ('MagStrap', 'MagStrap', 'MagStrap'),
 }
 
 

@@ -31,6 +31,9 @@ for k, p in enumerate(POUCHES[:6]):
 IDS.update({'RigVR_SndSnap': 0x811, 'RigVR_SndPickUp': 0x812, 'RigVR_SndFocus': 0x813, 'RigVR_SndPutIn': 0x814,
             'RigVR_Stats': 0x815, 'RigVR_PouchItems': 0x816, 'RigVR_Sounds': 0x817, 'RigVR_Quest': 0x818,
             'RigVR_PouchSling': 0x819, 'RigVR_ItemSling': 0x81A})   # 0.2
+# 0.4: the pouches are real items hung on the rig by hand; three magazine pouches replace the old one; the rig is an item
+IDS.update({'RigVR_ItemMagPistol': 0x81B, 'RigVR_ItemMagRifle': 0x81C, 'RigVR_ItemMagUniversal': 0x81D,
+            'RigVR_ItemRigBase': 0x81E, 'RigVR_OldItems': 0x81F})
 
 
 def zstr(s): return s.encode('latin1') + b'\0'
@@ -61,7 +64,7 @@ def vmad(script, props):
 
 
 # What the plugin draws. Order = static index in the plugin (StatKind): 0 mannequin, 1 rig, 2 ghost, 3 cursor, 4.. pouches.
-stats = [add('STAT', 'RigVR_Mannequin', [sub('OBND', b'\0' * 12), sub('MODL', zstr('RigVR\\Mannequin.nif'))]),
+stats = [add('STAT', 'RigVR_Mannequin', [sub('OBND', b'\0' * 12), sub('MODL', zstr('RigVR\\Custom\\Mannequin.nif'))]),
          add('STAT', 'RigVR_Rig', [sub('OBND', b'\0' * 12), sub('MODL', zstr('RigVR\\Rig.nif'))]),
          add('STAT', 'RigVR_Ghost', [sub('OBND', b'\0' * 12), sub('MODL', zstr('RigVR\\Ghost.nif'))]),
          add('STAT', 'RigVR_Cursor', [sub('OBND', b'\0' * 12), sub('MODL', zstr('RigVR\\Cursor.nif'))])]
@@ -78,7 +81,14 @@ def item(edid, name, model, kind, value, weight):
 
 
 kit = item('RigVR_Kit', 'Rig Mannequin (drop to set up)', 'RigVR\\Mannequin.nif', 0, 50, 5.0)
-items = [item('RigVR_Item' + p, NAMES[p], 'RigVR\\Pouch' + p + '.nif', k + 1, 15, 0.5) for k, p in enumerate(POUCHES)]
+# the old pouch items (0.1-0.3) stay as records so old saves load; the script takes them out of the inventory
+old_items = [item('RigVR_Item' + p, NAMES[p], 'RigVR\\Pouch' + p + '.nif', 0, 15, 0.5) for p in ('Mag', 'Med', 'Grenade', 'Bandolier')]
+# kind 1..6 in the plugin, then the rig itself (kind 7); models from the user's Blender scene (Meshes\RigVR\Custom)
+KINDS = [('MagPistol', 'Rig: Pistol Mag Pouch', 0.4), ('MagRifle', 'Rig: Rifle Mag Pouch', 0.5),
+         ('MagUniversal', 'Rig: Universal Mag Pouch', 0.5), ('Holster', 'Rig: Pistol Holster', 0.5),
+         ('Dump', 'Rig: Dump Bag', 0.8), ('Sling', 'Rig: Carbine Holder', 0.6)]
+items = [item('RigVR_Item' + k, n, 'RigVR\\Custom\\ItemPouch' + k + '.nif', i + 1, 15, w) for i, (k, n, w) in enumerate(KINDS)]
+items.append(item('RigVR_ItemRigBase', 'Rig: Chest Rig', 'RigVR\\Custom\\ItemRigBase.nif', 7, 40, 3.0))
 
 # UIWorkshopModeFocusGreen, ItemSnapSuccess, ItemPickUpMetal1Small (sound descriptors of Fallout4.esm, as WeaponVise uses)
 SOUNDS = [('RigVR_SndSnap', 0x1926A2), ('RigVR_SndPickUp', 0x0196B0), ('RigVR_SndFocus', 0x05FD82), ('RigVR_SndPutIn', 0x0196B0)]
@@ -89,9 +99,10 @@ def flst(edid, forms):
 flst_stats = flst('RigVR_Stats', stats)
 flst_items = flst('RigVR_PouchItems', items)
 flst_sounds = flst('RigVR_Sounds', sounds)
+flst_old = flst('RigVR_OldItems', old_items)
 
 props = [prop_obj('RigVR_Stats', flst_stats), prop_obj('RigVR_PouchItems', flst_items),
-         prop_obj('RigVR_Sounds', flst_sounds), prop_obj('Kit', kit)]
+         prop_obj('RigVR_Sounds', flst_sounds), prop_obj('Kit', kit), prop_obj('RigVR_OldItems', flst_old)]
 add('QUST', 'RigVR_Quest', [sub('VMAD', vmad('RigVRMain', props)), sub('FULL', zstr('Rig VR')),
                             sub('DNAM', bytes.fromhex('110000000000000000000000')), sub('NEXT', b''),
                             sub('ANAM', struct.pack('<I', 0))])

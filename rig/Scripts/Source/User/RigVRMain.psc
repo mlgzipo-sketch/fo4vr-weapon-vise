@@ -3,7 +3,8 @@ Scriptname RigVRMain extends Quest
 objects it draws with, moves items between the inventory and the hands, and keeps the rig in the save.}
 
 FormList Property RigVR_Stats Auto Const        ; 0 mannequin, 1 rig, 2 free place, 3 cursor, 4.. pouches (type 1..6)
-FormList Property RigVR_PouchItems Auto Const   ; pouch items, type 1..7
+FormList Property RigVR_PouchItems Auto Const   ; pouch items kind 1..6, then the rig item (kind 7)
+FormList Property RigVR_OldItems Auto Const     ; pouch items of 0.1-0.3, taken out of the inventory
 FormList Property RigVR_Sounds Auto Const       ; 0 snap, 1 pick up, 2 focus, 3 put in
 MiscObject Property Kit Auto Const              ; the folded mannequin
 
@@ -40,12 +41,20 @@ Event Actor.OnPlayerLoadGame(Actor akSender)
 	StartTimer(0.1, TimerPoll)
 EndEvent
 
-; Pouches added in later versions, for a game that already got the starter kit.
+; 0.4: the pouches of 0.1-0.3 are gone (the rig now starts on the mannequin with the new ones); old items leave the inventory.
 Function GiveNewItems()
-	if !SlingGiven && RigVR_PouchItems.GetSize() >= 7
-		SlingGiven = true
-		Game.GetPlayer().AddItem(RigVR_PouchItems.GetAt(6), 2, true)
-		RigVR.Notify(21)
+	SlingGiven = true
+	if RigVR_OldItems
+		Actor player = Game.GetPlayer()
+		int i = 0
+		while i < RigVR_OldItems.GetSize()
+			Form f = RigVR_OldItems.GetAt(i)
+			int n = player.GetItemCount(f)
+			if n > 0
+				player.RemoveItem(f, n, true)
+			endif
+			i += 1
+		endwhile
 	endif
 EndFunction
 
@@ -72,12 +81,8 @@ EndFunction
 
 Function GiveStarterKit()
 	Actor player = Game.GetPlayer()
+	; the rig with its pouches starts on the mannequin (RigVR.dll keeps it), so only the mannequin itself is given
 	player.AddItem(Kit, 1, true)
-	; for now only the pouches that have a model: magazines, holster, bag, back sling (first aid, grenades, ammo loops later)
-	player.AddItem(RigVR_PouchItems.GetAt(0), 2, true)
-	player.AddItem(RigVR_PouchItems.GetAt(3), 1, true)
-	player.AddItem(RigVR_PouchItems.GetAt(4), 1, true)
-	player.AddItem(RigVR_PouchItems.GetAt(6), 2, true)
 	RigVR.Notify(20)
 EndFunction
 
@@ -240,12 +245,10 @@ Function DropToHand(Form f, float[] pose, int token)
 EndFunction
 
 ; The kit dropped from the Pip-Boy: the mannequin stands up in front of you, facing you.
-; A pouch dropped from the Pip-Boy goes back: pouches are hung on the mannequin by hand.
+; Pouches and the rig are ordinary items: dropped, they just lie there (take one in the hand to hang it on the mannequin).
 Function ItemDropped(ObjectReference item, int kind)
 	Actor player = Game.GetPlayer()
 	if kind != 0
-		player.AddItem(item, 1, true)
-		RigVR.Notify(10)
 		return
 	endif
 	float a = player.GetAngleZ()

@@ -1,16 +1,18 @@
 // RigVR: a load-bearing rig for Fallout 4 VR (Into the Radius style).
 //
-// A mannequin stands in your settlement and wears the rig. You take pouches (magazine pouch, first aid,
-// grenades, holster, dump pouch, ammo loops) from the shelf beside it and hang them where you like, then put the
-// rig on: every pouch is on your body where it was on the mannequin. Let go of an item over a pouch and it goes
-// in; grip at a pouch and what is in it is in your hand.
+// A mannequin stands in your settlement and wears the rig. Pouches are real items: take one in your hand (from the
+// ground or out of the inventory), bring it to the rig on the mannequin, the places it may hang light up, let go and
+// it hangs there. Grip a pouch on the mannequin with an empty hand and it is in your hand again. Take the mannequin by
+// both shoulders to put the rig on (and the same at the mannequin to hang it back); on you nothing is moved, only used.
 //
 // How it is built:
-//   - everything you see is drawn by this plugin: static objects (made by the script) whose 3D is placed every
-//     frame on the mannequin or on your body (FRIK bones), the same way ManualReloadF draws its round.
-//   - what a pouch holds is a reservation of items that really are in your inventory (the game keeps counting
-//     them, weight and all). Taking one out drops it from the inventory into your hand, where ROCK holds it.
-//   - the rig (where each pouch hangs, what it holds) is kept by the quest script in the save.
+//   - the rig is described by a rig file (Data\F4SE\Plugins\RigVR\Rigs\RigBase.txt, written from Blender): its models,
+//     the skeleton bones they follow, and the areas (triangles) pouches may hang on.
+//   - everything drawn is a model loaded by this plugin and attached to a node of the game: under the mannequin's 3D,
+//     or under the bones of your body (Pelvis, SPINE2), with a fixed local transform. The engine moves them with the
+//     mannequin / your body; nothing is placed by hand each frame.
+//   - what a pouch holds is a reservation of items that really are in your inventory.
+//   - the rig (which pouch hangs where, what it holds) is kept by the quest script in the save.
 #include "Runtime.h"
 
 #include <F4SE/F4SE.h>
@@ -21,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cctype>
 #include <cmath>
@@ -28,8 +31,12 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fstream>
+#include <map>
+#include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -62,86 +69,81 @@ namespace
         logInfo(text);
     }
 
-    // ------------------------------------------------------------ the rig's shape
+    // ------------------------------------------------------------ pouch kinds
 
-    constexpr int kSlots = 13;
-    constexpr int kPouchTypes = 7;   // 1..7
+    constexpr int kMaxPouches = 12;
+    constexpr int kKinds = 6;         // pouch kinds 1..6
+    constexpr int kRigItem = 7;       // the rig itself as an item
     constexpr int kItemsPerPouch = 4;
 
-    enum PouchType : int
+    enum Kind : int
     {
         kEmpty = 0,
-        kMag = 1,
-        kMed = 2,
-        kGrenade = 3,
+        kMagPistol = 1,
+        kMagRifle = 2,
+        kMagUniversal = 3,
         kHolster = 4,
         kDump = 5,
-        kBandolier = 6,
-        kSling = 7,       // a long gun on the back
+        kSling = 6,       // carbine / big gun holder
     };
 
-    // Pouches without a model yet are left out for now (not on the shelf, not in the starter kit).
-    constexpr bool typeEnabled(int type) noexcept
-    {
-        return type == kMag || type == kHolster || type == kDump || type == kSling;
-    }
+    const char* const kKindNames[kKinds + 1]{ "", "MagPistol", "MagRifle", "MagUniversal", "Holster", "Dump", "Sling" };
 
-    const char* pouchName(int type) noexcept
+    bool isMag(int kind) noexcept { return kind == kMagPistol || kind == kMagRifle || kind == kMagUniversal; }
+
+    const char* kindTitle(int kind) noexcept
     {
-        switch (type) {
-        case kMag: return "Подсумок для магазинов";
-        case kMed: return "Аптечка";
-        case kGrenade: return "Гранатный подсумок";
+        switch (kind) {
+        case kMagPistol: return "Подсумок для пистолетных магазинов";
+        case kMagRifle: return "Подсумок для винтовочных магазинов";
+        case kMagUniversal: return "Универсальный подсумок";
         case kHolster: return "Кобура";
-        case kDump: return "Сбросной мешок";
-        case kBandolier: return "Патронташ";
-        case kSling: return "Ремень для оружия (спина)";
+        case kDump: return "Сумка";
+        case kSling: return "Держатель карабина";
+        case kRigItem: return "Разгрузка";
         default: return "";
         }
     }
 
-    // Index of each static object in the script's RigVR_Stats list.
-    enum StatKind : int
+    int kindByName(const std::string& name) noexcept
     {
-        kStatMannequin = 0,
-        kStatRig = 1,
-        kStatGhost = 2,
-        kStatCursor = 3,
-        kStatPouch0 = 3,   // + pouch type
-    };
+        for (int k = 1; k <= kKinds; ++k) {
+            if (name == kKindNames[k]) {
+                return k;
+            }
+        }
+        return kEmpty;
+    }
 
-    struct SlotPlace
+    std::string pouchModel(int kind) { return std::string("RigVR\\Custom\\Pouch") + kKindNames[kind] + ".nif"; }
+
+    // how close the palm must be to a pouch's middle to use / take it
+    float reachOf(int kind) noexcept
     {
-        int   group;     // 0 belt (anchored at the hips), 1 chest, -1 not used
-        float x, y, z;   // right, forward, up from the anchor (game units)
-        float yaw;       // the pouch turned this much around the vertical (degrees, + = to the right)
-    };
+        switch (kind) {
+        case kSling: return 14.0f;
+        case kHolster: return 10.0f;
+        case kDump: return 11.0f;
+        default: return 8.0f;
+        }
+    }
 
-    // Default places, from the user's Blender layout (centre of each model, its front turned away from the body):
-    // 0 magazine pouch at the belt front, 1 bag on the left hip, 2 pistol holster on the right hip, 3 carbine over the right
-    // shoulder, then 4 carbine over the left shoulder, 5 a second magazine pouch on the chest, 6 the bag on the back.
-    // 7..12 are not used. Each can be moved in RigVR.ini (SlotN=x,y,z,yaw[,group]; SlotN=off).
-    std::array<SlotPlace, kSlots> g_places{ {
-        { 0, 0.0f, 8.1f, 6.05f, 0.0f },
-        { 0, -13.9f, 1.1f, 7.3f, -90.0f },
-        { 0, 11.5f, 3.25f, 6.25f, 90.0f },
-        { 1, 6.55f, -8.4f, 7.65f, 180.0f },
-        { 1, -6.55f, -8.4f, 7.65f, 180.0f },
-        { 1, 0.0f, 10.5f, 0.0f, 0.0f },
-        { 0, 0.0f, -13.9f, 7.3f, 180.0f },
-        { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 },
-    } };
-
-    int capacityOf(int type) noexcept
+    // how far the middle of a pouch is out from where it hangs (its back)
+    float depthOf(int kind) noexcept
     {
-        switch (type) {
-        case kMag: return 3;
-        case kMed: return 4;
-        case kGrenade: return 2;
+        switch (kind) {
+        case kSling: return 6.0f;
+        case kDump: return 5.0f;
+        default: return 3.0f;
+        }
+    }
+
+    int capacityOf(int kind) noexcept
+    {
+        switch (kind) {
         case kHolster: return 1;
-        case kDump: return 12;
-        case kBandolier: return 12;
         case kSling: return 1;
+        case kDump: return 12;
         default: return 0;
         }
     }
@@ -154,64 +156,23 @@ namespace
         int   gripButton{ 2 };
         bool  haptics{ true };
         bool  messages{ true };
-        float slotRadius{ 8.0f };      // the palm this close to a pouch / a free place
-        float backRadius{ 16.0f };     // ..and this close to a gun place on the back (you cannot see it)
-        float holsterRadius{ 12.0f };  // ..and this close to a holster
+        float holdRadius{ 16.0f };     // a pouch item this close to a gripping palm is held by it
+        float snapRadius{ 20.0f };     // a held pouch this close to an area hangs there when let go
+        float showAreas{ 120.0f };     // the areas light up with a pouch in the hand this close to the mannequin
         float mannequinReach{ 150.0f };// the mannequin is used within this distance
-        float mannequinDraw{ 1500.0f };// ..and its pouches and shelf are drawn within this one
-        float wearRadius{ 12.0f };     // both hands this close to the mannequin's shoulders to put the rig on / hang it back
-        float wearWindow{ 0.5f };      // ..both grips pressed within this many seconds
+        float wearRadius{ 14.0f };     // both hands this close to the mannequin's shoulders to put the rig on / hang it back
+        float wearWindow{ 0.6f };      // ..both grips pressed within this many seconds
         float packSeconds{ 1.5f };     // hold the grip on the mannequin's head this long to fold it up
         float storeRadius{ 16.0f };    // an item let go this close to the palm over a pouch goes in
         float mouthRadius{ 12.0f };    // a chem / food from a pouch this close to the mouth is used
         float holsterCooldown{ 1.0f };
-        float beltHeight{ 66.0f };     // used without FRIK bones (and on the mannequin)
-        float chestHeight{ 92.0f };
-        float beltUp{ 0.0f };          // move the belt places up / down on the body
-        float chestUp{ 0.0f };
-        float bodyForward{ 0.0f };     // move all places forward / back on the body
-        float bodyScale{ 1.0f };       // places on the body are this much further out than on the mannequin
-        bool  useBones{ true };
-        bool  showRigOnBody{ false };  // the rig's outline on yourself (it is always shown on the mannequin)
-        bool  showPouchesOnBody{ true };
-        float trayX{ 30.0f };          // the shelf of pouches beside the mannequin
-        float trayY{ 4.0f };
-        float trayZ{ 104.0f };
-        float trayStep{ 9.0f };
+        float upSnapDegrees{ 25.0f };  // a pouch held this close to upright hangs straight
+        float shoulderX{ 14.7f };      // the mannequin's shoulders in its own space (right, forward, up)
+        float shoulderY{ -3.4f };
+        float shoulderZ{ 105.0f };
+        float headZ{ 116.0f };
     };
     Settings g_settings;
-
-    bool parseFloats(const std::string& text, float* out, int count) noexcept
-    {
-        const char* at = text.c_str();
-        for (int i = 0; i < count; ++i) {
-            char* end = nullptr;
-            out[i] = std::strtof(at, &end);
-            if (end == at) {
-                return false;
-            }
-            at = end;
-            while (*at == ' ' || *at == ',' || *at == '\t') {
-                ++at;
-            }
-        }
-        return true;
-    }
-
-    // Each drawn object (static index 0..10) can use any model: sModel_Mag=Path\\To\\Model.nif in [Models],
-    // turned (degrees), moved (game units, in the place's frame: right, forward, up) and scaled to sit right.
-    constexpr int kKinds = 11;
-    const char* const kKindNames[kKinds]{ "Mannequin", "Rig", "Ghost", "Cursor", "Mag", "Med", "Grenade", "Holster", "Dump", "Bandolier", "Sling" };
-    constexpr std::uint32_t kKindStatIDs[kKinds]{ 0x800, 0x801, 0x802, 0x803, 0x804, 0x805, 0x806, 0x807, 0x808, 0x809, 0x819 };
-
-    struct KindModel
-    {
-        std::string model;
-        float scale{ 1.0f };
-        float rot[3]{};
-        float offset[3]{};
-    };
-    std::array<KindModel, kKinds> g_kindModels;
 
     void loadSettings() noexcept
     {
@@ -219,13 +180,11 @@ namespace
         auto& s = g_settings;
         const Entry entries[]{
             { "iGunHand", 1, &s.gunHand }, { "iGripButton", 1, &s.gripButton }, { "bHaptics", 0, &s.haptics },
-            { "bMessages", 0, &s.messages }, { "fSlotRadius", 2, &s.slotRadius }, { "fBackRadius", 2, &s.backRadius }, { "fHolsterRadius", 2, &s.holsterRadius }, { "fMannequinReach", 2, &s.mannequinReach }, { "fMannequinDraw", 2, &s.mannequinDraw },
-            { "fWearRadius", 2, &s.wearRadius }, { "fWearWindow", 2, &s.wearWindow }, { "fPackSeconds", 2, &s.packSeconds },
-            { "fStoreRadius", 2, &s.storeRadius }, { "fMouthRadius", 2, &s.mouthRadius }, { "fHolsterCooldown", 2, &s.holsterCooldown },
-            { "fBeltHeight", 2, &s.beltHeight }, { "fChestHeight", 2, &s.chestHeight }, { "fBeltUp", 2, &s.beltUp },
-            { "fChestUp", 2, &s.chestUp }, { "fBodyForward", 2, &s.bodyForward }, { "fBodyScale", 2, &s.bodyScale },
-            { "bUseBones", 0, &s.useBones }, { "bShowRigOnBody", 0, &s.showRigOnBody }, { "bShowPouchesOnBody", 0, &s.showPouchesOnBody },
-            { "fTrayX", 2, &s.trayX }, { "fTrayY", 2, &s.trayY }, { "fTrayZ", 2, &s.trayZ }, { "fTrayStep", 2, &s.trayStep },
+            { "bMessages", 0, &s.messages }, { "fHoldRadius", 2, &s.holdRadius }, { "fSnapRadius", 2, &s.snapRadius },
+            { "fShowAreas", 2, &s.showAreas }, { "fMannequinReach", 2, &s.mannequinReach }, { "fWearRadius", 2, &s.wearRadius },
+            { "fWearWindow", 2, &s.wearWindow }, { "fPackSeconds", 2, &s.packSeconds }, { "fStoreRadius", 2, &s.storeRadius },
+            { "fMouthRadius", 2, &s.mouthRadius }, { "fHolsterCooldown", 2, &s.holsterCooldown }, { "fUpSnapDegrees", 2, &s.upSnapDegrees },
+            { "fShoulderX", 2, &s.shoulderX }, { "fShoulderY", 2, &s.shoulderY }, { "fShoulderZ", 2, &s.shoulderZ }, { "fHeadZ", 2, &s.headZ },
         };
         try {
             std::ifstream file("Data/F4SE/Plugins/RigVR.ini");
@@ -239,50 +198,7 @@ namespace
                 while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) {
                     key.pop_back();
                 }
-                const auto valueText = line.substr(equals + 1);
-                bool kindKey = false;
-                for (int k = 0; k < kKinds && !kindKey; ++k) {
-                    const std::string name = kKindNames[k];
-                    auto& km = g_kindModels[k];
-                    if (key == "sModel_" + name) {
-                        const auto first = valueText.find_first_not_of(" \t");
-                        const auto last = valueText.find_last_not_of(" \t\r");
-                        km.model = first == std::string::npos ? std::string{} : valueText.substr(first, last - first + 1);
-                        kindKey = true;
-                    } else if (key == "fScale_" + name) {
-                        km.scale = std::strtof(valueText.c_str(), nullptr);
-                        kindKey = true;
-                    } else if (key == "fRot_" + name) {
-                        parseFloats(valueText, km.rot, 3);
-                        kindKey = true;
-                    } else if (key == "fOffset_" + name) {
-                        parseFloats(valueText, km.offset, 3);
-                        kindKey = true;
-                    }
-                }
-                if (kindKey) {
-                    continue;
-                }
-                if (key.rfind("Slot", 0) == 0 && key.size() <= 6) {
-                    const int index = std::atoi(key.c_str() + 4);
-                    float v[5]{ 0.0f, 0.0f, 0.0f, 0.0f, -2.0f };
-                    if (index >= 0 && index < kSlots && valueText.find("off") != std::string::npos) {
-                        g_places[index].group = -1;
-                    } else if (index >= 0 && index < kSlots && parseFloats(valueText, v, 4)) {
-                        g_places[index].x = v[0];
-                        g_places[index].y = v[1];
-                        g_places[index].z = v[2];
-                        g_places[index].yaw = v[3];
-                        parseFloats(valueText, v, 5);
-                        if (v[4] == 0.0f || v[4] == 1.0f) {
-                            g_places[index].group = static_cast<int>(v[4]);
-                        } else if (g_places[index].group < 0) {
-                            g_places[index].group = v[2] > 15.0f ? 1 : 0;
-                        }
-                    }
-                    continue;
-                }
-                const float value = std::strtof(valueText.c_str(), nullptr);
+                const float value = std::strtof(line.c_str() + equals + 1, nullptr);
                 for (const auto& entry : entries) {
                     if (key == entry.key) {
                         if (entry.type == 0) *static_cast<bool*>(entry.value) = value != 0.0f;
@@ -295,8 +211,120 @@ namespace
         } catch (...) {
         }
         s.gunHand = s.gunHand != 0 ? 1 : 0;
-        note("Settings: gun hand %d, slot radius %.1f, bones %d, belt %.0f chest %.0f", s.gunHand, s.slotRadius, s.useBones ? 1 : 0,
-            s.beltHeight, s.chestHeight);
+        note("Settings: gun hand %d, hold %.0f, snap %.0f, wear %.0f", s.gunHand, s.holdRadius, s.snapRadius, s.wearRadius);
+    }
+
+    // ------------------------------------------------------------ the rig file
+
+    struct Area
+    {
+        std::string name;
+        std::string bone;
+        std::string highlight;   // model shown while a pouch is brought to the rig
+        std::vector<std::array<RE::NiPoint3, 3>> tris;
+        std::uint32_t kinds{ 0xFFFFFFFFu };   // bit per pouch kind that may hang here
+    };
+
+    struct Preset
+    {
+        int kind{ kEmpty };
+        int area{ -1 };
+        RE::NiTransform pose{};
+    };
+
+    struct RigDef
+    {
+        bool loaded{ false };
+        std::map<std::string, RE::NiTransform> binds;
+        std::vector<std::pair<std::string, std::string>> models;   // model path, bone
+        std::vector<Area> areas;
+        std::vector<Preset> presets;
+    };
+    RigDef g_def;
+
+    void loadRigFile() noexcept
+    {
+        g_def = RigDef{};
+        try {
+            std::ifstream file("Data/F4SE/Plugins/RigVR/Rigs/RigBase.txt");
+            std::string line;
+            int lineNo = 0;
+            while (file && std::getline(file, line)) {
+                ++lineNo;
+                if (line.empty() || line[0] == '#') {
+                    continue;
+                }
+                std::istringstream in(line);
+                std::string word;
+                in >> word;
+                if (word == "bind" || word == "preset") {
+                    std::string a, b;
+                    in >> a;
+                    if (word == "preset") in >> b;
+                    float v[12]{};
+                    for (auto& x : v) in >> x;
+                    if (!in) {
+                        note("Rig file line %d: not read", lineNo);
+                        continue;
+                    }
+                    RE::NiTransform t;
+                    for (int i = 0; i < 3; ++i)
+                        for (int j = 0; j < 3; ++j)
+                            t.rotate.entry[i][j] = v[i * 3 + j];
+                    t.translate = { v[9], v[10], v[11] };
+                    t.scale = 1.0f;
+                    if (word == "bind") {
+                        g_def.binds[a] = t;
+                    } else {
+                        Preset p;
+                        p.kind = kindByName(a);
+                        p.pose = t;
+                        for (std::size_t i = 0; i < g_def.areas.size(); ++i) {
+                            if (g_def.areas[i].name == b) p.area = static_cast<int>(i);
+                        }
+                        if (p.kind != kEmpty && p.area >= 0) {
+                            g_def.presets.push_back(p);
+                        } else {
+                            note("Rig file line %d: preset %s on %s not understood", lineNo, a.c_str(), b.c_str());
+                        }
+                    }
+                } else if (word == "model") {
+                    std::string path, bone;
+                    in >> path >> bone;
+                    g_def.models.emplace_back(path, bone);
+                } else if (word == "area") {
+                    Area a;
+                    std::string kinds;
+                    in >> a.name >> a.bone >> kinds;
+                    if (!kinds.empty() && kinds != "*") {
+                        a.kinds = 0;
+                        std::istringstream list(kinds);
+                        std::string k;
+                        while (std::getline(list, k, ',')) {
+                            const int kind = kindByName(k);
+                            if (kind) a.kinds |= 1u << kind;
+                        }
+                    }
+                    g_def.areas.push_back(a);
+                } else if (word == "tri" && !g_def.areas.empty()) {
+                    std::array<RE::NiPoint3, 3> t;
+                    for (auto& p : t) in >> p.x >> p.y >> p.z;
+                    if (in) g_def.areas.back().tris.push_back(t);
+                } else if (word == "highlight") {
+                    std::string name, path;
+                    in >> name >> path;
+                    for (auto& a : g_def.areas) {
+                        if (a.name == name) a.highlight = path;
+                    }
+                }
+            }
+        } catch (...) {
+        }
+        g_def.loaded = !g_def.models.empty() && !g_def.areas.empty();
+        std::size_t tris = 0;
+        for (const auto& a : g_def.areas) tris += a.tris.size();
+        note("Rig file: %s; %zu models, %zu areas (%zu triangles), %zu binds, %zu preset pouches", g_def.loaded ? "loaded" : "MISSING or empty",
+            g_def.models.size(), g_def.areas.size(), tris, g_def.binds.size(), g_def.presets.size());
     }
 
     // ------------------------------------------------------------ memory safety
@@ -364,7 +392,8 @@ namespace
         }
     }
 
-    // ------------------------------------------------------------ math (the game's row convention: world = local * parent)
+
+    // ------------------------------------------------------------ math (the game's row convention: rows are the local axes)
 
     float distance(const RE::NiPoint3& a, const RE::NiPoint3& b) noexcept
     {
@@ -372,6 +401,41 @@ namespace
         const float dy = a.y - b.y;
         const float dz = a.z - b.z;
         return std::sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    float dot(const RE::NiPoint3& a, const RE::NiPoint3& b) noexcept { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+    RE::NiPoint3 cross(const RE::NiPoint3& a, const RE::NiPoint3& b) noexcept
+    {
+        return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+    }
+
+    float length(const RE::NiPoint3& a) noexcept { return std::sqrt(dot(a, a)); }
+
+    RE::NiPoint3 normalized(const RE::NiPoint3& a) noexcept
+    {
+        const float l = length(a);
+        return l > 1.0e-6f ? a * (1.0f / l) : RE::NiPoint3{};
+    }
+
+    RE::NiPoint3 row(const RE::NiMatrix3& m, int i) noexcept { return { m.entry[i][0], m.entry[i][1], m.entry[i][2] }; }
+
+    void setRow(RE::NiMatrix3& m, int i, const RE::NiPoint3& v) noexcept
+    {
+        m.entry[i][0] = v.x;
+        m.entry[i][1] = v.y;
+        m.entry[i][2] = v.z;
+    }
+
+    RE::NiTransform identity() noexcept
+    {
+        RE::NiTransform t;
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                t.rotate.entry[i][j] = i == j ? 1.0f : 0.0f;
+        t.translate = {};
+        t.scale = 1.0f;
+        return t;
     }
 
     RE::NiTransform compose(const RE::NiTransform& parent, const RE::NiTransform& local) noexcept
@@ -393,59 +457,132 @@ namespace
         return local;
     }
 
-    RE::NiTransform pointTransform(const RE::NiPoint3& point) noexcept
+    RE::NiPoint3 toLocal(const RE::NiTransform& parent, const RE::NiPoint3& world) noexcept
     {
-        RE::NiTransform transform;
-        transform.translate = point;
-        return transform;
+        const float scale = parent.scale > 0.0f ? parent.scale : 1.0f;
+        return parent.rotate * (world - parent.translate) * (1.0f / scale);
     }
 
-    // A frame standing upright, turned by `yaw` (radians; 0 = facing +Y, growing to the right like the game's angle).
-    struct Frame
+    RE::NiPoint3 toWorld(const RE::NiTransform& parent, const RE::NiPoint3& local) noexcept
     {
-        RE::NiPoint3 origin{};
-        float        yaw{ 0.0f };
-
-        RE::NiPoint3 right() const noexcept { return { std::cos(yaw), -std::sin(yaw), 0.0f }; }
-        RE::NiPoint3 forward() const noexcept { return { std::sin(yaw), std::cos(yaw), 0.0f }; }
-
-        RE::NiPoint3 at(float x, float y, float z) const noexcept
-        {
-            return origin + right() * x + forward() * y + RE::NiPoint3{ 0.0f, 0.0f, z };
-        }
-    };
-
-    RE::NiTransform uprightTransform(const RE::NiPoint3& at, float yaw) noexcept
-    {
-        RE::NiTransform t;
-        const RE::NiPoint3 r{ std::cos(yaw), -std::sin(yaw), 0.0f };
-        const RE::NiPoint3 f{ std::sin(yaw), std::cos(yaw), 0.0f };
-        // rows are the local axes in world space
-        t.rotate.entry[0][0] = r.x; t.rotate.entry[0][1] = r.y; t.rotate.entry[0][2] = r.z;
-        t.rotate.entry[1][0] = f.x; t.rotate.entry[1][1] = f.y; t.rotate.entry[1][2] = f.z;
-        t.rotate.entry[2][0] = 0.0f; t.rotate.entry[2][1] = 0.0f; t.rotate.entry[2][2] = 1.0f;
-        t.translate = at;
-        t.scale = 1.0f;
-        return t;
-    }
-
-    float yawOfRight(const RE::NiPoint3& rightVector, float fallback) noexcept
-    {
-        // right = (cos a, -sin a)  ->  a = atan2(-right.y, right.x)
-        const float length = std::sqrt(rightVector.x * rightVector.x + rightVector.y * rightVector.y);
-        if (length < 1.0f) {
-            return fallback;
-        }
-        return std::atan2(-rightVector.y, rightVector.x);
+        return parent.translate + parent.rotate.Transpose() * local * parent.scale;
     }
 
     constexpr float kDegrees = 3.14159265f / 180.0f;
 
-    // Places a reference's 3D: the root at `world` (local too, so the engine keeps it), children follow,
-    // bounds move along and the nodes above are made to reach it (or it is culled with them).
-    // World bounds from the shapes' own model bounds (post-order), so the renderer culls the model where it is now.
-    // (Moving the old bounds along was not enough: a model the game had not bounded yet kept a stale or empty sphere
-    // and popped in and out as the view turned or the player came closer.)
+    // The point of a triangle closest to p (Ericson, Real-Time Collision Detection 5.1.5).
+    RE::NiPoint3 closestOnTriangle(const RE::NiPoint3& p, const RE::NiPoint3& a, const RE::NiPoint3& b, const RE::NiPoint3& c) noexcept
+    {
+        const auto ab = b - a, ac = c - a, ap = p - a;
+        const float d1 = dot(ab, ap), d2 = dot(ac, ap);
+        if (d1 <= 0.0f && d2 <= 0.0f) return a;
+        const auto bp = p - b;
+        const float d3 = dot(ab, bp), d4 = dot(ac, bp);
+        if (d3 >= 0.0f && d4 <= d3) return b;
+        const float vc = d1 * d4 - d3 * d2;
+        if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) return a + ab * (d1 / (d1 - d3));
+        const auto cp = p - c;
+        const float d5 = dot(ab, cp), d6 = dot(ac, cp);
+        if (d6 >= 0.0f && d5 <= d6) return c;
+        const float vb = d5 * d2 - d1 * d6;
+        if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) return a + ac * (d2 / (d2 - d6));
+        const float va = d3 * d6 - d5 * d4;
+        if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+        const float denom = 1.0f / (va + vb + vc);
+        return a + ab * (vb * denom) + ac * (vc * denom);
+    }
+
+
+    // ------------------------------------------------------------ models attached to game nodes
+    //
+    // A model is loaded once per file by the game's model database, which keeps one node per file. A second copy of
+    // the same pouch needs its own file: Meshes\RigVR\Inst\<name>_<n>.nif, copied from the model when first needed.
+
+    struct Instance
+    {
+        std::string base;                  // the model it shows
+        RE::NiPointer<RE::NiNode> node;
+        bool used{ false };                // wanted this frame
+    };
+    std::vector<std::unique_ptr<Instance>> g_instances;
+    std::map<std::string, bool> g_missingModels;
+
+    RE::NiNode* loadModel(const std::string& path) noexcept
+    {
+        RE::BSModelDB::DBTraits::ArgsType args{};
+        args.lodFadeMult = RE::ENUM_LOD_MULT::kObjects;
+        args.loadLevel = 0;
+        args.prepareAfterLoad = 1;
+        args.useErrorMarker = 0;
+        args.performProcess = 1;
+        args.createFadeNode = 0;
+        args.loadTextures = 1;
+        for (const std::string& name : { path, std::string("Meshes\\") + path }) {
+            RE::NiPointer<RE::NiNode> node;
+            const auto error = RE::BSModelDB::Demand(name.c_str(), &node, args);
+            if (node && looksLikeObject(node.get())) {
+                detail("Model %s loaded (as %s)", path.c_str(), name.c_str());
+                return node.get();
+            }
+            detail("Model %s: error %d", name.c_str(), static_cast<int>(error));
+        }
+        return nullptr;
+    }
+
+    std::string instancePath(const std::string& base, int n) noexcept
+    {
+        if (n == 0) {
+            return base;
+        }
+        try {
+            std::string stem = std::filesystem::path(base).stem().string();
+            const std::string rel = "RigVR\\Inst\\" + stem + "_" + std::to_string(n) + ".nif";
+            std::string from = "Data/Meshes/" + base;
+            std::string to = "Data/Meshes/" + rel;
+            std::replace(from.begin(), from.end(), '\\', '/');
+            std::replace(to.begin(), to.end(), '\\', '/');
+            std::filesystem::create_directories(std::filesystem::path(to).parent_path());
+            std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing);
+            return rel;
+        } catch (...) {
+            note("Could not copy %s for a second instance", base.c_str());
+            return {};
+        }
+    }
+
+    // A free instance of the model (made if needed). Null if the model cannot be loaded.
+    Instance* acquire(const std::string& base) noexcept
+    {
+        if (base.empty() || g_missingModels.contains(base)) {
+            return nullptr;
+        }
+        int count = 0;
+        for (auto& inst : g_instances) {
+            if (inst->base != base) continue;
+            ++count;
+            if (!inst->used) {
+                inst->used = true;
+                return inst.get();
+            }
+        }
+        const auto path = instancePath(base, count);
+        auto* node = path.empty() ? nullptr : loadModel(path);
+        if (!node) {
+            if (count == 0) {
+                g_missingModels[base] = true;
+                note("Model %s could not be loaded", base.c_str());
+            }
+            return nullptr;
+        }
+        auto inst = std::make_unique<Instance>();
+        inst->base = base;
+        inst->node.reset(node);
+        inst->used = true;
+        g_instances.push_back(std::move(inst));
+        note("Model %s instance %d ready", base.c_str(), count);
+        return g_instances.back().get();
+    }
+
     RE::NiBound recomputeBound(RE::NiAVObject* object, int depth = 0) noexcept
     {
         RE::NiBound out{};
@@ -454,7 +591,7 @@ namespace
         if (auto* geometry = object->IsGeometry()) {
             const auto& model = geometry->GetRuntimeData().modelBound;
             if (model.fRadius > 0.0f && model.fRadius < 5000.0f) {
-                out.center = compose(object->world, pointTransform(model.center)).translate;
+                out.center = toWorld(object->world, model.center);
                 out.fRadius = model.fRadius * object->world.scale;
             } else {
                 out.fRadius = 50.0f;
@@ -465,13 +602,9 @@ namespace
             std::vector<RE::NiBound> parts;
             for (std::uint16_t i = 0; i < count && i < 256; ++i) {
                 auto* child = children[i].get();
-                if (!looksLikeObject(child)) {
-                    continue;
-                }
+                if (!looksLikeObject(child)) continue;
                 const auto b = recomputeBound(child, depth + 1);
-                if (b.fRadius > 0.0f) {
-                    parts.push_back(b);
-                }
+                if (b.fRadius > 0.0f) parts.push_back(b);
             }
             if (!parts.empty()) {
                 RE::NiPoint3 c{};
@@ -487,39 +620,72 @@ namespace
         return out;
     }
 
-    void place3D(RE::NiAVObject* root, const RE::NiTransform& world) noexcept
+    // Hangs the instance under `parent` at `local` (moved from wherever it was) and brings its world data up to date
+    // for this frame; from then on the engine carries it along with the parent.
+    void show(Instance* inst, RE::NiNode* parent, const RE::NiTransform& local) noexcept
     {
-        if (!looksLikeObject(root)) {
+        if (!inst || !looksLikeObject(parent)) {
             return;
         }
-        auto* parent = root->parent;
-        if (looksLikeObject(parent)) {
-            root->local = relative(parent->world, world);
-        } else {
-            root->local = world;
+        auto* node = inst->node.get();
+        if (!looksLikeObject(node)) {
+            return;
         }
-        root->world = world;
-        forEachNode(root, [&](RE::NiAVObject* object, int depth) {
-            if (depth == 0) {
-                return true;
+        if (node->parent != parent) {
+            if (auto* old = node->parent; looksLikeObject(old)) {
+                old->DetachChild(node);
             }
-            if (auto* up = object->parent; looksLikeObject(up)) {
-                object->world = compose(up->world, object->local);
+            parent->AttachChild(node, true);
+            detail("Model %s attached under %s", inst->base.c_str(), parent->name.c_str());
+        }
+        setCulled(node, false);
+        node->local = local;
+        node->world = compose(parent->world, local);
+        forEachNode(node, [](RE::NiAVObject* object, int depth) {
+            if (depth > 0) {
+                if (auto* up = object->parent; looksLikeObject(up)) {
+                    object->world = compose(up->world, object->local);
+                }
             }
             return true;
         });
-        const auto rootBound = recomputeBound(root);
-        const float reach = rootBound.fRadius > 0.0f && rootBound.fRadius < 1000.0f ? rootBound.fRadius : 20.0f;
-        RE::NiAVObject* up = root->parent;
-        for (int i = 0; i < 8 && looksLikeObject(up); ++i) {
-            auto& bound = up->worldBound;
-            const float needed = distance(bound.center, rootBound.center) + reach;
-            if (bound.fRadius > 0.0f && bound.fRadius < needed && needed < 20000.0f) {
-                bound.fRadius = needed;
+        const auto bound = recomputeBound(node);
+        // the parent's bound must reach the model, or the renderer culls it with the parent
+        RE::NiAVObject* up = parent;
+        for (int i = 0; i < 6 && looksLikeObject(up); ++i) {
+            auto& b = up->worldBound;
+            const float needed = distance(b.center, bound.center) + bound.fRadius;
+            if (b.fRadius > 0.0f && b.fRadius < needed && needed < 20000.0f) {
+                b.fRadius = needed;
             }
-            auto* next = up->parent;
-            up = looksLikeObject(next) ? next : nullptr;
+            up = up->parent;
         }
+    }
+
+    void beginFrameModels() noexcept
+    {
+        for (auto& inst : g_instances) inst->used = false;
+    }
+
+    // Models not shown this frame are taken off their parent.
+    void endFrameModels() noexcept
+    {
+        for (auto& inst : g_instances) {
+            auto* node = inst->node.get();
+            if (!inst->used && looksLikeObject(node) && node->parent) {
+                auto* parent = node->parent;
+                if (looksLikeObject(parent)) {
+                    parent->DetachChild(node);
+                }
+                node->parent = nullptr;
+            }
+        }
+    }
+
+    void detachAllModels() noexcept
+    {
+        beginFrameModels();
+        endFrameModels();
     }
 
     // ------------------------------------------------------------ game helpers
@@ -550,9 +716,7 @@ namespace
         }
         std::uint32_t total = 0;
         for (auto& item : list->data) {
-            if (item.object != object) {
-                continue;
-            }
+            if (item.object != object) continue;
             for (auto* stack = item.stackData.get(); stack; stack = stack->nextStack.get()) {
                 total += stack->count;
             }
@@ -577,9 +741,7 @@ namespace
         }
         for (auto& item : items) {
             auto* form = item.item.object;
-            if (!form || !readable(form, sizeof(RE::TESForm)) || form->GetFormType() != RE::ENUM_FORM_ID::kWEAP) {
-                continue;
-            }
+            if (!form || !readable(form, sizeof(RE::TESForm)) || form->GetFormType() != RE::ENUM_FORM_ID::kWEAP) continue;
             auto* weapon = static_cast<RE::TESObjectWEAP*>(form);
             if (weapon->weaponData.type.get() == RE::WEAPON_TYPE::kGun) {
                 return weapon;
@@ -588,49 +750,17 @@ namespace
         return nullptr;
     }
 
-    std::string modelOf(RE::TESForm* form) noexcept
-    {
-        if (!form || form->GetFormType() != RE::ENUM_FORM_ID::kMISC) {
-            return {};
-        }
-        auto* misc = static_cast<RE::TESObjectMISC*>(form);
-        const char* path = static_cast<RE::TESModel&>(static_cast<RE::BGSModelMaterialSwap&>(*misc)).GetModel();
-        std::string text = path ? path : "";
-        for (auto& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        return text;
-    }
-
-    // Can this item go into a pouch of this type?
-    bool accepts(int type, RE::TESForm* form) noexcept
+    // Can this item go into the bag?
+    bool bagAccepts(RE::TESForm* form) noexcept
     {
         if (!form) {
             return false;
         }
         const auto kind = form->GetFormType();
-        switch (type) {
-        case kMag:
-            return kind == RE::ENUM_FORM_ID::kAMMO || (kind == RE::ENUM_FORM_ID::kMISC && modelOf(form).find("mag") != std::string::npos);
-        case kMed:
-            return kind == RE::ENUM_FORM_ID::kALCH;
-        case kGrenade:
-            if (kind == RE::ENUM_FORM_ID::kWEAP) {
-                const auto t = static_cast<RE::TESObjectWEAP*>(form)->weaponData.type.get();
-                return t == RE::WEAPON_TYPE::kGrenade || t == RE::WEAPON_TYPE::kMine;
-            }
-            return false;
-        case kHolster:
-        case kSling:
-            return kind == RE::ENUM_FORM_ID::kWEAP && static_cast<RE::TESObjectWEAP*>(form)->weaponData.type.get() == RE::WEAPON_TYPE::kGun;
-        case kDump:
-            return kind == RE::ENUM_FORM_ID::kMISC || kind == RE::ENUM_FORM_ID::kALCH || kind == RE::ENUM_FORM_ID::kAMMO ||
-                   kind == RE::ENUM_FORM_ID::kBOOK || kind == RE::ENUM_FORM_ID::kNOTE || kind == RE::ENUM_FORM_ID::kKEYM ||
-                   kind == RE::ENUM_FORM_ID::kINGR || kind == RE::ENUM_FORM_ID::kARMO ||
-                   (kind == RE::ENUM_FORM_ID::kWEAP && static_cast<RE::TESObjectWEAP*>(form)->weaponData.type.get() != RE::WEAPON_TYPE::kGun);
-        case kBandolier:
-            return kind == RE::ENUM_FORM_ID::kAMMO;
-        default:
-            return false;
-        }
+        return kind == RE::ENUM_FORM_ID::kMISC || kind == RE::ENUM_FORM_ID::kALCH || kind == RE::ENUM_FORM_ID::kAMMO ||
+               kind == RE::ENUM_FORM_ID::kBOOK || kind == RE::ENUM_FORM_ID::kNOTE || kind == RE::ENUM_FORM_ID::kKEYM ||
+               kind == RE::ENUM_FORM_ID::kINGR || kind == RE::ENUM_FORM_ID::kARMO ||
+               (kind == RE::ENUM_FORM_ID::kWEAP && static_cast<RE::TESObjectWEAP*>(form)->weaponData.type.get() != RE::WEAPON_TYPE::kGun);
     }
 
     // ------------------------------------------------------------ controllers and hands
@@ -725,7 +855,7 @@ namespace
     bool bone(const char* name, RE::NiPoint3& out) noexcept
     {
         const auto* frik = FRIKApiV2::inst;
-        if (!g_settings.useBones || !frik || !frik->getBoneWorldTransform) {
+        if (!frik || !frik->getBoneWorldTransform) {
             return false;
         }
         RE::NiTransform t;
@@ -741,10 +871,7 @@ namespace
     enum Command : std::int32_t
     {
         kNone = 0,
-        kSpawn = 1,         // kind = static index, token
-        kDelete = 2,        // ref
-        kSetPos = 3,        // ref, pose
-        kMoveToPlayer = 4,  // ref
+        kDelete = 2,        // ref: a pouch item hung on the rig is gone from the world
         kTakeItem = 5,      // form: one less in the inventory
         kGiveItem = 6,      // form: one more in the inventory
         kStoreRef = 7,      // ref: picked up into the inventory
@@ -783,8 +910,8 @@ namespace
         bool stateArrived{ false };
         std::uint32_t mannequinArrived{ 0 };
         bool mannequinChanged{ false };
-        std::array<std::uint32_t, 1 + kPouchTypes> forms{};   // 0 kit, 1..6 pouch items
-        std::string hudText;   // a message from a script thread, shown on the next frame
+        std::array<std::uint32_t, 1 + kRigItem> forms{};   // 0 kit, 1..6 pouch items, 7 the rig item
+        std::string hudText;
     } g_shared;
 
     void queueHud(const char* text) noexcept
@@ -865,7 +992,7 @@ namespace
     void PushState(std::monostate, std::int32_t value)
     {
         std::scoped_lock guard(g_shared.lock);
-        if (g_shared.incoming.size() < 512) {
+        if (g_shared.incoming.size() < 1024) {
             g_shared.incoming.push_back(value);
         }
     }
@@ -882,12 +1009,9 @@ namespace
     {
         note("Script: %d", message);
         switch (message) {
-        case 1: logWarning("The script could not make a drawn object"); break;
         case 2: queueHud("Не получилось достать предмет"); break;
         case 3: queueHud("Не получилось поставить манекен"); break;
-        case 10: queueHud("Подсумки не бросают: повесь его на манекен (полка справа от манекена)"); break;
-        case 21: queueHud("Разгрузка 0.2: в инвентаре два ремня для оружия на спину. Повесь их на спину манекена"); break;
-        case 20: queueHud("Разгрузка: в инвентаре (Разное) манекен и подсумки. Выбрось манекен из Пип-Боя, чтобы поставить его"); break;
+        case 20: queueHud("Разгрузка: в инвентаре (Разное) манекен. Выбрось его из Пип-Боя, чтобы поставить; разгрузка с подсумками уже на нём"); break;
         default: break;
         }
     }
@@ -926,7 +1050,9 @@ namespace
 
     struct Pouch
     {
-        int type{ kEmpty };
+        int kind{ kEmpty };
+        int area{ -1 };
+        RE::NiTransform pose{};   // in body space: where its back hangs, rows = its axes (+Y out of the rig, +Z up)
         std::array<Stack, kItemsPerPouch> items{};
 
         int total() const noexcept
@@ -940,18 +1066,25 @@ namespace
     struct Rig
     {
         bool worn{ false };
+        bool rigOn{ true };            // the rig is on the mannequin / on you (false: it is an item somewhere)
         std::uint32_t mannequin{ 0 };
-        std::array<Pouch, kSlots> slots{};
+        std::vector<Pouch> pouches;
     };
 
     std::mutex g_rigLock;   // GetState runs on a script thread
     Rig g_rig;
     bool g_rigLoaded{ false };
-    bool g_tidied{ false };   // places checked after this load
     bool g_dirty{ false };
     Clock::time_point g_lastSave{};
 
-    constexpr std::int32_t kStateVersion = 1;
+    constexpr std::int32_t kStateVersion = 2;
+
+    std::int32_t bits(float f) noexcept { return std::bit_cast<std::int32_t>(f); }
+    float unbits(std::int32_t i) noexcept
+    {
+        const float f = std::bit_cast<float>(i);
+        return std::isfinite(f) ? f : 0.0f;
+    }
 
     std::vector<std::int32_t> GetState(std::monostate)
     {
@@ -960,10 +1093,18 @@ namespace
         out.push_back(kStateVersion);
         out.push_back(g_rig.worn ? 1 : 0);
         out.push_back(static_cast<std::int32_t>(g_rig.mannequin));
-        out.push_back(kSlots);
-        for (const auto& pouch : g_rig.slots) {
-            out.push_back(pouch.type);
-            for (const auto& s : pouch.items) {
+        out.push_back(g_rig.rigOn ? 1 : 0);
+        out.push_back(static_cast<std::int32_t>(g_rig.pouches.size()));
+        for (const auto& p : g_rig.pouches) {
+            out.push_back(p.kind);
+            out.push_back(p.area);
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j)
+                    out.push_back(bits(p.pose.rotate.entry[i][j]));
+            out.push_back(bits(p.pose.translate.x));
+            out.push_back(bits(p.pose.translate.y));
+            out.push_back(bits(p.pose.translate.z));
+            for (const auto& s : p.items) {
                 out.push_back(static_cast<std::int32_t>(s.form));
                 out.push_back(s.count);
             }
@@ -971,68 +1112,75 @@ namespace
         return out;
     }
 
-    void loadState(const std::vector<std::int32_t>& in) noexcept
+    // The layout a new game (or a game from before 0.4) starts with: the rig on the mannequin with every pouch where it
+    // hangs in the Blender scene.
+    void applyPreset() noexcept
     {
-        std::scoped_lock guard(g_rigLock);
-        g_rig = Rig{};
-        if (in.size() >= 4 && in[0] == kStateVersion) {
-            g_rig.worn = in[1] != 0;
-            g_rig.mannequin = static_cast<std::uint32_t>(in[2]);
-            const int slots = std::min<int>(in[3], kSlots);
-            std::size_t at = 4;
-            for (int i = 0; i < slots && at + 1 + 2 * kItemsPerPouch <= in.size(); ++i) {
-                auto& pouch = g_rig.slots[i];
-                pouch.type = std::clamp(in[at++], 0, kPouchTypes);
-                for (auto& s : pouch.items) {
-                    s.form = static_cast<std::uint32_t>(in[at++]);
-                    s.count = std::max(0, in[at++]);
-                    if (s.count == 0) s.form = 0;
-                }
-            }
+        g_rig.rigOn = true;
+        g_rig.worn = false;
+        g_rig.pouches.clear();
+        for (const auto& p : g_def.presets) {
+            Pouch pouch;
+            pouch.kind = p.kind;
+            pouch.area = p.area;
+            pouch.pose = p.pose;
+            g_rig.pouches.push_back(pouch);
         }
-        g_rigLoaded = true;
-        g_tidied = false;
-        int pouches = 0;
-        for (const auto& p : g_rig.slots) pouches += p.type != kEmpty ? 1 : 0;
-        note("Rig loaded: %s, mannequin %08X, %d pouches", g_rig.worn ? "worn" : "on the mannequin", g_rig.mannequin, pouches);
+        note("Starting layout: %zu pouches on the rig", g_rig.pouches.size());
     }
 
     void markDirty() noexcept { g_dirty = true; }
 
-    // After a load: a pouch on a place that is no longer used moves to a free place; a pouch of a type left out
-    // for now (or with no free place) goes back to the inventory. Its contents stay in the inventory either way.
-    void tidyPlaces() noexcept
+    void loadState(const std::vector<std::int32_t>& in) noexcept
     {
-        if (g_tidied) {
-            return;
-        }
-        g_tidied = true;
-        for (int i = 0; i < kSlots; ++i) {
-            auto& pouch = g_rig.slots[i];
-            if (pouch.type == kEmpty || (g_places[i].group >= 0 && typeEnabled(pouch.type))) {
-                continue;
-            }
-            int to = -1;
-            for (int j = 0; j < kSlots && to < 0 && typeEnabled(pouch.type); ++j) {
-                if (g_places[j].group >= 0 && g_rig.slots[j].type == kEmpty) {
-                    to = j;
+        std::scoped_lock guard(g_rigLock);
+        g_rig = Rig{};
+        constexpr std::size_t kPer = 2 + 12 + 2 * kItemsPerPouch;
+        if (in.size() >= 5 && in[0] == kStateVersion) {
+            g_rig.worn = in[1] != 0;
+            g_rig.mannequin = static_cast<std::uint32_t>(in[2]);
+            g_rig.rigOn = in[3] != 0;
+            const int count = std::clamp(in[4], 0, kMaxPouches);
+            std::size_t at = 5;
+            for (int n = 0; n < count && at + kPer <= in.size(); ++n) {
+                Pouch p;
+                p.kind = in[at++];
+                p.area = in[at++];
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j)
+                        p.pose.rotate.entry[i][j] = unbits(in[at++]);
+                p.pose.translate.x = unbits(in[at++]);
+                p.pose.translate.y = unbits(in[at++]);
+                p.pose.translate.z = unbits(in[at++]);
+                p.pose.scale = 1.0f;
+                for (auto& s : p.items) {
+                    s.form = static_cast<std::uint32_t>(in[at++]);
+                    s.count = std::max(0, in[at++]);
+                    if (s.count == 0) s.form = 0;
+                }
+                if (p.kind >= 1 && p.kind <= kKinds && p.area >= 0 && p.area < static_cast<int>(g_def.areas.size())) {
+                    g_rig.pouches.push_back(p);
                 }
             }
-            if (to >= 0) {
-                g_rig.slots[to] = pouch;
-                note("Pouch type %d moved from place %d (not used now) to %d", pouch.type, i, to);
-            } else {
-                pushSimple(kGiveItem, 0, g_shared.forms[pouch.type]);
-                note("Pouch type %d on place %d given back to the inventory", pouch.type, i);
+            if (!g_rig.rigOn) {
+                g_rig.worn = false;
             }
-            pouch = Pouch{};
-            markDirty();
+        } else {
+            // nothing saved yet, or the layout of 0.1-0.3 (fixed places): start with the scene's layout, keep the mannequin
+            if (in.size() >= 3 && in[0] == 1) {
+                g_rig.mannequin = static_cast<std::uint32_t>(in[2]);
+            }
+            applyPreset();
+            g_dirty = true;
         }
+        g_rigLoaded = true;
+        note("Rig loaded: %s, mannequin %08X, %zu pouches", !g_rig.rigOn ? "not hung" : g_rig.worn ? "worn" : "on the mannequin",
+            g_rig.mannequin, g_rig.pouches.size());
     }
 
     bool addToPouch(Pouch& pouch, std::uint32_t form) noexcept
     {
-        if (pouch.total() >= capacityOf(pouch.type)) {
+        if (pouch.total() >= capacityOf(pouch.kind)) {
             return false;
         }
         for (auto& s : pouch.items) {
@@ -1056,368 +1204,168 @@ namespace
     {
         for (int i = kItemsPerPouch - 1; i >= 0; --i) {
             auto& s = pouch.items[i];
-            if (!s.form || s.count <= 0) {
-                continue;
-            }
+            if (!s.form || s.count <= 0) continue;
             const auto have = static_cast<std::int32_t>(inventoryCount(player, s.form));
             if (have <= 0) {
-                // used up some other way (Pip-Boy, a reload): forget it
                 s = Stack{};
                 continue;
             }
             s.count = std::min(s.count, have) - 1;
             const auto form = s.form;
-            if (s.count <= 0) {
-                s = Stack{};
-            }
+            if (s.count <= 0) s = Stack{};
             return form;
         }
         return 0;
     }
 
-    // ------------------------------------------------------------ what is drawn
+    // ------------------------------------------------------------ where the rig is: the mannequin or your body
 
-    struct Visual
+    // A place to hang models: on the mannequin everything goes under its root (its space is the body space); on the
+    // body each model goes under the bone it follows.
+    struct Holder
     {
-        std::uint32_t ref{ 0 };
-        int  kind{ -1 };          // static index the ref was made of
-        int  wanted{ -1 };        // static index wanted now (-1: none)
-        bool show{ false };
-        RE::NiTransform pose{};
-        bool requested{ false };
-        Clock::time_point requestedAt{};
-        Clock::time_point lastMove{};
-        Clock::time_point missingSince{};
-    };
+        bool valid{ false };
+        bool body{ false };
+        RE::NiNode* root{ nullptr };       // the mannequin's 3D
+        RE::NiAVObject* skeleton{ nullptr };   // your body's 3D
 
-    // 0..10 the pouches, 11 the rig, 12 the cursor, 13..18 the shelf, 19..29 free places on the mannequin, 30 pouch in a hand
-    constexpr int kVisPouch = 0;
-    constexpr int kVisRig = kSlots;
-    constexpr int kVisCursor = kVisRig + 1;
-    constexpr int kVisTray = kVisCursor + 1;
-    constexpr int kVisGhost = kVisTray + kPouchTypes;
-    constexpr int kVisHeld = kVisGhost + kSlots;
-    constexpr int kVisuals = kVisHeld + 1;
-    std::array<Visual, kVisuals> g_vis;
-
-    // Rows of a rotation by x, then y, then z degrees (the frame's own axes).
-    RE::NiMatrix3 rotationXYZ(const float* degrees) noexcept
-    {
-        RE::NiMatrix3 m;
-        m.entry[0][0] = 1.0f; m.entry[0][1] = 0.0f; m.entry[0][2] = 0.0f;
-        m.entry[1][0] = 0.0f; m.entry[1][1] = 1.0f; m.entry[1][2] = 0.0f;
-        m.entry[2][0] = 0.0f; m.entry[2][1] = 0.0f; m.entry[2][2] = 1.0f;
-        for (int axis = 0; axis < 3; ++axis) {
-            const float a = degrees[axis] * 3.14159265f / 180.0f;
-            if (a == 0.0f) {
-                continue;
-            }
-            const float c = std::cos(a);
-            const float sn = std::sin(a);
-            RE::NiMatrix3 r;
-            const int i = (axis + 1) % 3;
-            const int j = (axis + 2) % 3;
-            for (int x = 0; x < 3; ++x)
-                for (int y = 0; y < 3; ++y)
-                    r.entry[x][y] = x == y ? 1.0f : 0.0f;
-            r.entry[i][i] = c; r.entry[i][j] = sn;
-            r.entry[j][i] = -sn; r.entry[j][j] = c;
-            m = m * r;
-        }
-        return m;
-    }
-
-    RE::NiTransform withKindModel(int kind, const RE::NiTransform& pose) noexcept
-    {
-        if (kind < 0 || kind >= kKinds) {
-            return pose;
-        }
-        const auto& km = g_kindModels[kind];
-        RE::NiTransform local;
-        local.rotate = rotationXYZ(km.rot);
-        local.translate = { km.offset[0], km.offset[1], km.offset[2] };
-        local.scale = km.scale > 0.001f ? km.scale : 1.0f;
-        return compose(pose, local);
-    }
-
-    // Models from RigVR.ini replace the hologram outlines (once the game data is loaded).
-    void applyKindModels() noexcept
-    {
-        auto* data = RE::TESDataHandler::GetSingleton();
-        if (!data) {
-            return;
-        }
-        // a model in Meshes\RigVR\Custom\ with the hologram's file name replaces it (no ini needed; the mod's zip never overwrites it)
-        for (int k = 0; k < kKinds; ++k) {
-            auto& km = g_kindModels[k];
-            const std::string file = (k < 4 ? std::string{} : std::string{ "Pouch" }) + kKindNames[k] + ".nif";
-            if (km.model.empty() && std::ifstream("Data/Meshes/RigVR/Custom/" + file).good()) {
-                km.model = "RigVR\\Custom\\" + file;
-            }
-        }
-        // the pouches as inventory items (seen when dropped) use the same model
-        constexpr std::uint32_t kItemIDs[kKinds]{ 0, 0, 0, 0, 0x80B, 0x80C, 0x80D, 0x80E, 0x80F, 0x810, 0x81A };
-        for (int k = 0; k < kKinds; ++k) {
-            const auto& km = g_kindModels[k];
-            if (km.model.empty()) {
-                continue;
-            }
-            if (kItemIDs[k]) {
-                auto* item = data->LookupForm(kItemIDs[k], "RigVR.esp");
-                if (item && item->GetFormType() == RE::ENUM_FORM_ID::kMISC) {
-                    static_cast<RE::TESModel&>(static_cast<RE::BGSModelMaterialSwap&>(*static_cast<RE::TESObjectMISC*>(item))).SetModel(km.model.c_str());
-                }
-            }
-            auto* form = data->LookupForm(kKindStatIDs[k], "RigVR.esp");
-            if (!form || form->GetFormType() != RE::ENUM_FORM_ID::kSTAT) {
-                note("Model for %s: RigVR.esp record %03X not found", kKindNames[k], kKindStatIDs[k]);
-                continue;
-            }
-            auto* stat = static_cast<RE::TESObjectSTAT*>(form);
-            static_cast<RE::TESModel&>(static_cast<RE::BGSModelMaterialSwap&>(*stat)).SetModel(km.model.c_str());
-            note("Model for %s: %s (scale %.2f, turn %.0f %.0f %.0f, shift %.1f %.1f %.1f)", kKindNames[k], km.model.c_str(), km.scale,
-                km.rot[0], km.rot[1], km.rot[2], km.offset[0], km.offset[1], km.offset[2]);
-        }
-    }
-
-    void want(int index, int kind, const RE::NiTransform& pose) noexcept
-    {
-        auto& v = g_vis[index];
-        v.wanted = kind;
-        v.show = kind >= 0;
-        v.pose = pose;
-    }
-
-    void hideVisual(int index) noexcept
-    {
-        g_vis[index].show = false;
-    }
-
-    void forgetVisuals() noexcept
-    {
-        for (auto& v : g_vis) {
-            v = Visual{};
-        }
-    }
-
-    void onDroppedToHand(std::uint32_t ref, std::int32_t token) noexcept;
-
-    void takeNewRefs() noexcept
-    {
-        std::vector<NewRef> refs;
+        RE::NiNode* parentFor(const std::string& bone) const noexcept
         {
-            std::scoped_lock guard(g_shared.lock);
-            refs.swap(g_shared.newRefs);
+            if (!body) {
+                return root;
+            }
+            auto* object = looksLikeObject(skeleton) ? skeleton->GetObjectByName(RE::BSFixedString(bone.c_str())) : nullptr;
+            auto* node = looksLikeObject(object) ? object->IsNode() : nullptr;
+            return node;
         }
-        for (const auto& r : refs) {
-            if (r.token >= 0 && r.token < kVisuals) {
-                auto& v = g_vis[r.token];
-                if (v.ref && v.ref != r.ref) {
-                    pushSimple(kDelete, v.ref);
-                }
-                v.ref = r.ref;
-                v.requested = false;
-                v.missingSince = {};
-                detail("Visual %d is ref %08X (kind %d)", r.token, r.ref, v.kind);
-            } else if (r.token >= 1000) {
-                onDroppedToHand(r.ref, r.token);
+
+        // local transform under parentFor(bone) for a pose in body space
+        RE::NiTransform localFor(const std::string& bone, const RE::NiTransform& bodyPose) const noexcept
+        {
+            if (!body) {
+                return bodyPose;
             }
+            const auto it = g_def.binds.find(bone);
+            return it == g_def.binds.end() ? bodyPose : relative(it->second, bodyPose);
         }
-    }
 
-    void updateVisuals(RE::PlayerCharacter* player, Clock::time_point now) noexcept
-    {
-        for (int i = 0; i < kVisuals; ++i) {
-            auto& v = g_vis[i];
-            if (v.wanted >= 0 && v.wanted != v.kind) {
-                if (v.ref) {
-                    pushSimple(kDelete, v.ref);
-                    v.ref = 0;
-                }
-                v.kind = v.wanted;
-                v.requested = false;
+        // a pose in body space as it is in the world now
+        bool world(const std::string& bone, const RE::NiTransform& bodyPose, RE::NiTransform& out) const noexcept
+        {
+            auto* parent = parentFor(bone);
+            if (!looksLikeObject(parent)) {
+                return false;
             }
-            if (v.kind < 0) {
-                continue;
-            }
-            if (!v.ref) {
-                if (v.show && (!v.requested || now - v.requestedAt > std::chrono::seconds(4))) {
-                    PendingCommand c;
-                    c.type = kSpawn;
-                    c.kind = v.kind;
-                    c.token = i;
-                    push(c);
-                    v.requested = true;
-                    v.requestedAt = now;
-                }
-                continue;
-            }
-            auto* ref = lookupRef(v.ref);
-            if (!ref || ref->IsDeleted()) {
-                v.ref = 0;
-                continue;
-            }
-            auto* root = ref->Get3D();
-            if (!looksLikeObject(root)) {
-                // left behind in another cell, or not loaded yet
-                if (v.show) {
-                    if (v.missingSince == Clock::time_point{}) {
-                        v.missingSince = now;
-                    } else if (now - v.missingSince > std::chrono::seconds(2) && now - v.lastMove > std::chrono::seconds(3)) {
-                        pushSimple(kMoveToPlayer, v.ref);
-                        v.lastMove = now;
-                    }
-                }
-                continue;
-            }
-            v.missingSince = {};
-            if (!v.show) {
-                setCulled(root, true);
-                continue;
-            }
-            setCulled(root, false);
-            place3D(root, withKindModel(v.kind, v.pose));
-            // the reference itself must stay near what is drawn, or the game unloads / culls it
-            if (distance(ref->GetPosition(), v.pose.translate) > 300.0f && now - v.lastMove > std::chrono::seconds(2)) {
-                PendingCommand c;
-                c.type = kSetPos;
-                c.ref = v.ref;
-                c.pose = { v.pose.translate.x, v.pose.translate.y, v.pose.translate.z, 0.0f, 0.0f, 0.0f };
-                push(c);
-                v.lastMove = now;
-            }
+            out = compose(parent->world, localFor(bone, bodyPose));
+            return true;
         }
-        (void)player;
-    }
-
-    // ------------------------------------------------------------ frames: the mannequin and the body
-
-    struct Frames
-    {
-        Frame belt;
-        Frame chest;
-        float scale{ 1.0f };
     };
 
-    Frames mannequinFrames(RE::TESObjectREFR* mannequin) noexcept
+    Holder mannequinHolder(RE::TESObjectREFR* mannequin) noexcept
     {
-        Frames f;
-        const auto pos = mannequin->GetPosition();
-        const float yaw = mannequin->data.angle.z;
-        f.belt.origin = { pos.x, pos.y, pos.z + g_settings.beltHeight };
-        f.belt.yaw = yaw;
-        f.chest.origin = { pos.x, pos.y, pos.z + g_settings.chestHeight };
-        f.chest.yaw = yaw;
-        f.scale = 1.0f;
-        return f;
+        Holder h;
+        auto* root = mannequin ? mannequin->Get3D() : nullptr;
+        h.root = looksLikeObject(root) ? root->IsNode() : nullptr;
+        h.valid = h.root != nullptr;
+        return h;
     }
 
-    bool g_bonesLogged{ false };
-
-    Frames bodyFrames(RE::PlayerCharacter* player) noexcept
+    Holder bodyHolder(RE::PlayerCharacter* player) noexcept
     {
-        Frames f;
-        const auto feet = player->GetPosition();
-        const float playerYaw = player->data.angle.z;
-        f.scale = g_settings.bodyScale;
-        RE::NiPoint3 pelvis, chest, lThigh, rThigh, lArm, rArm;
-        const bool hasPelvis = bone("Pelvis", pelvis);
-        const bool hasChest = bone("Chest", chest) || bone("SPINE2", chest);
-        const bool hasThighs = bone("LLeg_Thigh", lThigh) && bone("RLeg_Thigh", rThigh);
-        const bool hasArms = bone("LArm_UpperArm", lArm) && bone("RArm_UpperArm", rArm);
-        const float beltYaw = hasThighs ? yawOfRight(rThigh - lThigh, playerYaw) : playerYaw;
-        const float chestYaw = hasArms ? yawOfRight(rArm - lArm, beltYaw) : beltYaw;
-        f.belt.yaw = beltYaw;
-        f.chest.yaw = chestYaw;
-        f.belt.origin = hasPelvis ? pelvis : RE::NiPoint3{ feet.x, feet.y, feet.z + g_settings.beltHeight };
-        f.chest.origin = hasChest ? chest : RE::NiPoint3{ f.belt.origin.x, f.belt.origin.y, f.belt.origin.z + (g_settings.chestHeight - g_settings.beltHeight) };
-        f.belt.origin.z += g_settings.beltUp;
-        f.chest.origin.z += g_settings.chestUp;
-        f.belt.origin += f.belt.forward() * g_settings.bodyForward;
-        f.chest.origin += f.chest.forward() * g_settings.bodyForward;
-        if (!g_bonesLogged) {
-            g_bonesLogged = true;
-            note("Body: pelvis %s (%.0f above feet), chest %s (%.0f), thighs %s, arms %s; yaw belt %.0f chest %.0f player %.0f",
-                hasPelvis ? "bone" : "fallback", f.belt.origin.z - feet.z, hasChest ? "bone" : "fallback", f.chest.origin.z - feet.z,
-                hasThighs ? "yes" : "no", hasArms ? "yes" : "no", beltYaw / kDegrees, chestYaw / kDegrees, playerYaw / kDegrees);
+        Holder h;
+        h.body = true;
+        RE::NiAVObject* third = player->Get3D(false);
+        if (!looksLikeObject(third)) {
+            third = player->Get3D();
         }
-        return f;
+        h.skeleton = looksLikeObject(third) ? third : nullptr;
+        h.valid = h.skeleton != nullptr && h.parentFor("Pelvis") != nullptr;
+        return h;
     }
 
-    RE::NiTransform slotPose(const Frames& f, int slot, float extraScale = 1.0f) noexcept
+    const std::string& boneOf(const Pouch& p) noexcept
     {
-        const auto& p = g_places[slot];
-        const auto& frame = p.group == 1 ? f.chest : f.belt;
-        const float s = f.scale * extraScale;
-        return uprightTransform(frame.at(p.x * s, p.y * s, p.z), frame.yaw + p.yaw * kDegrees);
+        static const std::string pelvis = "Pelvis";
+        return p.area >= 0 && p.area < static_cast<int>(g_def.areas.size()) ? g_def.areas[p.area].bone : pelvis;
     }
 
-    RE::NiTransform trayPose(const Frames& f, int index) noexcept
+    // the middle of a pouch in body space
+    RE::NiPoint3 pouchMiddle(const Pouch& p) noexcept
     {
-        const float z = g_settings.trayZ - g_settings.beltHeight - index * g_settings.trayStep;
-        return uprightTransform(f.belt.at(g_settings.trayX, g_settings.trayY, z), f.belt.yaw - 90.0f * kDegrees);
+        return p.pose.translate + row(p.pose.rotate, 1) * depthOf(p.kind);
     }
 
-    // ------------------------------------------------------------ state of the frame
-
-    struct State
+    void drawRig(const Holder& h) noexcept
     {
-        int heldType{ kEmpty };      // a pouch in a hand (taken from the shelf or the mannequin)
-        int heldHand{ -1 };
-        std::array<Clock::time_point, 2> gripAt{};
-        Clock::time_point packStart{};
-        int packHand{ -1 };
-        Clock::time_point holsterAt{};
-        RE::TESObjectWEAP* lastGun{ nullptr };
-        Clock::time_point lastFrame{};
-        std::array<int, 2> hover{ -1, -1 };   // pouch slot each hand is at (body)
-        bool wearArmed{ true };
-    } g_state;
+        for (const auto& [path, bone] : g_def.models) {
+            auto* parent = h.parentFor(bone);
+            if (!parent) continue;
+            show(acquire(path), parent, h.localFor(bone, identity()));
+        }
+    }
 
-    // Items dropped from a pouch into a hand: a chem / food among them is used at the mouth.
-    struct InHand
+    void drawPouch(const Holder& h, const Pouch& p) noexcept
+    {
+        const auto& bone = boneOf(p);
+        auto* parent = h.parentFor(bone);
+        if (!parent) return;
+        show(acquire(pouchModel(p.kind)), parent, h.localFor(bone, p.pose));
+    }
+
+    // ------------------------------------------------------------ pouch items in the hands
+
+    // A pouch item (or the rig item) a gripping hand holds: the nearest one to the palm.
+    struct Held
     {
         std::uint32_t ref{ 0 };
-        std::int32_t  token{ 0 };
-        Clock::time_point at{};
+        int kind{ kEmpty };
+        RE::NiTransform world{};
     };
-    std::vector<InHand> g_inHand;
-    std::int32_t g_nextToken{ 1000 };
 
-    void onDroppedToHand(std::uint32_t ref, std::int32_t token) noexcept
+    int kindOfItem(RE::TESForm* base) noexcept
     {
-        if (!ref) {
-            return;
+        if (!base) return kEmpty;
+        const auto id = base->GetFormID();
+        for (int k = 1; k <= kRigItem; ++k) {
+            if (g_shared.forms[k] && g_shared.forms[k] == id) return k;
         }
-        for (auto& h : g_inHand) {
-            if (h.token == token) {
-                h.ref = ref;
-                return;
-            }
-        }
+        return kEmpty;
     }
 
-    int nearestSlot(const Frames& f, const RE::NiPoint3& palm, bool wantFilled, float radius) noexcept
+    Held heldBy(RE::PlayerCharacter* player, const RE::NiPoint3& palm) noexcept
     {
-        int best = -1;
-        float bestDistance = radius;
-        for (int i = 0; i < kSlots; ++i) {
-            const bool filled = g_rig.slots[i].type != kEmpty;
-            if (filled != wantFilled || g_places[i].group < 0) {
-                continue;
-            }
-            const float d = distance(slotPose(f, i).translate, palm) * (g_rig.slots[i].type == kSling ? g_settings.slotRadius / g_settings.backRadius :
-                                                                          g_rig.slots[i].type == kHolster ? g_settings.slotRadius / g_settings.holsterRadius : 1.0f);
+        Held best;
+        auto* cell = player->GetParentCell();
+        if (!cell || !readable(cell, sizeof(RE::TESObjectCELL))) {
+            return best;
+        }
+        float bestDistance = g_settings.holdRadius;
+        const auto count = cell->references.size();
+        if (count > 100000) {
+            return best;
+        }
+        for (std::uint32_t i = 0; i < count; ++i) {
+            auto* ref = cell->references[i].get();
+            if (!ref || ref == player || !readable(ref, sizeof(RE::TESObjectREFR)) || ref->IsDisabled() || ref->IsDeleted()) continue;
+            auto* base = ref->GetObjectReference();
+            if (!base || !readable(base, sizeof(RE::TESForm))) continue;
+            const int kind = kindOfItem(base);
+            if (kind == kEmpty) continue;
+            auto* root = ref->Get3D();
+            if (!looksLikeObject(root)) continue;
+            const float d = distance(root->world.translate, palm);
             if (d < bestDistance) {
                 bestDistance = d;
-                best = i;
+                best.ref = ref->GetFormID();
+                best.kind = kind;
+                best.world = root->world;
             }
         }
         return best;
     }
 
-    // A loose item near the palm (the one the hand just let go of).
-    RE::TESObjectREFR* looseItemNear(RE::PlayerCharacter* player, const RE::NiPoint3& palm, int pouchType) noexcept
+    // A loose item near the palm (the one the hand just let go of) that the bag takes.
+    RE::TESObjectREFR* looseItemNear(RE::PlayerCharacter* player, const RE::NiPoint3& palm) noexcept
     {
         auto* cell = player->GetParentCell();
         if (!cell || !readable(cell, sizeof(RE::TESObjectCELL))) {
@@ -1431,23 +1379,10 @@ namespace
         }
         for (std::uint32_t i = 0; i < count; ++i) {
             auto* ref = cell->references[i].get();
-            if (!ref || ref == player || !readable(ref, sizeof(RE::TESObjectREFR)) || ref->IsDisabled() || ref->IsDeleted()) {
-                continue;
-            }
+            if (!ref || ref == player || !readable(ref, sizeof(RE::TESObjectREFR)) || ref->IsDisabled() || ref->IsDeleted()) continue;
             auto* base = ref->GetObjectReference();
-            if (!base || !readable(base, sizeof(RE::TESForm)) || !accepts(pouchType, base)) {
-                continue;
-            }
-            bool ours = false;
-            for (const auto& v : g_vis) {
-                ours = ours || v.ref == ref->GetFormID();
-            }
-            for (std::size_t k = 1; k < g_shared.forms.size(); ++k) {
-                ours = ours || g_shared.forms[k] == base->GetFormID();
-            }
-            if (ours || !ref->Get3D()) {
-                continue;
-            }
+            if (!base || !readable(base, sizeof(RE::TESForm)) || !bagAccepts(base) || kindOfItem(base) != kEmpty) continue;
+            if (!ref->Get3D()) continue;
             const float d = distance(ref->GetPosition(), palm);
             if (d < bestDistance) {
                 bestDistance = d;
@@ -1457,107 +1392,282 @@ namespace
         return best;
     }
 
-    std::array<float, 6> poseAt(const RE::NiPoint3& p) noexcept
+    // Where a pouch held at `item` (mannequin space) would hang: the nearest point of an area it may hang on, turned
+    // with its back to the rig and its top up (or as the hand tilts it).
+    struct Snap
     {
-        return { p.x, p.y, p.z, 0.0f, 0.0f, 0.0f };
+        bool ok{ false };
+        int area{ -1 };
+        float gap{ 1.0e9f };
+        RE::NiTransform pose{};
+    };
+
+    Snap snapPouch(int kind, const RE::NiTransform& item) noexcept
+    {
+        Snap s;
+        RE::NiPoint3 bestPoint{}, bestNormal{};
+        const auto at = item.translate;
+        for (std::size_t a = 0; a < g_def.areas.size(); ++a) {
+            const auto& area = g_def.areas[a];
+            if (!(area.kinds & (1u << kind))) continue;
+            for (const auto& t : area.tris) {
+                const auto q = closestOnTriangle(at, t[0], t[1], t[2]);
+                const float d = distance(q, at);
+                if (d < s.gap) {
+                    s.gap = d;
+                    s.area = static_cast<int>(a);
+                    bestPoint = q;
+                    bestNormal = normalized(cross(t[1] - t[0], t[2] - t[0]));
+                }
+            }
+        }
+        if (s.area < 0 || length(bestNormal) < 0.5f) {
+            return s;
+        }
+        // out of the rig: away from the body's middle line
+        RE::NiPoint3 out = bestNormal;
+        if (dot(out, RE::NiPoint3{ bestPoint.x, bestPoint.y, 0.0f }) < 0.0f) {
+            out = out * -1.0f;
+        }
+        const RE::NiPoint3 worldUp{ 0.0f, 0.0f, 1.0f };
+        auto upright = normalized(worldUp - out * dot(worldUp, out));
+        auto tilted = row(item.rotate, 2);
+        tilted = normalized(tilted - out * dot(tilted, out));
+        RE::NiPoint3 up = upright;
+        if (length(tilted) > 0.5f && length(upright) > 0.5f && dot(tilted, upright) < std::cos(g_settings.upSnapDegrees * kDegrees)) {
+            up = tilted;
+        } else if (length(upright) < 0.5f) {
+            up = length(tilted) > 0.5f ? tilted : RE::NiPoint3{ 0.0f, 1.0f, 0.0f };
+        }
+        const auto right = normalized(cross(out, up));
+        up = cross(right, out);
+        s.pose = identity();
+        setRow(s.pose.rotate, 0, right);
+        setRow(s.pose.rotate, 1, out);
+        setRow(s.pose.rotate, 2, up);
+        s.pose.translate = bestPoint;
+        s.ok = s.gap < g_settings.snapRadius;
+        return s;
+    }
+
+    // ------------------------------------------------------------ state of the frame
+
+    struct State
+    {
+        std::array<Held, 2> held{};          // the pouch each hand holds (while gripping)
+        std::array<Clock::time_point, 2> gripAt{};
+        Clock::time_point packStart{};
+        int packHand{ -1 };
+        Clock::time_point holsterAt{};
+        RE::TESObjectWEAP* lastGun{ nullptr };
+        bool wearArmed{ true };
+        bool bodyLogged{ false };
+    } g_state;
+
+    // Items dropped from a pouch into a hand: a chem / food among them is used at the mouth.
+    struct InHand
+    {
+        std::uint32_t ref{ 0 };
+        std::int32_t  token{ 0 };
+        Clock::time_point at{};
+    };
+    std::vector<InHand> g_inHand;
+    std::int32_t g_nextToken{ 1000 };
+
+    void takeNewRefs() noexcept
+    {
+        std::vector<NewRef> refs;
+        {
+            std::scoped_lock guard(g_shared.lock);
+            refs.swap(g_shared.newRefs);
+        }
+        for (const auto& r : refs) {
+            for (auto& h : g_inHand) {
+                if (h.token == r.token) h.ref = r.ref;
+            }
+        }
+    }
+
+    void dropToHand(std::uint32_t form, const RE::NiPoint3& palm, Clock::time_point now) noexcept
+    {
+        PendingCommand c;
+        c.type = kDropToHand;
+        c.form = form;
+        c.pose = { palm.x, palm.y, palm.z, 0.0f, 0.0f, 0.0f };
+        c.token = g_nextToken++;
+        push(c);
+        g_inHand.push_back(InHand{ 0, c.token, now });
+    }
+
+    // the pouch whose middle is nearest the palm (palm in body space), within its reach
+    int nearestPouch(const RE::NiPoint3& palmBody, float scale = 1.0f) noexcept
+    {
+        int best = -1;
+        float bestRatio = 1.0f;
+        for (std::size_t i = 0; i < g_rig.pouches.size(); ++i) {
+            const auto& p = g_rig.pouches[i];
+            const float ratio = distance(pouchMiddle(p), palmBody) / (reachOf(p.kind) * scale);
+            if (ratio < bestRatio) {
+                bestRatio = ratio;
+                best = static_cast<int>(i);
+            }
+        }
+        return best;
+    }
+
+    // the palm in body space for a holder (mannequin root, or the body through the pelvis bone)
+    bool palmInBody(const Holder& h, const RE::NiPoint3& palm, RE::NiPoint3& out) noexcept
+    {
+        if (!h.body) {
+            out = toLocal(h.root->world, palm);
+            return true;
+        }
+        auto* pelvis = h.parentFor("Pelvis");
+        const auto it = g_def.binds.find("Pelvis");
+        if (!pelvis || it == g_def.binds.end()) {
+            return false;
+        }
+        // body space = pelvis world composed with the inverse of its bind
+        const auto bodyWorld = compose(pelvis->world, relative(it->second, identity()));
+        out = toLocal(bodyWorld, palm);
+        return true;
     }
 
     // ------------------------------------------------------------ at the mannequin
 
-    void atMannequin(RE::PlayerCharacter* player, RE::TESObjectREFR* mannequin, Clock::time_point now, bool interact) noexcept
+    void atMannequin(RE::PlayerCharacter* player, const Holder& h, Clock::time_point now, bool interact) noexcept
     {
         auto& st = g_state;
-        const auto f = mannequinFrames(mannequin);
-        const bool rigHere = !g_rig.worn;
-
-        // the shelf: one of each pouch you carry and have not hung up
-        for (int t = 1; t <= kPouchTypes; ++t) {
-            const auto have = typeEnabled(t) ? inventoryCount(player, g_shared.forms[t]) : 0u;
-            const bool inHand = st.heldType == t;
-            if (have > (inHand ? 1u : 0u)) {
-                want(kVisTray + t - 1, kStatPouch0 + t, trayPose(f, t - 1));
-            } else {
-                hideVisual(kVisTray + t - 1);
-            }
-        }
+        const bool rigHere = g_rig.rigOn && !g_rig.worn;
         if (rigHere) {
-            want(kVisRig, kStatRig, uprightTransform(mannequin->GetPosition(), f.belt.yaw));
+            drawRig(h);
+            for (const auto& p : g_rig.pouches) drawPouch(h, p);
         }
+        if (!interact) {
+            return;
+        }
+        const auto& manWorld = h.root->world;
+        bool areasShown = false;
+        // both palms on the mannequin's shoulders: that is putting the rig on / off, not taking a pouch
+        const RE::NiPoint3 right{ g_settings.shoulderX, g_settings.shoulderY, g_settings.shoulderZ };
+        const RE::NiPoint3 left{ -g_settings.shoulderX, g_settings.shoulderY, g_settings.shoulderZ };
+        RE::NiPoint3 p0, p1;
+        const bool palms = g_hands[0].valid && g_hands[1].valid && palmInBody(h, g_hands[0].palm, p0) && palmInBody(h, g_hands[1].palm, p1);
+        const float r = g_settings.wearRadius;
+        const bool atShoulders = palms && ((distance(p0, right) < r && distance(p1, left) < r) || (distance(p0, left) < r && distance(p1, right) < r));
 
-        RE::NiTransform cursorPose{};
-        bool cursor = false;
+        for (int hi = 0; hi < 2; ++hi) {
+            const auto& hand = g_hands[hi];
+            if (!hand.valid) continue;
+            RE::NiPoint3 palm;
+            palmInBody(h, hand.palm, palm);
 
-        for (int h = 0; h < 2; ++h) {
-            const auto& hand = g_hands[h];
-            if (!hand.valid || !interact) {
-                continue;
-            }
-            // a pouch in this hand
-            if (st.heldType != kEmpty && st.heldHand == h) {
-                const int slot = rigHere ? nearestSlot(f, hand.palm, false, g_settings.slotRadius * 1.5f) : -1;
-                if (slot >= 0) {
-                    cursor = true;
-                    cursorPose = slotPose(f, slot);
+            // a pouch (or the rig) in this hand
+            if (hand.grip || hand.released()) {
+                if (hand.grip) {
+                    st.held[hi] = heldBy(player, hand.palm);
+                }
+                const auto& held = st.held[hi];
+                if (held.ref && held.kind >= 1 && held.kind <= kKinds && rigHere) {
+                    const auto itemLocal = relative(manWorld, held.world);
+                    const auto snap = snapPouch(held.kind, itemLocal);
+                    const bool nearRig = distance(itemLocal.translate, RE::NiPoint3{ 0.0f, 0.0f, 85.0f }) < g_settings.showAreas;
+                    const bool full = static_cast<int>(g_rig.pouches.size()) >= kMaxPouches;
+                    if (nearRig && !areasShown && !full) {
+                        areasShown = true;
+                        for (const auto& area : g_def.areas) {
+                            if ((area.kinds & (1u << held.kind)) && !area.highlight.empty()) {
+                                show(acquire(area.highlight), h.root, identity());
+                            }
+                        }
+                    }
+                    if (snap.ok && !full) {
+                        Pouch preview;
+                        preview.kind = held.kind;
+                        preview.area = snap.area;
+                        preview.pose = snap.pose;
+                        drawPouch(h, preview);
+                        if (hand.released()) {
+                            g_rig.pouches.push_back(preview);
+                            pushSimple(kDelete, held.ref);
+                            sound(0);
+                            buzz(hi, 2500);
+                            note("%s hung on %s at %.1f %.1f %.1f", kKindNames[held.kind], g_def.areas[snap.area].name.c_str(),
+                                snap.pose.translate.x, snap.pose.translate.y, snap.pose.translate.z);
+                            markDirty();
+                            st.held[hi] = Held{};
+                        }
+                    } else if (hand.released() && full && nearRig) {
+                        hud("На разгрузке больше нет места");
+                    }
+                } else if (held.ref && held.kind == kRigItem && !g_rig.rigOn && hand.released()) {
+                    // the rig item let go at the mannequin's body: it hangs on it
+                    const auto itemLocal = relative(manWorld, held.world);
+                    if (distance(itemLocal.translate, RE::NiPoint3{ 0.0f, 0.0f, 88.0f }) < 30.0f) {
+                        g_rig.rigOn = true;
+                        g_rig.worn = false;
+                        pushSimple(kDelete, held.ref);
+                        sound(0);
+                        buzz(hi, 2500);
+                        hud("Разгрузка на манекене");
+                        note("Rig hung on the mannequin");
+                        markDirty();
+                    }
                 }
                 if (hand.released()) {
-                    if (slot >= 0) {
-                        g_rig.slots[slot] = Pouch{};
-                        g_rig.slots[slot].type = st.heldType;
-                        pushSimple(kTakeItem, 0, g_shared.forms[st.heldType]);
-                        sound(0);
-                        buzz(h, 2500);
-                        note("Pouch type %d hung on place %d", st.heldType, slot);
-                        markDirty();
-                    } else {
-                        sound(1);
-                    }
-                    st.heldType = kEmpty;
-                    st.heldHand = -1;
+                    st.held[hi] = Held{};
                 }
+                if (!hand.pressed()) {
+                    continue;
+                }
+            }
+
+            if (!hand.pressed() || st.held[hi].ref || atShoulders) {
                 continue;
             }
-            if (!hand.pressed()) {
-                continue;
-            }
-            // a pouch off the mannequin
+            // an empty hand grips a pouch on the mannequin: it comes off into the hand
             if (rigHere) {
-                const int slot = nearestSlot(f, hand.palm, true, g_settings.slotRadius);
-                if (slot >= 0 && st.heldType == kEmpty) {
-                    st.heldType = g_rig.slots[slot].type;
-                    st.heldHand = h;
-                    g_rig.slots[slot] = Pouch{};
-                    pushSimple(kGiveItem, 0, g_shared.forms[st.heldType]);
+                const int index = nearestPouch(palm);
+                if (index >= 0) {
+                    const auto pouch = g_rig.pouches[index];
+                    // what it held stays in the inventory; a holstered gun stays there too
+                    g_rig.pouches.erase(g_rig.pouches.begin() + index);
+                    if (const auto form = g_shared.forms[pouch.kind]) {
+                        pushSimple(kGiveItem, 0, form);
+                        dropToHand(form, hand.palm, now);
+                    }
                     sound(1);
-                    buzz(h, 1500);
+                    buzz(hi, 1500);
+                    hud(kindTitle(pouch.kind));
+                    note("%s taken off the rig", kKindNames[pouch.kind]);
                     markDirty();
                     continue;
                 }
             }
-            // a pouch from the shelf
-            bool took = false;
-            for (int t = 1; t <= kPouchTypes && !took; ++t) {
-                if (st.heldType != kEmpty || !g_vis[kVisTray + t - 1].show) {
-                    continue;
-                }
-                if (distance(trayPose(f, t - 1).translate, hand.palm) < g_settings.slotRadius) {
-                    st.heldType = t;
-                    st.heldHand = h;
-                    sound(1);
-                    buzz(h, 1500);
-                    hud(pouchName(t));
-                    took = true;
-                }
-            }
-            if (took) {
-                continue;
-            }
             // fold the mannequin up: hold the grip on its head
-            const auto head = f.chest.at(0.0f, -2.0f, 14.0f);   // just above the mannequin's neck
-            if (distance(head, hand.palm) < 10.0f) {
+            const RE::NiPoint3 head{ 0.0f, g_settings.shoulderY, g_settings.headZ };
+            if (distance(head, palm) < 10.0f) {
                 st.packStart = now;
-                st.packHand = h;
+                st.packHand = hi;
                 hud("Держи грип, чтобы сложить манекен");
                 continue;
+            }
+            // an empty hand grips the bare rig (no pouches on it): the rig comes off into the hand
+            if (rigHere && palm.z > 64.0f && palm.z < 84.0f && std::sqrt(palm.x * palm.x + palm.y * palm.y) < 22.0f) {
+                if (!g_rig.pouches.empty()) {
+                    // only say so once the hand is really on the rig, not reaching past it
+                    continue;
+                }
+                if (const auto form = g_shared.forms[kRigItem]) {
+                    g_rig.rigOn = false;
+                    pushSimple(kGiveItem, 0, form);
+                    dropToHand(form, hand.palm, now);
+                    sound(1);
+                    buzz(hi, 1500);
+                    hud("Разгрузка снята с манекена");
+                    note("Rig taken off the mannequin");
+                    markDirty();
+                }
             }
         }
 
@@ -1582,21 +1692,16 @@ namespace
         }
 
         // put the rig on / hang it back: both hands take the mannequin by the shoulders, both grips at once
-        const auto leftShoulder = f.chest.at(-10.0f, -2.0f, 6.0f);
-        const auto rightShoulder = f.chest.at(10.0f, -2.0f, 6.0f);
+        if (!g_rig.rigOn) {
+            return;
+        }
         const bool both = g_hands[0].grip && g_hands[1].grip;
         if (!both) {
             st.wearArmed = true;
+            return;
         }
-        const auto atShoulders = [&]() {
-            const float r = g_settings.wearRadius;
-            const auto& p0 = g_hands[0].palm;
-            const auto& p1 = g_hands[1].palm;
-            return (distance(p0, rightShoulder) < r && distance(p1, leftShoulder) < r) ||
-                   (distance(p0, leftShoulder) < r && distance(p1, rightShoulder) < r);
-        };
         const auto apart = st.gripAt[0] > st.gripAt[1] ? st.gripAt[0] - st.gripAt[1] : st.gripAt[1] - st.gripAt[0];
-        if (interact && both && st.wearArmed && st.heldType == kEmpty && atShoulders() &&
+        if (st.wearArmed && atShoulders && !st.held[0].ref && !st.held[1].ref &&
             std::chrono::duration<float>(apart).count() < g_settings.wearWindow) {
             st.wearArmed = false;
             g_rig.worn = !g_rig.worn;
@@ -1604,81 +1709,42 @@ namespace
             buzz(0, 3000);
             buzz(1, 3000);
             hud(g_rig.worn ? "Разгрузка надета" : "Разгрузка снята и висит на манекене");
-            note(g_rig.worn ? "Rig put on" : "Rig taken off");
+            note(g_rig.worn ? "Rig put on" : "Rig hung back on the mannequin");
             markDirty();
-            return;
-        }
-
-        // free places
-        for (int i = 0; i < kSlots; ++i) {
-            if (rigHere && g_rig.slots[i].type == kEmpty && st.heldType != kEmpty && g_places[i].group >= 0) {
-                want(kVisGhost + i, kStatGhost, slotPose(f, i));
-            } else {
-                hideVisual(kVisGhost + i);
-            }
-        }
-        if (cursor) {
-            want(kVisCursor, kStatCursor, cursorPose);
-        } else {
-            hideVisual(kVisCursor);
-        }
-        if (rigHere) {
-            for (int i = 0; i < kSlots; ++i) {
-                const int type = g_rig.slots[i].type;
-                if (type != kEmpty) {
-                    want(kVisPouch + i, kStatPouch0 + type, slotPose(f, i));
-                } else {
-                    hideVisual(kVisPouch + i);
-                }
-            }
         }
     }
 
     // ------------------------------------------------------------ on the body
 
-    void onBody(RE::PlayerCharacter* player, RE::TESObjectREFR* mannequin, Clock::time_point now) noexcept
+    void onBody(RE::PlayerCharacter* player, const Holder& h, Clock::time_point now) noexcept
     {
         auto& st = g_state;
-        const auto f = bodyFrames(player);
-        (void)mannequin;
-
-        for (int i = 0; i < kSlots; ++i) {
-            const int type = g_rig.slots[i].type;
-            if (type != kEmpty && g_settings.showPouchesOnBody) {
-                want(kVisPouch + i, kStatPouch0 + type, slotPose(f, i));
-            } else {
-                hideVisual(kVisPouch + i);
-            }
-        }
-        if (g_settings.showRigOnBody) {
-            const auto feetish = RE::NiPoint3{ f.belt.origin.x, f.belt.origin.y, f.belt.origin.z - g_settings.beltHeight };
-            want(kVisRig, kStatRig, uprightTransform(feetish, f.belt.yaw));
-        } else {
-            hideVisual(kVisRig);
+        drawRig(h);
+        for (const auto& p : g_rig.pouches) drawPouch(h, p);
+        if (!st.bodyLogged) {
+            st.bodyLogged = true;
+            auto* pelvis = h.parentFor("Pelvis");
+            auto* spine = h.parentFor("SPINE2");
+            note("Body: skeleton %s, Pelvis %s, SPINE2 %s", h.skeleton ? h.skeleton->name.c_str() : "-", pelvis ? "found" : "MISSING",
+                spine ? "found" : "MISSING");
         }
 
         auto* gunNow = equippedGun(player);
         auto* gun = gunNow ? gunNow : st.lastGun;   // let go this frame: ROCK may already have dropped it
         st.lastGun = gunNow;
         const bool cooling = std::chrono::duration<float>(now - st.holsterAt).count() < g_settings.holsterCooldown;
-        RE::NiTransform cursorPose{};
-        bool cursor = false;
 
-        for (int h = 0; h < 2; ++h) {
-            const auto& hand = g_hands[h];
-            st.hover[h] = -1;
-            if (!hand.valid) {
-                continue;
-            }
-            const int slot = nearestSlot(f, hand.palm, true, g_settings.slotRadius);
-            st.hover[h] = slot;
-            if (slot < 0) {
-                continue;
-            }
-            auto& pouch = g_rig.slots[slot];
-            const bool gunHand = h == g_settings.gunHand;
+        for (int hi = 0; hi < 2; ++hi) {
+            const auto& hand = g_hands[hi];
+            if (!hand.valid) continue;
+            RE::NiPoint3 palm;
+            if (!palmInBody(h, hand.palm, palm)) continue;
+            const int index = nearestPouch(palm);
+            if (index < 0) continue;
+            auto& pouch = g_rig.pouches[index];
+            const bool gunHand = hi == g_settings.gunHand;
+            const bool gunPlace = pouch.kind == kHolster || pouch.kind == kSling;
 
-            const bool gunPlace = pouch.type == kHolster || pouch.type == kSling;
             if (gunPlace && gunHand) {
                 // holster: let go of (or press) the grip with a gun at an empty holster to put it away
                 if (gun && pouch.total() == 0 && (hand.released() || (gunNow && hand.pressed())) && !cooling) {
@@ -1686,20 +1752,20 @@ namespace
                     pushSimple(kUnequip, 0, gun->GetFormID());
                     st.holsterAt = now;
                     st.lastGun = nullptr;
-                    hud(pouch.type == kSling ? "Оружие за спиной" : "Оружие в кобуре");
+                    hud(pouch.kind == kSling ? "Оружие в держателе" : "Оружие в кобуре");
                     sound(0);
-                    buzz(h, 2500);
+                    buzz(hi, 2500);
                     markDirty();
                     continue;
                 }
                 // ..and grip at a full holster with an empty hand to draw it
                 if (!gunNow && pouch.total() > 0 && hand.pressed() && !cooling) {
                     const auto form = pouch.items[0].form;
-                    pouch = Pouch{ pouch.type };
+                    pouch.items = {};
                     if (inventoryCount(player, form) > 0) {
                         pushSimple(kEquip, 0, form);
                         sound(1);
-                        buzz(h, 2000);
+                        buzz(hi, 2000);
                     } else {
                         hud("Этого оружия у тебя больше нет");
                     }
@@ -1707,63 +1773,39 @@ namespace
                     markDirty();
                     continue;
                 }
+                continue;
             }
-
-            cursor = cursor || hand.grip;
-            if (cursor && hand.grip) {
-                cursorPose = slotPose(f, slot);
+            if (pouch.kind != kDump) {
+                // magazine pouches hand out magazines with ManualReloadF (next stage)
+                if (hand.pressed()) buzz(hi, 400);
+                continue;
             }
-
-            // let go of an item over a pouch: it goes in
-            if (hand.released() && !gunPlace) {
-                if (auto* ref = looseItemNear(player, hand.palm, pouch.type)) {
+            // the bag: let go of an item in it and it goes in, grip in it with an empty hand to take the last one out
+            if (hand.released()) {
+                if (auto* ref = looseItemNear(player, hand.palm)) {
                     auto* base = ref->GetObjectReference();
                     if (addToPouch(pouch, base->GetFormID())) {
                         pushSimple(kStoreRef, ref->GetFormID());
                         char text[200]{};
                         const auto name = RE::TESFullName::GetFullName(*base);
-                        std::snprintf(text, sizeof(text), "%s: %.*s (%d/%d)", pouchName(pouch.type), static_cast<int>(name.size()), name.data(),
-                            pouch.total(), capacityOf(pouch.type));
+                        std::snprintf(text, sizeof(text), "Сумка: %.*s (%d/%d)", static_cast<int>(name.size()), name.data(), pouch.total(),
+                            capacityOf(pouch.kind));
                         hud(text);
                         sound(3);
-                        buzz(h, 1500);
+                        buzz(hi, 1500);
                         markDirty();
-                        detail("Item %08X (%08X) into pouch %d", ref->GetFormID(), base->GetFormID(), slot);
                     } else {
-                        hud("Подсумок полон");
+                        hud("Сумка полна");
                     }
                 }
                 continue;
             }
-
-            if (!hand.pressed()) {
-                continue;
-            }
-            if (gunPlace) {
-                // a loose gun let go of over the holster is taken above; with the gun hand busy nothing else to do
-                continue;
-            }
-            if (pouch.type == kMag) {
-                // ManualReloadF hands out magazines at the belt by itself; this pouch only keeps the ones you put in
-                if (pouch.total() == 0) {
-                    buzz(h, 500);
-                    continue;
-                }
-            }
+            if (!hand.pressed()) continue;
             const auto form = takeFromPouch(pouch, player);
             if (!form) {
-                buzz(h, 400);
+                buzz(hi, 400);
                 hud("Пусто");
                 markDirty();
-                continue;
-            }
-            if (pouch.type == kGrenade) {
-                pushSimple(kEquip, 0, form);
-                hud("Граната выбрана");
-                sound(1);
-                buzz(h, 1500);
-                // the grenade stays in the pouch as a reservation: put it back
-                addToPouch(pouch, form);
                 continue;
             }
             if (auto* item = lookupForm(form)) {
@@ -1772,23 +1814,11 @@ namespace
                 std::snprintf(text, sizeof(text), "%.*s (осталось %d)", static_cast<int>(name.size()), name.data(), pouch.total());
                 hud(text);
             }
-            PendingCommand c;
-            c.type = kDropToHand;
-            c.form = form;
-            c.pose = poseAt(hand.palm);
-            c.token = g_nextToken++;
-            push(c);
-            g_inHand.push_back(InHand{ 0, c.token, now });
+            dropToHand(form, hand.palm, now);
             sound(1);
-            buzz(h, 1500);
+            buzz(hi, 1500);
             markDirty();
         }
-        if (cursor) {
-            want(kVisCursor, kStatCursor, cursorPose);
-        } else {
-            hideVisual(kVisCursor);
-        }
-
     }
 
     // A chem or food from a pouch brought to the mouth is used.
@@ -1864,7 +1894,6 @@ namespace
             }
             if (arrived) {
                 loadState(incoming);
-                forgetVisuals();
                 g_state = State{};
                 g_inHand.clear();
             }
@@ -1877,24 +1906,12 @@ namespace
                     g_rig.mannequin = mannequin;
                 }
                 note("Mannequin set up: %08X", mannequin);
-                hud("Манекен поставлен. Бери подсумки с полки справа от него");
+                hud(g_rig.rigOn && !g_rig.worn ? "Манекен поставлен, разгрузка на нём" : "Манекен поставлен");
                 markDirty();
             }
         }
-        if (!g_rigLoaded) {
+        if (!g_rigLoaded || !g_def.loaded) {
             return;
-        }
-        if (!g_tidied) {
-            tidyPlaces();
-            // every pouch that has a model now: one of each for a game that has none (on the rig or carried)
-            for (int t : { kMag, kHolster, kDump, kSling }) {
-                bool hung = false;
-                for (const auto& p : g_rig.slots) hung = hung || p.type == t;
-                if (!hung && g_state.heldType != t && g_shared.forms[t] && inventoryCount(player, g_shared.forms[t]) == 0) {
-                    pushSimple(kGiveItem, 0, g_shared.forms[t]);
-                    note("Pouch type %d given (the game had none)", t);
-                }
-            }
         }
         takeNewRefs();
         readHand(0);
@@ -1905,42 +1922,33 @@ namespace
             }
         }
 
-        if (menuOpen()) {
-            for (int i = 0; i < kVisuals; ++i) {
-                if (i >= kVisTray) hideVisual(i);
-            }
-            updateVisuals(player, now);
-            return;
-        }
+        beginFrameModels();
+        const bool menu = menuOpen();
 
         auto* mannequin = lookupRef(g_rig.mannequin);
         if (mannequin && (mannequin->IsDeleted() || mannequin->IsDisabled())) {
             mannequin = nullptr;
         }
-        const float mannequinDistance = mannequin && mannequin->Get3D() ? distance(mannequin->GetPosition(), player->GetPosition()) : 1.0e9f;
-        const bool mannequinNear = mannequinDistance < g_settings.mannequinReach;
-        const bool mannequinSeen = mannequinDistance < std::max(g_settings.mannequinDraw, g_settings.mannequinReach);
-
-        for (int i = 0; i < kVisuals; ++i) {
-            g_vis[i].show = false;
+        if (mannequin) {
+            const auto holder = mannequinHolder(mannequin);
+            if (holder.valid) {
+                const bool near = distance(mannequin->GetPosition(), player->GetPosition()) < g_settings.mannequinReach;
+                atMannequin(player, holder, now, near && !menu);
+            }
         }
-        if (mannequinSeen) {
-            atMannequin(player, mannequin, now, mannequinNear);
+        if (g_rig.rigOn && g_rig.worn) {
+            const auto holder = bodyHolder(player);
+            if (holder.valid) {
+                if (menu) {
+                    drawRig(holder);
+                    for (const auto& p : g_rig.pouches) drawPouch(holder, p);
+                } else {
+                    onBody(player, holder, now);
+                }
+            }
         }
-        if (!mannequinNear && g_state.heldType != kEmpty) {
-            g_state.heldType = kEmpty;   // walked away with it: it is back in the inventory anyway
-            g_state.heldHand = -1;
-        }
-        if (g_rig.worn) {
-            onBody(player, mannequinNear ? mannequin : nullptr, now);
-        }
-        if (g_state.heldType != kEmpty && g_state.heldHand >= 0 && g_hands[g_state.heldHand].valid) {
-            const auto& hand = g_hands[g_state.heldHand];
-            const float yaw = player->data.angle.z;
-            want(kVisHeld, kStatPouch0 + g_state.heldType, uprightTransform(hand.palm - RE::NiPoint3{ 0.0f, 0.0f, 2.0f }, yaw));
-        }
+        endFrameModels();
         checkMouth(player, now);
-        updateVisuals(player, now);
 
         if (g_dirty && now - g_lastSave > std::chrono::milliseconds(500)) {
             g_dirty = false;
@@ -1969,7 +1977,6 @@ namespace
         static bool done = false;
         if (!done) {
             done = true;
-            applyKindModels();
             const int error = FRIKApiV2::initialize(3);
             if (error != 0) {
                 note("FRIK API v2.3+ unavailable (error %d); RigVR cannot run", error);
@@ -1988,11 +1995,10 @@ namespace
             g_vr = get ? static_cast<vr::IVRSystem*>(get(vr::IVRSystem_Version, &error)) : nullptr;
             logNote(g_vr ? "OpenVR ready" : "OpenVR not found: buttons cannot be read");
         }
-        // a loaded save: the script deletes the drawn objects of the last session and sends the rig again
-        forgetVisuals();
+        // a loaded save: the nodes the models hung on are gone; the script sends the rig again
+        detachAllModels();
         g_state = State{};
         g_inHand.clear();
-        g_bonesLogged = false;
         logNote("RigVR ready (build " RIGVR_BUILD ")");
     }
 }
@@ -2012,6 +2018,7 @@ namespace rigvr::runtime
     void onLoad() noexcept
     {
         loadSettings();
+        loadRigFile();
         const auto* papyrus = F4SE::GetPapyrusInterface();
         if (!papyrus || !papyrus->Register(registerNatives)) {
             logWarning("Could not register Papyrus functions; RigVR cannot work");

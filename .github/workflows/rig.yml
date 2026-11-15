@@ -90,6 +90,8 @@ jobs:
           New-Item -ItemType Directory -Force $plugins | Out-Null
           Copy-Item build\Release\RigVR.dll $plugins
           Copy-Item rig\RigVR.ini $plugins
+          New-Item -ItemType Directory -Force "$plugins\RigVR\Rigs" | Out-Null
+          Copy-Item rig\data\RigBase.txt "$plugins\RigVR\Rigs"
           python rig\tools\build_esp.py package\RigVR.esp
           python rig\tools\build_models.py package
           Copy-Item rig\README.md package\RigVR-README.md
