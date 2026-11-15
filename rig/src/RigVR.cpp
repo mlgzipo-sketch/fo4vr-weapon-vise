@@ -158,6 +158,7 @@ namespace
         float backRadius{ 16.0f };     // ..and this close to a gun place on the back (you cannot see it)
         float holsterRadius{ 12.0f };  // ..and this close to a holster
         float mannequinReach{ 150.0f };// the mannequin is used within this distance
+        float mannequinDraw{ 1500.0f };// ..and its pouches and shelf are drawn within this one
         float wearRadius{ 12.0f };     // both hands this close to the mannequin's shoulders to put the rig on / hang it back
         float wearWindow{ 0.5f };      // ..both grips pressed within this many seconds
         float packSeconds{ 1.5f };     // hold the grip on the mannequin's head this long to fold it up
@@ -218,7 +219,7 @@ namespace
         auto& s = g_settings;
         const Entry entries[]{
             { "iGunHand", 1, &s.gunHand }, { "iGripButton", 1, &s.gripButton }, { "bHaptics", 0, &s.haptics },
-            { "bMessages", 0, &s.messages }, { "fSlotRadius", 2, &s.slotRadius }, { "fBackRadius", 2, &s.backRadius }, { "fHolsterRadius", 2, &s.holsterRadius }, { "fMannequinReach", 2, &s.mannequinReach },
+            { "bMessages", 0, &s.messages }, { "fSlotRadius", 2, &s.slotRadius }, { "fBackRadius", 2, &s.backRadius }, { "fHolsterRadius", 2, &s.holsterRadius }, { "fMannequinReach", 2, &s.mannequinReach }, { "fMannequinDraw", 2, &s.mannequinDraw },
             { "fWearRadius", 2, &s.wearRadius }, { "fWearWindow", 2, &s.wearWindow }, { "fPackSeconds", 2, &s.packSeconds },
             { "fStoreRadius", 2, &s.storeRadius }, { "fMouthRadius", 2, &s.mouthRadius }, { "fHolsterCooldown", 2, &s.holsterCooldown },
             { "fBeltHeight", 2, &s.beltHeight }, { "fChestHeight", 2, &s.chestHeight }, { "fBeltUp", 2, &s.beltUp },
@@ -442,43 +443,77 @@ namespace
 
     // Places a reference's 3D: the root at `world` (local too, so the engine keeps it), children follow,
     // bounds move along and the nodes above are made to reach it (or it is culled with them).
+    // World bounds from the shapes' own model bounds (post-order), so the renderer culls the model where it is now.
+    // (Moving the old bounds along was not enough: a model the game had not bounded yet kept a stale or empty sphere
+    // and popped in and out as the view turned or the player came closer.)
+    RE::NiBound recomputeBound(RE::NiAVObject* object, int depth = 0) noexcept
+    {
+        RE::NiBound out{};
+        out.center = object->world.translate;
+        out.fRadius = 0.0f;
+        if (auto* geometry = object->IsGeometry()) {
+            const auto& model = geometry->GetRuntimeData().modelBound;
+            if (model.fRadius > 0.0f && model.fRadius < 5000.0f) {
+                out.center = compose(object->world, pointTransform(model.center)).translate;
+                out.fRadius = model.fRadius * object->world.scale;
+            } else {
+                out.fRadius = 50.0f;
+            }
+        } else if (auto* node = object->IsNode(); node && depth < 40) {
+            auto& children = node->GetRuntimeData().children;
+            const auto count = children.size();
+            std::vector<RE::NiBound> parts;
+            for (std::uint16_t i = 0; i < count && i < 256; ++i) {
+                auto* child = children[i].get();
+                if (!looksLikeObject(child)) {
+                    continue;
+                }
+                const auto b = recomputeBound(child, depth + 1);
+                if (b.fRadius > 0.0f) {
+                    parts.push_back(b);
+                }
+            }
+            if (!parts.empty()) {
+                RE::NiPoint3 c{};
+                for (const auto& b : parts) c += b.center;
+                c = c * (1.0f / static_cast<float>(parts.size()));
+                float r = 0.0f;
+                for (const auto& b : parts) r = std::max(r, distance(c, b.center) + b.fRadius);
+                out.center = c;
+                out.fRadius = r;
+            }
+        }
+        object->worldBound = out;
+        return out;
+    }
+
     void place3D(RE::NiAVObject* root, const RE::NiTransform& world) noexcept
     {
         if (!looksLikeObject(root)) {
             return;
         }
-        const auto moveBound = [](RE::NiAVObject* object, const RE::NiTransform& before) {
-            auto& bound = object->worldBound;
-            if (bound.fRadius > 0.0f && bound.fRadius < 1000.0f) {
-                const auto local = relative(before, pointTransform(bound.center)).translate;
-                bound.center = compose(object->world, pointTransform(local)).translate;
-            }
-        };
         auto* parent = root->parent;
         if (looksLikeObject(parent)) {
             root->local = relative(parent->world, world);
         } else {
             root->local = world;
         }
-        const auto rootBefore = root->world;
         root->world = world;
-        moveBound(root, rootBefore);
         forEachNode(root, [&](RE::NiAVObject* object, int depth) {
             if (depth == 0) {
                 return true;
             }
             if (auto* up = object->parent; looksLikeObject(up)) {
-                const auto before = object->world;
                 object->world = compose(up->world, object->local);
-                moveBound(object, before);
             }
             return true;
         });
-        const float reach = root->worldBound.fRadius > 0.0f && root->worldBound.fRadius < 1000.0f ? root->worldBound.fRadius : 20.0f;
+        const auto rootBound = recomputeBound(root);
+        const float reach = rootBound.fRadius > 0.0f && rootBound.fRadius < 1000.0f ? rootBound.fRadius : 20.0f;
         RE::NiAVObject* up = root->parent;
         for (int i = 0; i < 8 && looksLikeObject(up); ++i) {
             auto& bound = up->worldBound;
-            const float needed = distance(bound.center, world.translate) + reach;
+            const float needed = distance(bound.center, rootBound.center) + reach;
             if (bound.fRadius > 0.0f && bound.fRadius < needed && needed < 20000.0f) {
                 bound.fRadius = needed;
             }
@@ -1429,7 +1464,7 @@ namespace
 
     // ------------------------------------------------------------ at the mannequin
 
-    void atMannequin(RE::PlayerCharacter* player, RE::TESObjectREFR* mannequin, Clock::time_point now) noexcept
+    void atMannequin(RE::PlayerCharacter* player, RE::TESObjectREFR* mannequin, Clock::time_point now, bool interact) noexcept
     {
         auto& st = g_state;
         const auto f = mannequinFrames(mannequin);
@@ -1454,7 +1489,7 @@ namespace
 
         for (int h = 0; h < 2; ++h) {
             const auto& hand = g_hands[h];
-            if (!hand.valid) {
+            if (!hand.valid || !interact) {
                 continue;
             }
             // a pouch in this hand
@@ -1561,7 +1596,7 @@ namespace
                    (distance(p0, leftShoulder) < r && distance(p1, rightShoulder) < r);
         };
         const auto apart = st.gripAt[0] > st.gripAt[1] ? st.gripAt[0] - st.gripAt[1] : st.gripAt[1] - st.gripAt[0];
-        if (both && st.wearArmed && st.heldType == kEmpty && atShoulders() &&
+        if (interact && both && st.wearArmed && st.heldType == kEmpty && atShoulders() &&
             std::chrono::duration<float>(apart).count() < g_settings.wearWindow) {
             st.wearArmed = false;
             g_rig.worn = !g_rig.worn;
@@ -1849,7 +1884,18 @@ namespace
         if (!g_rigLoaded) {
             return;
         }
-        tidyPlaces();
+        if (!g_tidied) {
+            tidyPlaces();
+            // every pouch that has a model now: one of each for a game that has none (on the rig or carried)
+            for (int t : { kMag, kHolster, kDump, kSling }) {
+                bool hung = false;
+                for (const auto& p : g_rig.slots) hung = hung || p.type == t;
+                if (!hung && g_state.heldType != t && g_shared.forms[t] && inventoryCount(player, g_shared.forms[t]) == 0) {
+                    pushSimple(kGiveItem, 0, g_shared.forms[t]);
+                    note("Pouch type %d given (the game had none)", t);
+                }
+            }
+        }
         takeNewRefs();
         readHand(0);
         readHand(1);
@@ -1871,14 +1917,17 @@ namespace
         if (mannequin && (mannequin->IsDeleted() || mannequin->IsDisabled())) {
             mannequin = nullptr;
         }
-        const bool mannequinNear = mannequin && mannequin->Get3D() && distance(mannequin->GetPosition(), player->GetPosition()) < g_settings.mannequinReach;
+        const float mannequinDistance = mannequin && mannequin->Get3D() ? distance(mannequin->GetPosition(), player->GetPosition()) : 1.0e9f;
+        const bool mannequinNear = mannequinDistance < g_settings.mannequinReach;
+        const bool mannequinSeen = mannequinDistance < std::max(g_settings.mannequinDraw, g_settings.mannequinReach);
 
         for (int i = 0; i < kVisuals; ++i) {
             g_vis[i].show = false;
         }
-        if (mannequinNear) {
-            atMannequin(player, mannequin, now);
-        } else if (g_state.heldType != kEmpty) {
+        if (mannequinSeen) {
+            atMannequin(player, mannequin, now, mannequinNear);
+        }
+        if (!mannequinNear && g_state.heldType != kEmpty) {
             g_state.heldType = kEmpty;   // walked away with it: it is back in the inventory anyway
             g_state.heldHand = -1;
         }
