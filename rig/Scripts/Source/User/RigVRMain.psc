@@ -215,8 +215,18 @@ Function Recollect(Form f, int want)
 	Actor player = Game.GetPlayer()
 	int tries = 0
 	while tries < 6 && player.GetItemCount(f) < want
-		ObjectReference r = Game.FindClosestReferenceOfTypeFromRef(f, player, 200.0)
-		if r && !r.IsDisabled() && !r.IsDeleted()
+		ObjectReference[] near = player.FindAllReferencesOfType(f, 200.0)
+		ObjectReference r = None
+		float best = 1000.0
+		int i = 0
+		while near && i < near.Length
+			if near[i] && !near[i].IsDisabled() && !near[i].IsDeleted() && player.GetDistance(near[i]) < best
+				r = near[i]
+				best = player.GetDistance(near[i])
+			endif
+			i += 1
+		endwhile
+		if r
 			player.AddItem(r, 1, true)
 		endif
 		Utility.Wait(0.15)
