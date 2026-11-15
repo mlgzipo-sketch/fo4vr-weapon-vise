@@ -1953,7 +1953,7 @@ namespace
         g.seen = true;
     }
 
-    // Shows the gun just put into pouch `index`: the copy of it, hung as it was let go (carbine holder) or straight.
+    // Shows the gun just put into pouch `index`: the copy of it, hung as it was let go.
     void keepGunVisual(const Holder& h, int index, std::uint32_t form) noexcept
     {
         if (index < 0 || index >= static_cast<int>(g_gunVisuals.size())) {
@@ -1980,7 +1980,7 @@ namespace
         g.source = nullptr;
         const auto& p = g_rig.pouches[index];
         v.inPouch = fixedGunPose(p.kind);
-        if (p.kind == kSling) {
+        {
             const auto& bone = boneOf(p);
             auto* parent = h.parentFor(bone);
             if (parent) {
@@ -2001,7 +2001,7 @@ namespace
             const auto& p = g_rig.pouches[i];
             if (p.kind != kHolster && p.kind != kSling) continue;
             float d = distance(pouchMiddle(p), palmBody);
-            if (hasMiddle && p.kind == kSling) d = std::min(d, distance(pouchMiddle(p), middle));
+            if (hasMiddle) d = std::min(d, distance(pouchMiddle(p), middle));
             const float ratio = d / reachOf(p.kind);
             if (ratio < bestRatio) {
                 bestRatio = ratio;
