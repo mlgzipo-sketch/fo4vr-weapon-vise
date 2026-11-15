@@ -56,6 +56,11 @@ Function GiveNewItems()
 			i += 1
 		endwhile
 	endif
+	; 0.4 test build set up a mannequin for every old item it took away (each one folded the last into a kit): one kit is enough
+	int kits = Game.GetPlayer().GetItemCount(Kit)
+	if kits > 1
+		Game.GetPlayer().RemoveItem(Kit, kits - 1, true)
+	endif
 EndFunction
 
 Function SendForms()

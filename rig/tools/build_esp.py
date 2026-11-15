@@ -82,7 +82,7 @@ def item(edid, name, model, kind, value, weight):
 
 kit = item('RigVR_Kit', 'Rig Mannequin (drop to set up)', 'RigVR\\Mannequin.nif', 0, 50, 5.0)
 # the old pouch items (0.1-0.3) stay as records so old saves load; the script takes them out of the inventory
-old_items = [item('RigVR_Item' + p, NAMES[p], 'RigVR\\Pouch' + p + '.nif', 0, 15, 0.5) for p in ('Mag', 'Med', 'Grenade', 'Bandolier')]
+old_items = [item('RigVR_Item' + p, NAMES[p], 'RigVR\\Pouch' + p + '.nif', -1, 15, 0.5) for p in ('Mag', 'Med', 'Grenade', 'Bandolier')]
 # kind 1..6 in the plugin, then the rig itself (kind 7); models from the user's Blender scene (Meshes\RigVR\Custom)
 KINDS = [('MagPistol', 'Rig: Pistol Mag Pouch', 0.4), ('MagRifle', 'Rig: Rifle Mag Pouch', 0.5),
          ('MagUniversal', 'Rig: Universal Mag Pouch', 0.5), ('Holster', 'Rig: Pistol Holster', 0.5),

@@ -542,12 +542,27 @@ namespace
             std::replace(from.begin(), from.end(), '\\', '/');
             std::replace(to.begin(), to.end(), '\\', '/');
             std::filesystem::create_directories(std::filesystem::path(to).parent_path());
-            std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing);
+            if (!std::filesystem::exists(to) || std::filesystem::file_size(to) != std::filesystem::file_size(from) ||
+                std::filesystem::last_write_time(to) < std::filesystem::last_write_time(from)) {
+                std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing);
+            }
             return rel;
         } catch (...) {
             note("Could not copy %s for a second instance", base.c_str());
             return {};
         }
+    }
+
+    // The game only finds loose files that were there when it started: the copies are made at plugin load.
+    void prepareInstances() noexcept
+    {
+        int made = 0;
+        for (int k = 1; k <= kKinds; ++k) {
+            for (int n = 1; n <= 5; ++n) {
+                made += instancePath(pouchModel(k), n).empty() ? 0 : 1;
+            }
+        }
+        note("Pouch model copies ready: %d", made);
     }
 
     // A free instance of the model (made if needed). Null if the model cannot be loaded.
@@ -566,12 +581,16 @@ namespace
             }
         }
         const auto path = instancePath(base, count);
-        auto* node = path.empty() ? nullptr : loadModel(path);
+        if (path.empty() || g_missingModels.contains(path)) {
+            return nullptr;
+        }
+        auto* node = loadModel(path);
         if (!node) {
+            g_missingModels[path] = true;
             if (count == 0) {
                 g_missingModels[base] = true;
-                note("Model %s could not be loaded", base.c_str());
             }
+            note("Model %s could not be loaded", path.c_str());
             return nullptr;
         }
         auto inst = std::make_unique<Instance>();
@@ -1274,12 +1293,24 @@ namespace
     {
         Holder h;
         h.body = true;
-        RE::NiAVObject* third = player->Get3D(false);
-        if (!looksLikeObject(third)) {
-            third = player->Get3D();
+        // the body FRIK shows: whichever of the player's 3D roots has the Pelvis bone
+        RE::NiAVObject* roots[3]{ player->Get3D(false), player->Get3D(true), player->Get3D() };
+        for (auto* root : roots) {
+            if (!looksLikeObject(root)) continue;
+            h.skeleton = root;
+            if (h.parentFor("Pelvis")) {
+                h.valid = true;
+                return h;
+            }
         }
-        h.skeleton = looksLikeObject(third) ? third : nullptr;
-        h.valid = h.skeleton != nullptr && h.parentFor("Pelvis") != nullptr;
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            for (int i = 0; i < 3; ++i) {
+                note("Body root %d: %s, Pelvis not found under it", i, looksLikeObject(roots[i]) ? roots[i]->name.c_str() : "none");
+            }
+        }
+        h.skeleton = nullptr;
         return h;
     }
 
@@ -2019,6 +2050,7 @@ namespace rigvr::runtime
     {
         loadSettings();
         loadRigFile();
+        prepareInstances();
         const auto* papyrus = F4SE::GetPapyrusInterface();
         if (!papyrus || !papyrus->Register(registerNatives)) {
             logWarning("Could not register Papyrus functions; RigVR cannot work");
