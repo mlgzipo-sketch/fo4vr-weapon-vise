@@ -23,3 +23,9 @@ int Function FallbackID(ObjectMod akMod) global native
 bool Function IsFreeMod(ObjectMod akMod) global native
 ; True: a removed part is carried by the plugin (old way); false: it is a physical object ROCK takes.
 bool Function RemoveIntoHand() global native
+; Pegboard: the clamped weapon's physical part mods, what making one takes, and the stands that show them.
+int[] Function BoardMods(int aiWeaponID) global native
+int[] Function RecipeOf(int aiModID) global native     ; component/item id, count, id, count...
+int[] Function PerksOf(int aiModID) global native
+Function SetBoard(ObjectReference[] akBoards, ObjectReference[] akItems, int[] aiMods, int[] aiStates) global native
+Function Hud(string asText) global native

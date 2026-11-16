@@ -5,3 +5,4 @@ bool Function IsWeaponDrawn() native
 Function UnequipItem(Form akItem, bool abPreventEquip = false, bool abSilent = false) native
 Event OnPlayerLoadGame()
 EndEvent
+bool Function HasPerk(Perk akPerk) native

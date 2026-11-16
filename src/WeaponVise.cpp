@@ -86,7 +86,7 @@ namespace
         float rackStep{ 6.0f };
         int rackPerRow{ 6 };
         float zoneLift{ 16.0f };        // the weapon hangs in a ball this high above the vise point...
-        float zoneRadius{ 18.0f };      // ...of this radius
+        float zoneRadius{ 27.0f };      // ...of this radius (the frame model is drawn for 18)
         float previewRadius{ 15.0f };   // a carried part this close to its place shows the ghost
         float snapTime{ 0.15f };        // seconds of the snap-on animation
         float ghostFade{ 0.5f };        // how see-through the attach ghost is
@@ -96,6 +96,10 @@ namespace
         bool refresh3D{ false };         // reload the weapon's 3D when it does not show a change
         bool logTree{ true };
         bool messages{ true };
+        float boardAspect{ 1.25f };     // pegboard width / height (only its bound sphere is known)
+        float boardFill{ 0.85f };       // share of the board the parts may cover
+        float boardGap{ 2.0f };         // space between parts on the board
+        float boardHover{ 3.0f };       // hand this close to a part on the board points at it (plus its size)
     } g_settings;
 
     void loadSettings() noexcept
@@ -146,6 +150,10 @@ namespace
                 else if (key == "fSnapTime") s.snapTime = value;
                 else if (key == "fGhostFade") s.ghostFade = value;
                 else if (key == "fHeldRadius") s.heldRadius = value;
+                else if (key == "fBoardAspect") s.boardAspect = value;
+                else if (key == "fBoardFill") s.boardFill = value;
+                else if (key == "fBoardGap") s.boardGap = value;
+                else if (key == "fBoardHover") s.boardHover = value;
                 else if (key == "bLogGrab") s.logGrab = value != 0.0f;
                 else if (key == "bRemoveIntoHand") s.removeIntoHand = value != 0.0f;
                 else if (key == "bRefresh3D") s.refresh3D = value != 0.0f;
@@ -174,6 +182,9 @@ namespace
         bool part{ false };    // has a visible model of its own: can be taken off by hand
         bool required{ false };
         std::uint32_t fallback{ 0 };  // fills the slot when this part is taken off
+        std::vector<std::uint32_t> weapons;              // weapons it fits
+        std::vector<std::int32_t> recipe;                // component, count, component, count...
+        std::vector<std::int32_t> perks;                 // perks the recipe asks for
     };
     std::unordered_map<std::uint32_t, PartInfo> g_table;
 
@@ -218,6 +229,37 @@ namespace
                 info.part = cells[6] == "1";
                 info.fallback = static_cast<std::uint32_t>(std::strtoul(cells[7].c_str(), nullptr, 16));
                 info.required = cells[8] == "1" || cells[8] == "1\r";
+                const auto ids = [](const std::string& text, char sep) {
+                    std::vector<std::string> out;
+                    std::stringstream in(text);
+                    std::string item;
+                    while (std::getline(in, item, sep)) {
+                        while (!item.empty() && (item.back() == '\r' || item.back() == ' ')) {
+                            item.pop_back();
+                        }
+                        if (!item.empty()) {
+                            out.push_back(item);
+                        }
+                    }
+                    return out;
+                };
+                for (const auto& w : ids(cells[2], ';')) {
+                    info.weapons.push_back(static_cast<std::uint32_t>(std::strtoul(w.c_str(), nullptr, 16)));
+                }
+                if (cells.size() > 9) {
+                    for (const auto& c : ids(cells[9], ';')) {
+                        const auto colon = c.find(':');
+                        if (colon != std::string::npos) {
+                            info.recipe.push_back(static_cast<std::int32_t>(std::strtoul(c.substr(0, colon).c_str(), nullptr, 16)));
+                            info.recipe.push_back(static_cast<std::int32_t>(std::strtol(c.c_str() + colon + 1, nullptr, 10)));
+                        }
+                    }
+                }
+                if (cells.size() > 10) {
+                    for (const auto& k : ids(cells[10], ';')) {
+                        info.perks.push_back(static_cast<std::int32_t>(std::strtoul(k.c_str(), nullptr, 16)));
+                    }
+                }
                 g_table[info.omod] = info;
             }
         } catch (...) {
@@ -269,6 +311,8 @@ namespace
         kGhost = 7,
         kSound = 8,
         kFramePose = 9,
+        kBoardHover = 10,  // part = board item ref, mod = 1 hand came onto it, 0 left it
+        kBoardTake = 11,   // part = board item ref, mod = its mod, pose = the palm
     };
 
     struct PendingCommand
@@ -298,6 +342,12 @@ namespace
         RE::NiTransform benchWorld{};       // the workbench model at clamp time
         bool benchKnown{ false };
         bool modelOutdated{ false };
+        // the pegboards near the bench and the parts shown on them
+        std::vector<std::uint32_t> boards;
+        std::vector<std::uint32_t> boardItems;   // display references
+        std::vector<std::uint32_t> boardMods;    // the mod of each
+        std::vector<std::int32_t> boardStates;   // 0 grey (can not craft), 1 grey (can craft), 2 owned
+        std::uint64_t boardRevision{ 0 };
     } g_shared;
 
     // ------------------------------------------------------------ math
@@ -1119,6 +1169,320 @@ namespace
         hand.hidden = nullptr;
     }
 
+    // ------------------------------------------------------------ the pegboard (crafting stand)
+    // The script finds the pegboards near the bench and gives every part of the clamped weapon
+    // a display model; here they are laid out in rows on the boards, and a hand on one sends
+    // "hover" (the script lights it and tells what it costs) and "take" (grip: the part comes
+    // into the palm, or the script asks to craft it).
+
+    struct BoardItem
+    {
+        std::uint32_t ref{ 0 };
+        std::uint32_t mod{ 0 };
+        int state{ 0 };
+        RE::NiAVObject* detached{ nullptr };
+        RE::NiTransform world{};   // where it is shown
+        bool placed{ false };
+        float radius{ 6.0f };
+    };
+    std::vector<std::uint32_t> g_boards;
+    std::vector<BoardItem> g_boardItems;
+    std::uint64_t g_boardRevision{ 0 };
+    std::array<std::uint32_t, 2> g_boardHover{};
+    std::unordered_set<RE::NiAVObject*> g_boardToolsHidden;
+
+    struct BoardFrame
+    {
+        RE::NiPoint3 center{};
+        RE::NiPoint3 width{};    // along the board, left to right as seen from the front
+        RE::NiPoint3 up{ 0.0f, 0.0f, 1.0f };
+        RE::NiPoint3 normal{};   // out of the board, towards the room
+        float halfWidth{ 30.0f };
+        float halfHeight{ 24.0f };
+    };
+
+    RE::NiPoint3 cross(const RE::NiPoint3& a, const RE::NiPoint3& b) noexcept
+    {
+        return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+    }
+
+    float dot(const RE::NiPoint3& a, const RE::NiPoint3& b) noexcept
+    {
+        return a.x * b.x + a.y * b.y + a.z * b.z;
+    }
+
+    RE::NiPoint3 unit(RE::NiPoint3 v) noexcept
+    {
+        const float length = std::sqrt(dot(v, v));
+        return length > 1e-4f ? RE::NiPoint3{ v.x / length, v.y / length, v.z / length } : RE::NiPoint3{ 1.0f, 0.0f, 0.0f };
+    }
+
+    // The board's front and size: the panel is its biggest piece; the small ones (the tools that
+    // hang on the vanilla model) are hidden so the parts take their place.
+    bool boardFrame(RE::TESObjectREFR* board, const RE::NiPoint3& towards, BoardFrame& out) noexcept
+    {
+        auto* root = board ? board->Get3D() : nullptr;
+        if (!looksLikeObject(root)) {
+            return false;
+        }
+        float biggest = 0.0f;
+        RE::NiAVObject* panel = nullptr;
+        forEachNode(root, [&](RE::NiAVObject* object, int) {
+            if (!object->IsNode() && object->worldBound.fRadius > biggest && object->worldBound.fRadius < 500.0f) {
+                biggest = object->worldBound.fRadius;
+                panel = object;
+            }
+        });
+        if (!panel) {
+            return false;
+        }
+        forEachNode(root, [&](RE::NiAVObject* object, int) {
+            if (!object->IsNode() && object->worldBound.fRadius < biggest * 0.4f && !g_boardToolsHidden.contains(object)) {
+                g_boardToolsHidden.insert(object);
+                setCulled(object, true);
+            }
+        });
+        const auto& rotate = root->world.rotate;
+        const RE::NiPoint3 axisX{ rotate.entry[0][0], rotate.entry[0][1], rotate.entry[0][2] };
+        const RE::NiPoint3 axisY{ rotate.entry[1][0], rotate.entry[1][1], rotate.entry[1][2] };
+        out.center = panel->worldBound.center;
+        // the thin side faces the room: the panel's pieces spread along the width, not the depth
+        float spreadX = 0.0f;
+        float spreadY = 0.0f;
+        forEachNode(root, [&](RE::NiAVObject* object, int) {
+            if (!object->IsNode() && object->worldBound.fRadius > 0.0f && object->worldBound.fRadius < 500.0f) {
+                const auto d = object->worldBound.center - out.center;
+                spreadX = std::max(spreadX, std::abs(dot(d, axisX)) + object->worldBound.fRadius * 0.1f);
+                spreadY = std::max(spreadY, std::abs(dot(d, axisY)) + object->worldBound.fRadius * 0.1f);
+            }
+        });
+        RE::NiPoint3 normal = spreadX < spreadY ? axisX : axisY;
+        normal.z = 0.0f;
+        normal = unit(normal);
+        auto toRoom = towards - out.center;
+        toRoom.z = 0.0f;
+        if (dot(normal, toRoom) < 0.0f) {
+            normal = { -normal.x, -normal.y, -normal.z };
+        }
+        out.normal = normal;
+        out.up = { 0.0f, 0.0f, 1.0f };
+        out.width = unit(cross(out.up, out.normal));   // right-hand side as seen from the front
+        // a thin panel: its bound sphere spans the diagonal
+        const float diagonal = biggest * 2.0f;
+        const float aspect = std::max(0.2f, g_settings.boardAspect);
+        const float height = diagonal / std::sqrt(1.0f + aspect * aspect);
+        out.halfHeight = height * 0.5f;
+        out.halfWidth = height * aspect * 0.5f;
+        return true;
+    }
+
+    void syncBoard() noexcept
+    {
+        std::vector<std::uint32_t> boards, items, mods;
+        std::vector<std::int32_t> states;
+        {
+            std::scoped_lock guard(g_shared.lock);
+            if (g_shared.boardRevision == g_boardRevision) {
+                return;
+            }
+            g_boardRevision = g_shared.boardRevision;
+            boards = g_shared.boards;
+            items = g_shared.boardItems;
+            mods = g_shared.boardMods;
+            states = g_shared.boardStates;
+        }
+        std::vector<BoardItem> next;
+        for (std::size_t i = 0; i < items.size() && i < mods.size() && i < states.size(); ++i) {
+            BoardItem item;
+            for (const auto& old : g_boardItems) {
+                if (old.ref == items[i]) {
+                    item = old;
+                }
+            }
+            item.ref = items[i];
+            item.mod = mods[i];
+            item.state = states[i];
+            next.push_back(item);
+        }
+        g_boards = boards;
+        g_boardItems = std::move(next);
+        g_boardHover = {};
+        char text[120]{};
+        std::snprintf(text, sizeof(text), "Board: %zu boards, %zu parts", g_boards.size(), g_boardItems.size());
+        logNote(text);
+    }
+
+    // Rows by slot (barrels, muzzles, sights, magazines, grips), left to right, top to bottom;
+    // a full board goes on to the next one (the script lists them nearest first).
+    void layoutBoard(const RE::NiPoint3& bench) noexcept
+    {
+        std::vector<BoardFrame> frames;
+        for (const auto id : g_boards) {
+            BoardFrame frame;
+            if (boardFrame(lookupRef(id), bench, frame)) {
+                frames.push_back(frame);
+            }
+        }
+        std::size_t board = 0;
+        float x = 0.0f;
+        float y = 0.0f;
+        float rowHeight = 0.0f;
+        std::string lastSlot;
+        static std::uint64_t loggedFor = ~0ull;
+        const bool log = loggedFor != g_boardRevision;
+        loggedFor = g_boardRevision;
+        if (log) {
+            for (const auto& f : frames) {
+                char text[200]{};
+                std::snprintf(text, sizeof(text), "Board at (%.0f, %.0f, %.0f) %.0f x %.0f, front (%.2f, %.2f)",
+                    f.center.x, f.center.y, f.center.z, f.halfWidth * 2.0f, f.halfHeight * 2.0f, f.normal.x, f.normal.y);
+                logNote(text);
+            }
+        }
+        for (auto& item : g_boardItems) {
+            item.placed = false;
+            if (board >= frames.size()) {
+                continue;
+            }
+            const auto* info = partInfo(item.mod);
+            const std::string slot = info ? info->slot : "";
+            const float size = item.radius * 2.0f * 0.9f;
+            auto* f = &frames[board];
+            const float usableW = f->halfWidth * 2.0f * g_settings.boardFill;
+            const float usableH = f->halfHeight * 2.0f * g_settings.boardFill;
+            const bool newRow = (slot != lastSlot && x > 0.0f) || x + size > usableW;
+            if (newRow) {
+                y += rowHeight + g_settings.boardGap;
+                x = 0.0f;
+                rowHeight = 0.0f;
+            }
+            if (y + std::min(size, item.radius * 1.2f) > usableH && y > 0.0f) {
+                ++board;
+                x = y = rowHeight = 0.0f;
+                if (board >= frames.size()) {
+                    continue;
+                }
+                f = &frames[board];
+            }
+            lastSlot = slot;
+            const float itemH = std::max(4.0f, item.radius * 1.1f);
+            const float cx = -f->halfWidth * g_settings.boardFill + x + size * 0.5f;
+            const float cy = f->halfHeight * g_settings.boardFill - y - itemH * 0.5f;
+            x += size + g_settings.boardGap;
+            rowHeight = std::max(rowHeight, itemH);
+            const auto at = f->center + f->width * cx + f->up * cy + f->normal * (1.5f + item.radius * 0.25f);
+            // on its side, the barrel end to the right: part Y along the board, Z up, X out of it
+            RE::NiTransform world{};
+            const auto right = f->width;
+            const auto up = f->up;
+            const auto side = cross(right, up);
+            world.rotate.entry[0][0] = side.x;  world.rotate.entry[0][1] = side.y;  world.rotate.entry[0][2] = side.z;
+            world.rotate.entry[1][0] = right.x; world.rotate.entry[1][1] = right.y; world.rotate.entry[1][2] = right.z;
+            world.rotate.entry[2][0] = up.x;    world.rotate.entry[2][1] = up.y;    world.rotate.entry[2][2] = up.z;
+            world.translate = at;
+            world.scale = 1.0f;
+            item.world = world;
+            item.placed = true;
+        }
+    }
+
+    void updateBoard() noexcept
+    {
+        syncBoard();
+        if (g_boardItems.empty()) {
+            return;
+        }
+        auto* bench = lookupRef(g_bench);
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        RE::NiPoint3 towards = bench ? bench->GetPosition() : (player ? player->GetPosition() : RE::NiPoint3{});
+        layoutBoard(towards);
+        for (auto& item : g_boardItems) {
+            auto* ref = lookupRef(item.ref);
+            auto* root = ref ? ref->Get3D() : nullptr;
+            if (!looksLikeObject(root)) {
+                continue;
+            }
+            if (item.detached != root) {
+                item.detached = root;
+                ref->DetachHavok(root);
+            }
+            if (!item.placed) {
+                setCulled(root, true);
+                continue;
+            }
+            setCulled(root, false);
+            // the part's middle at the cell's middle (its root is its attach point, not its middle)
+            const auto offset = centerOf(root) - root->world.translate;
+            if (root->worldBound.fRadius > 0.5f && root->worldBound.fRadius < 60.0f) {
+                item.radius = root->worldBound.fRadius;
+            }
+            auto world = item.world;
+            world.translate = world.translate - offset;
+            place3D(root, world);
+            if (auto* fade = root->IsFadeNode()) {
+                fade->GetFadeNodeRuntimeData().currentFade = item.state == 2 ? 1.0f : 0.3f;   // grey: not made yet
+            }
+        }
+    }
+
+    const BoardItem* boardItemAt(const RE::NiPoint3& point) noexcept
+    {
+        const BoardItem* best = nullptr;
+        float bestDistance = 1e9f;
+        for (const auto& item : g_boardItems) {
+            auto* ref = item.placed ? lookupRef(item.ref) : nullptr;
+            auto* root = ref ? ref->Get3D() : nullptr;
+            if (!looksLikeObject(root)) {
+                continue;
+            }
+            const float d = distance(point, centerOf(root));
+            if (d < g_settings.boardHover + item.radius * 0.6f && d < bestDistance) {
+                bestDistance = d;
+                best = &item;
+            }
+        }
+        return best;
+    }
+
+    // A free hand at the board: lights the part it points at; grip takes it (or asks to craft it).
+    bool boardHand(int index, Hand& hand, bool pressed) noexcept
+    {
+        if (g_boardItems.empty() || hand.select) {
+            if (g_boardHover[index]) {
+                PendingCommand command; command.type = kBoardHover; command.part = g_boardHover[index]; command.mod = 0;
+                pushCommand(command);
+                g_boardHover[index] = 0;
+            }
+            return false;
+        }
+        const auto* item = (hand.grip && !pressed) ? nullptr : boardItemAt(hand.point);
+        const std::uint32_t hover = item ? item->ref : 0;
+        if (hover != g_boardHover[index]) {
+            if (g_boardHover[index]) {
+                PendingCommand command; command.type = kBoardHover; command.part = g_boardHover[index]; command.mod = 0;
+                pushCommand(command);
+            }
+            if (hover) {
+                PendingCommand command; command.type = kBoardHover; command.part = hover; command.mod = 1;
+                pushCommand(command);
+                buzz(index, 600);
+            }
+            g_boardHover[index] = hover;
+        }
+        if (item && pressed) {
+            PendingCommand command;
+            command.type = kBoardTake;
+            command.part = item->ref;
+            command.mod = item->mod;
+            command.pose = poseOf(hand.point, headingOf(fingers(hand)));
+            pushCommand(command);
+            buzz(index, 2000);
+            hand.mode = Hand::Mode::Done;
+            return true;
+        }
+        return false;
+    }
+
     void updateHandAtWeapon(int index, RE::NiAVObject* weapon3D) noexcept
     {
         auto& hand = g_hands_state[index];
@@ -1131,6 +1495,9 @@ namespace
         switch (hand.mode) {
         case Hand::Mode::Idle:
             {
+                if (boardHand(index, hand, pressed)) {
+                    break;
+                }
                 // A / X held: the part under the hand shows in red; grip takes it off
                 const auto* anchor = hand.select ? nearestAnchor(hand.point, g_settings.grabRadius) : nullptr;
                 const std::uint32_t hover = anchor ? anchor->mod : 0;
@@ -1737,7 +2104,7 @@ namespace
         RE::NiTransform world{};
         world.rotate = bench.rotate;
         world.translate = center;
-        world.scale = 1.0f;
+        world.scale = std::clamp(g_settings.zoneRadius / 18.0f, 0.3f, 4.0f);   // the frame grows with the zone
         place3D(root, world);
         if (auto* fade = root->IsFadeNode()) {
             fade->GetFadeNodeRuntimeData().currentFade = inside ? 1.0f : 0.35f;
@@ -1859,6 +2226,7 @@ namespace
         updateHeldParts(root);
         updateSnaps();
         applyGhosts();
+        updateBoard();
         updateFrame();
     }
 
@@ -2032,6 +2400,84 @@ namespace
         return false;
     }
 
+    // The parts a weapon can take that hang on the pegboard: real parts with a model of their own,
+    // no free fillers (iron sights, stock barrel), grouped by slot.
+    std::vector<std::int32_t> BoardMods(std::monostate, std::int32_t weaponId)
+    {
+        std::unordered_set<std::uint32_t> fillers;
+        for (const auto& [omod, info] : g_table) {
+            if (info.fallback) {
+                fillers.insert(info.fallback);
+            }
+        }
+        static const std::array<const char*, 5> order{ "ap_gun_Barrel", "ap_gun_Muzzle", "ap_gun_Scope", "ap_gun_Mag", "ap_gun_Grip" };
+        std::vector<const PartInfo*> found;
+        for (const auto& [omod, info] : g_table) {
+            if (!info.part || fillers.contains(omod)) {
+                continue;
+            }
+            if (std::find(order.begin(), order.end(), info.slot) == order.end()) {
+                continue;
+            }
+            if (std::find(info.weapons.begin(), info.weapons.end(), static_cast<std::uint32_t>(weaponId) & 0xFFFFFF) != info.weapons.end()) {
+                found.push_back(&info);
+            }
+        }
+        const auto rank = [&](const PartInfo* info) {
+            return std::find(order.begin(), order.end(), info->slot) - order.begin();
+        };
+        std::sort(found.begin(), found.end(), [&](const PartInfo* a, const PartInfo* b) {
+            return rank(a) != rank(b) ? rank(a) < rank(b) : a->edid < b->edid;
+        });
+        std::vector<std::int32_t> ids;
+        for (const auto* info : found) {
+            ids.push_back(static_cast<std::int32_t>(info->omod));
+        }
+        return ids;
+    }
+
+    // component, count, component, count... of the mod's recipe (Fallout4.esm ids)
+    std::vector<std::int32_t> RecipeOf(std::monostate, std::int32_t modId)
+    {
+        const auto* info = partInfo(static_cast<std::uint32_t>(modId));
+        return info ? info->recipe : std::vector<std::int32_t>{};
+    }
+
+    std::vector<std::int32_t> PerksOf(std::monostate, std::int32_t modId)
+    {
+        const auto* info = partInfo(static_cast<std::uint32_t>(modId));
+        return info ? info->perks : std::vector<std::int32_t>{};
+    }
+
+    void SetBoard(std::monostate, std::vector<RE::TESObjectREFR*> boards, std::vector<RE::TESObjectREFR*> items,
+        std::vector<std::int32_t> mods, std::vector<std::int32_t> states)
+    {
+        std::scoped_lock guard(g_shared.lock);
+        g_shared.boards.clear();
+        for (auto* b : boards) {
+            if (b) {
+                g_shared.boards.push_back(b->GetFormID());
+            }
+        }
+        g_shared.boardItems.clear();
+        g_shared.boardMods.clear();
+        g_shared.boardStates.clear();
+        for (std::size_t i = 0; i < items.size() && i < mods.size() && i < states.size(); ++i) {
+            if (items[i]) {
+                g_shared.boardItems.push_back(items[i]->GetFormID());
+                g_shared.boardMods.push_back(static_cast<std::uint32_t>(mods[i]));
+                g_shared.boardStates.push_back(states[i]);
+            }
+        }
+        ++g_shared.boardRevision;
+    }
+
+    void Hud(std::monostate, RE::BSFixedString text)
+    {
+        hud(text.c_str());
+        logNote(std::string("Hud: ") + text.c_str());
+    }
+
     bool ModelOutdated(std::monostate)
     {
         std::scoped_lock guard(g_shared.lock);
@@ -2049,7 +2495,7 @@ namespace
         case 4: hud("Оружие в тисках. Держи курок и наведи руку на деталь, грип: снять. Грип за рукоять: забрать оружие"); break;
         case 5: hud("Эта деталь сюда не подходит"); break;
         case 6: hud("Оружие снова в руке"); break;
-        case 7: hud("Ты отошёл: оружие и детали вернулись в инвентарь"); break;
+        case 7: hud("Ты отошёл: оружие и детали с верстака ушли в хранилище поселения"); break;
         case 10: break;  // took the weapon ROCK dropped
         default: break;
         }
@@ -2079,6 +2525,11 @@ namespace
         vm->BindNativeMethod(kScript, "AddGhost", AddGhost, true);
         vm->BindNativeMethod(kScript, "SetFrame", SetFrame, true);
         vm->BindNativeMethod(kScript, "CommandFlag", CommandFlag, true);
+        vm->BindNativeMethod(kScript, "BoardMods", BoardMods, true);
+        vm->BindNativeMethod(kScript, "RecipeOf", RecipeOf, true);
+        vm->BindNativeMethod(kScript, "PerksOf", PerksOf, true);
+        vm->BindNativeMethod(kScript, "SetBoard", SetBoard, true);
+        vm->BindNativeMethod(kScript, "Hud", Hud, true);
         logNote("Papyrus functions of script WeaponVise registered");
         return true;
     }

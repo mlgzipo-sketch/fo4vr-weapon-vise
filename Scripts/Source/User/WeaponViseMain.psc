@@ -14,6 +14,9 @@ Static Property ZoneFrame Auto Const            ; corner brackets above the vise
 Container Property WV_Stash Auto Const          ; hidden box: other copies of the pistol wait here while this one is equipped
 EffectShader Property OutlineAttach Auto Const
 EffectShader Property OutlineRemove Auto Const
+Static Property WV_Pegboard Auto Const          ; the crafting stand built in a settlement
+Message Property WV_CraftConfirm Auto Const     ; "Create this mod?" Yes / No
+Keyword Property WorkshopItemKeyword Auto Const ; bench -> its settlement (the stash)
 
 int Property CmdClamp = 1 AutoReadOnly
 int Property CmdUnclamp = 2 AutoReadOnly
@@ -24,6 +27,8 @@ int Property CmdMove = 6 AutoReadOnly
 int Property CmdGhost = 7 AutoReadOnly
 int Property CmdSound = 8 AutoReadOnly
 int Property CmdFramePose = 9 AutoReadOnly
+int Property CmdBoardHover = 10 AutoReadOnly
+int Property CmdBoardTake = 11 AutoReadOnly
 int Property TimerScan = 1 AutoReadOnly
 int Property TimerFast = 2 AutoReadOnly
 int Property MaxParts = 120 AutoReadOnly
@@ -39,6 +44,12 @@ int SkipPartPickups   ; part items we put into the inventory ourselves (attachin
 ObjectReference[] Ghosts
 ObjectMod[] GhostMods
 int[] GhostColors      ; 0 none, 1 remove (red), 2 attach (green)
+ObjectReference[] Boards      ; pegboards near the bench, nearest first
+ObjectReference[] BoardRefs   ; the part models shown on them
+int[] BoardModIds
+int[] BoardStates             ; 0 grey (can not craft), 1 grey (can craft), 2 owned
+ObjectReference ReturnBench   ; the bench just left: what is left on it goes to the stash
+int BoardTicks
 
 Event OnInit()
 	Setup()
@@ -221,6 +232,9 @@ Function Scan()
 		i += 1
 	endwhile
 	if nearest != Bench
+		if Bench
+			ReturnBench = Bench
+		endif
 		Bench = nearest
 		WeaponVise.SetWorkbench(Bench)
 		PlaceFrame()
@@ -236,7 +250,7 @@ Function Scan()
 			Busy = false
 		elseif player.GetDistance(Clamped) > 700.0
 			Busy = true
-			Unclamp(false)
+			StashClamped()
 			WeaponVise.Notify(7)
 			Busy = false
 		elseif !Clamped.Is3DLoaded()
@@ -251,6 +265,21 @@ Function Scan()
 			endif
 		else
 			Unloaded = 0
+		endif
+	endif
+	if ReturnBench && !Busy && player.GetDistance(ReturnBench) > 700.0
+		Busy = true
+		ReturnToStash(ReturnBench)
+		ReturnBench = None
+		Busy = false
+	endif
+	if Clamped && BoardRefs && BoardRefs.Length > 0 && !Busy
+		BoardTicks += 1
+		if BoardTicks >= 3
+			BoardTicks = 0
+			Busy = true
+			RefreshStates()
+			Busy = false
 		endif
 	endif
 	if (Bench || Clamped) && !FastRunning
@@ -285,6 +314,10 @@ Function Handle()
 			ShowGhost(CmdMod(), WeaponVise.CommandPose()[0] as int)
 		elseif cmd == CmdSound
 			PlaySound(WeaponVise.CommandPose()[0] as int)
+		elseif cmd == CmdBoardHover
+			BoardHover(CmdPart(), WeaponVise.CommandFlag())
+		elseif cmd == CmdBoardTake
+			BoardTake(CmdPart(), WeaponVise.CommandModID())
 		elseif cmd == CmdFramePose
 			if FrameRef
 				float[] fp = WeaponVise.CommandPose()
@@ -396,6 +429,7 @@ Function Clamp()
 	ClampedBase = w
 	WeaponVise.SetWeapon(ref, ref.GetAllMods())
 	WeaponVise.Notify(4)
+	RefreshBoard()
 EndFunction
 
 ObjectReference Function SpawnPart(int index, float[] pose, bool inHand)
@@ -571,6 +605,9 @@ Function ShowGhost(ObjectMod m, int color)
 EndFunction
 
 Function ClearGhosts()
+	if !Clamped
+		ClearBoard()
+	endif
 	int i = 0
 	while Ghosts && i < Ghosts.Length
 		if Ghosts[i] && Ghosts[i].GetBaseObject() as Static
@@ -638,4 +675,390 @@ Function Unclamp(bool equip)
 		endif
 	endif
 	ClearGhosts()
+EndFunction
+
+; ------------------------------------------------------------ the pegboard (crafting stand)
+
+ObjectReference Function WorkshopOf(ObjectReference b)
+	if b && WorkshopItemKeyword
+		return b.GetLinkedRef(WorkshopItemKeyword)
+	endif
+	return None
+EndFunction
+
+; The weapon left in the vise goes to the settlement's stash (the inventory if there is none).
+Function StashClamped()
+	ObjectReference ref = Clamped
+	ObjectReference b = Bench
+	if !b
+		b = ReturnBench
+	endif
+	ObjectReference ws = WorkshopOf(b)
+	Clamped = None
+	WeaponVise.SetWeapon(None, new ObjectMod[0])
+	ClearGhosts()
+	if ref
+		ref.SetMotionType(1, true)
+		if ws
+			ws.AddItem(ref, 1, true)
+		else
+			Game.GetPlayer().AddItem(ref, 1, true)
+		endif
+	endif
+EndFunction
+
+; Parts left lying at a bench the player walked away from go back to its stash as loose mods.
+Function ReturnToStash(ObjectReference b)
+	ObjectReference ws = WorkshopOf(b)
+	Actor player = Game.GetPlayer()
+	int i = Parts.Length - 1
+	while i >= 0
+		ObjectReference p = Parts[i]
+		if p && !p.GetContainer() && p.GetDistance(b) < 250.0
+			int k = WV_Mods.Find(PartMods[i])
+			Parts.Remove(i)
+			PartMods.Remove(i)
+			WeaponVise.ForgetPart(p)
+			p.Disable()
+			p.Delete()
+			if k >= 0
+				if ws
+					ws.AddItem(WV_LooseMods.GetAt(k), 1, true)
+				else
+					player.AddItem(WV_LooseMods.GetAt(k), 1, true)
+				endif
+			endif
+		endif
+		i -= 1
+	endwhile
+EndFunction
+
+int Function CountOf(Form f, ObjectReference ws)
+	Actor player = Game.GetPlayer()
+	int n = 0
+	if f as Component
+		n = player.GetComponentCount(f)
+		if ws
+			n += ws.GetComponentCount(f)
+		endif
+	else
+		n = player.GetItemCount(f)
+		if ws
+			n += ws.GetItemCount(f)
+		endif
+	endif
+	return n
+EndFunction
+
+int Function OwnedCount(int k, ObjectReference ws)
+	Form loose = WV_LooseMods.GetAt(k)
+	int n = Game.GetPlayer().GetItemCount(loose)
+	if ws
+		n += ws.GetItemCount(loose)
+	endif
+	return n
+EndFunction
+
+bool Function CanCraft(int modId, ObjectReference ws)
+	int[] recipe = WeaponVise.RecipeOf(modId)
+	if !recipe || recipe.Length == 0
+		return false
+	endif
+	Actor player = Game.GetPlayer()
+	int[] perks = WeaponVise.PerksOf(modId)
+	int i = 0
+	while perks && i < perks.Length
+		Perk p = Game.GetForm(perks[i]) as Perk
+		if p && !player.HasPerk(p)
+			return false
+		endif
+		i += 1
+	endwhile
+	i = 0
+	while i + 1 < recipe.Length
+		Form f = Game.GetForm(recipe[i])
+		if f && CountOf(f, ws) < recipe[i + 1]
+			return false
+		endif
+		i += 2
+	endwhile
+	return true
+EndFunction
+
+int Function StateOf(int modId, ObjectReference ws)
+	int k = WV_Mods.Find(Game.GetForm(modId))
+	if k >= 0 && OwnedCount(k, ws) > 0
+		return 2
+	elseif CanCraft(modId, ws)
+		return 1
+	endif
+	return 0
+EndFunction
+
+; Shows the clamped weapon's parts on the pegboards near the bench.
+Function RefreshBoard()
+	if !Clamped || !ClampedBase || !Bench || !WV_Pegboard
+		ClearBoard()
+		return
+	endif
+	ObjectReference[] found = Bench.FindAllReferencesOfType(WV_Pegboard, 700.0)
+	if !found || found.Length == 0
+		ClearBoard()
+		return
+	endif
+	; nearest to the bench first
+	int a = 0
+	while a < found.Length
+		int best = a
+		int c = a + 1
+		while c < found.Length
+			if found[c].GetDistance(Bench) < found[best].GetDistance(Bench)
+				best = c
+			endif
+			c += 1
+		endwhile
+		ObjectReference t = found[a]
+		found[a] = found[best]
+		found[best] = t
+		a += 1
+	endwhile
+	if !BoardRefs
+		BoardRefs = new ObjectReference[0]
+		BoardModIds = new int[0]
+		BoardStates = new int[0]
+	endif
+	ObjectReference ws = WorkshopOf(Bench)
+	int[] ids = WeaponVise.BoardMods(ClampedBase.GetFormID())
+	ObjectReference[] refs = new ObjectReference[0]
+	int[] mods = new int[0]
+	int[] states = new int[0]
+	int i = 0
+	while i < ids.Length && refs.Length < 100
+		int k = WV_Mods.Find(Game.GetForm(ids[i]))
+		if k >= 0
+			ObjectReference r = None
+			int old = BoardModIds.Find(ids[i])
+			if old >= 0
+				r = BoardRefs[old]
+			endif
+			if !r
+				r = Bench.PlaceAtMe(WV_Ghosts.GetAt(k), 1, false, false, false)
+			endif
+			if r
+				refs.Add(r)
+				mods.Add(ids[i])
+				states.Add(StateOf(ids[i], ws))
+			endif
+		endif
+		i += 1
+	endwhile
+	; models of another weapon's parts go away
+	i = 0
+	while i < BoardRefs.Length
+		if BoardRefs[i] && refs.Find(BoardRefs[i]) < 0
+			BoardRefs[i].Disable()
+			BoardRefs[i].Delete()
+		endif
+		i += 1
+	endwhile
+	Boards = found
+	BoardRefs = refs
+	BoardModIds = mods
+	BoardStates = states
+	WeaponVise.SetBoard(Boards, BoardRefs, BoardModIds, BoardStates)
+EndFunction
+
+; Owned or not, can be made or not: the counts change as things are crafted, taken or picked up.
+Function RefreshStates()
+	if !BoardRefs || BoardRefs.Length == 0
+		return
+	endif
+	ObjectReference ws = WorkshopOf(Bench)
+	bool changed = false
+	int i = 0
+	while i < BoardModIds.Length
+		int st = StateOf(BoardModIds[i], ws)
+		if st != BoardStates[i]
+			BoardStates[i] = st
+			changed = true
+		endif
+		i += 1
+	endwhile
+	if changed
+		WeaponVise.SetBoard(Boards, BoardRefs, BoardModIds, BoardStates)
+	endif
+EndFunction
+
+Function ClearBoard()
+	int i = 0
+	while BoardRefs && i < BoardRefs.Length
+		if BoardRefs[i]
+			BoardRefs[i].Disable()
+			BoardRefs[i].Delete()
+		endif
+		i += 1
+	endwhile
+	BoardRefs = new ObjectReference[0]
+	BoardModIds = new int[0]
+	BoardStates = new int[0]
+	Boards = new ObjectReference[0]
+	WeaponVise.SetBoard(Boards, BoardRefs, BoardModIds, BoardStates)
+EndFunction
+
+string Function NameOf(Form f)
+	if f
+		string n = f.GetName()
+		if n != ""
+			return n
+		endif
+	endif
+	return "?"
+EndFunction
+
+; What the hand points at: its name, how many there are, or what making it takes.
+string Function BoardText(int modId, int st, ObjectReference ws)
+	int k = WV_Mods.Find(Game.GetForm(modId))
+	if k < 0
+		return ""
+	endif
+	string text = NameOf(WV_LooseMods.GetAt(k))
+	if st == 2
+		return text + ": есть " + OwnedCount(k, ws) + ". Грип: взять"
+	endif
+	int[] recipe = WeaponVise.RecipeOf(modId)
+	if !recipe || recipe.Length == 0
+		return text + ": не создаётся"
+	endif
+	Actor player = Game.GetPlayer()
+	string need = ""
+	int i = 0
+	while i + 1 < recipe.Length
+		Form f = Game.GetForm(recipe[i])
+		if f
+			if need != ""
+				need += ", "
+			endif
+			need += NameOf(f) + " " + CountOf(f, ws) + "/" + recipe[i + 1]
+		endif
+		i += 2
+	endwhile
+	int[] perks = WeaponVise.PerksOf(modId)
+	i = 0
+	while perks && i < perks.Length
+		Perk p = Game.GetForm(perks[i]) as Perk
+		if p
+			string mark = ""
+			if !player.HasPerk(p)
+				mark = " (нет)"
+			endif
+			need += ", навык " + NameOf(p) + mark
+		endif
+		i += 1
+	endwhile
+	if st == 1
+		return text + ": " + need + ". Грип: создать"
+	endif
+	return text + ": не хватает. " + need
+EndFunction
+
+Function BoardHover(ObjectReference r, int entered)
+	int b = -1
+	if r && BoardRefs
+		b = BoardRefs.Find(r)
+	endif
+	if b < 0
+		return
+	endif
+	OutlineAttach.Stop(r)
+	OutlineRemove.Stop(r)
+	if entered == 0
+		return
+	endif
+	int st = BoardStates[b]
+	if st == 1
+		OutlineAttach.Play(r, -1.0)
+	elseif st == 0
+		OutlineRemove.Play(r, -1.0)
+	endif
+	WeaponVise.Hud(BoardText(BoardModIds[b], st, WorkshopOf(Bench)))
+EndFunction
+
+; Grip on a part on the board: an owned one comes into the palm (ROCK takes it);
+; one not made yet asks to be crafted from the inventory and the settlement's stash.
+Function BoardTake(ObjectReference r, int modId)
+	int b = -1
+	if r && BoardRefs
+		b = BoardRefs.Find(r)
+	endif
+	if b < 0
+		return
+	endif
+	int k = WV_Mods.Find(Game.GetForm(modId))
+	if k < 0
+		return
+	endif
+	Actor player = Game.GetPlayer()
+	ObjectReference ws = WorkshopOf(Bench)
+	Form loose = WV_LooseMods.GetAt(k)
+	int st = StateOf(modId, ws)
+	if st == 2
+		if player.GetItemCount(loose) > 0
+			player.RemoveItem(loose, 1, true)
+		elseif ws
+			ws.RemoveItem(loose, 1, true)
+		endif
+		SpawnPart(k, WeaponVise.CommandPose(), WeaponVise.RemoveIntoHand())
+		PlaySound(3)
+	elseif st == 1
+		OutlineAttach.Stop(r)
+		if WV_CraftConfirm && WV_CraftConfirm.Show() == 0
+			if CanCraft(modId, ws)
+				Consume(modId, ws)
+				player.AddItem(loose, 1, true)
+				PlaySound(2)
+				WeaponVise.Hud("Создано: " + NameOf(loose))
+			endif
+		endif
+	else
+		WeaponVise.Hud(BoardText(modId, st, ws))
+	endif
+	RefreshStates()
+EndFunction
+
+; Takes the recipe's components from the inventory first, then from the stash.
+Function Consume(int modId, ObjectReference ws)
+	int[] recipe = WeaponVise.RecipeOf(modId)
+	Actor player = Game.GetPlayer()
+	int i = 0
+	while i + 1 < recipe.Length
+		Form f = Game.GetForm(recipe[i])
+		int need = recipe[i + 1]
+		if f
+			Component c = f as Component
+			if c
+				int mine = player.GetComponentCount(f)
+				if mine > need
+					mine = need
+				endif
+				if mine > 0
+					player.RemoveComponents(c, mine, true)
+				endif
+				if need - mine > 0 && ws
+					ws.RemoveComponents(c, need - mine, true)
+				endif
+			else
+				int have = player.GetItemCount(f)
+				if have > need
+					have = need
+				endif
+				if have > 0
+					player.RemoveItem(f, have, true)
+				endif
+				if need - have > 0 && ws
+					ws.RemoveItem(f, need - have, true)
+				endif
+			endif
+		endif
+		i += 2
+	endwhile
 EndFunction

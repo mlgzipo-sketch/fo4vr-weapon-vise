@@ -985,5 +985,8 @@
  "WV_Ghost_Broadsider_Barrel_LightLong": "000CC0",
  "WV_Ghost_Broadsider_Barrel_Long": "000CC1",
  "WV_Ghost_Broadsider_Grip_Better2": "000CC2",
- "WV_Ghost_Broadsider_Mag_Multi": "000CC3"
+ "WV_Ghost_Broadsider_Mag_Multi": "000CC3",
+ "WV_Pegboard": "000CC4",
+ "WV_co_Pegboard": "000CC5",
+ "WV_CraftConfirm": "000CC6"
 }

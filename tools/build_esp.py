@@ -128,6 +128,23 @@ flst('WV_Weapons', sorted({w for r in parts for w in r['weapons']}))
 add('CONT', 'WV_Stash', [sub('OBND', b'\0' * 12), sub('COCT', struct.pack('<I', 0)),
                          sub('DATA', struct.pack('<Bf', 0, 0.0))])
 
+# Crafting stand: the Red Rocket tool rack, built from the workshop menu (Decorations > Misc).
+# The bench shows the clamped weapon's parts on the stands within 10 m of it.
+add('STAT', 'WV_Pegboard', [sub('OBND', struct.pack('<6h', -61, -10, -65, 61, 1, 64)),
+                            sub('FULL', zstr('Стенд для модификаций', 'utf-8')),
+                            sub('MODL', zstr('SetDressing\\Garage\\ToolRackGarage01.nif', 'latin1')),
+                            sub('DNAM', struct.pack('<ffff', 90.0, 0.0, 1.0, 1.0))])
+add('COBJ', 'WV_co_Pegboard', [sub('YNAM', struct.pack('<I', 0x2B014)), sub('ZNAM', struct.pack('<I', 0x2B015)),
+                               sub('FVPA', struct.pack('<6I', 0x1FAC2, 4, 0x1FABD, 2, 0x3D294, 1)),  # wood, steel, screws
+                               sub('DESC', struct.pack('<I', 0)), sub('CNAM', struct.pack('<I', ids['WV_Pegboard'])),
+                               sub('BNAM', struct.pack('<I', 0x8280B)),     # WorkshopWorkbenchTypeDecorations
+                               sub('FNAM', struct.pack('<I', 0x1B4AA7)),    # Decor > Wall decorations > Misc
+                               sub('INTV', struct.pack('<HH', 1, 100))])
+add('MESG', 'WV_CraftConfirm', [sub('DESC', zstr('Создать эту модификацию? Материалы спишутся из рюкзака и хранилища поселения.', 'utf-8')),
+                                sub('FULL', zstr('Стенд для модификаций', 'utf-8')),
+                                sub('INAM', struct.pack('<I', 0)), sub('DNAM', struct.pack('<I', 1)),
+                                sub('ITXT', zstr('Да', 'utf-8')), sub('ITXT', zstr('Нет', 'utf-8'))])
+
 def wstr(s): b = s.encode('latin1'); return struct.pack('<H', len(b)) + b
 def prop_obj(name, formid): return wstr(name) + bytes([1, 1]) + struct.pack('<HhI', 0, -1, formid)
 
@@ -138,6 +155,8 @@ props = {
     'WV_Ghosts': ids['WV_Ghosts'], 'WV_Sounds': ids['WV_Sounds'],
     'ZoneFrame': ids['WV_ZoneFrame'], 'WV_Stash': ids['WV_Stash'],
     'OutlineAttach': ids['WV_OutlineAttach'], 'OutlineRemove': ids['WV_OutlineRemove'],
+    'WV_Pegboard': ids['WV_Pegboard'], 'WV_CraftConfirm': ids['WV_CraftConfirm'],
+    'WorkshopItemKeyword': 0x54BA6,
 }
 vmad = struct.pack('<hhH', 6, 2, 1) + wstr('WeaponViseMain') + b'\0' + struct.pack('<H', len(props))
 vmad += b''.join(prop_obj(k, v) for k, v in props.items())
@@ -145,7 +164,7 @@ add('QUST', 'WV_Quest', [sub('VMAD', vmad), sub('FULL', zstr('Weapon Vise', 'lat
                          sub('DNAM', bytes.fromhex('110000000000000000000000')), sub('NEXT', b''),
                          sub('ANAM', struct.pack('<I', 0))])
 
-ORDER = ['SOUN', 'MISC', 'STAT', 'CONT', 'QUST', 'EFSH', 'FLST']
+ORDER = ['SOUN', 'MISC', 'STAT', 'CONT', 'MESG', 'COBJ', 'QUST', 'EFSH', 'FLST']
 nrec = sum(len(recs[t]) for t in ORDER)
 tes4 = record('TES4', 0, [sub('HEDR', struct.pack('<fII', 1.0, nrec, next_id)), sub('CNAM', zstr('Aleshon')),
                           sub('SNAM', zstr('Weapon Vise: modify weapons by hand at a weapons workbench.', 'latin1')),

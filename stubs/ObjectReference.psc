@@ -31,3 +31,6 @@ bool Function IsDisabled() native
 Form Function GetBaseObject() native
 Event OnItemRemoved(Form akBaseItem, int aiItemCount, ObjectReference akItemReference, ObjectReference akDestContainer)
 EndEvent
+ObjectReference Function GetLinkedRef(Keyword apKeyword = None) native
+int Function GetComponentCount(Form akItem = None) native
+Function RemoveComponents(Component akComponent, int aiCount, bool abSilent = false) native
