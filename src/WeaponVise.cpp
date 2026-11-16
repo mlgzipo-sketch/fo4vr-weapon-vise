@@ -100,6 +100,7 @@ namespace
         float boardFill{ 0.85f };       // share of the board the parts may cover
         float boardGap{ 2.0f };         // space between parts on the board
         float boardHover{ 3.0f };       // hand this close to a part on the board points at it (plus its size)
+        float boardStoreDepth{ 30.0f }; // a loose part let go or thrown this close in front of a board goes to the stash
     } g_settings;
 
     void loadSettings() noexcept
@@ -154,6 +155,7 @@ namespace
                 else if (key == "fBoardFill") s.boardFill = value;
                 else if (key == "fBoardGap") s.boardGap = value;
                 else if (key == "fBoardHover") s.boardHover = value;
+                else if (key == "fBoardStoreDepth") s.boardStoreDepth = value;
                 else if (key == "bLogGrab") s.logGrab = value != 0.0f;
                 else if (key == "bRemoveIntoHand") s.removeIntoHand = value != 0.0f;
                 else if (key == "bRefresh3D") s.refresh3D = value != 0.0f;
@@ -313,6 +315,8 @@ namespace
         kFramePose = 9,
         kBoardHover = 10,  // part = board item ref, mod = 1 hand came onto it, 0 left it
         kBoardTake = 11,   // part = board item ref, mod = its mod, pose = the palm
+        kBoardPlace = 12,  // part = board item ref, pose = where it hangs (the reference itself moves there)
+        kBoardStore = 13,  // part = loose part put or thrown onto a board: back to the stash
     };
 
     struct PendingCommand
@@ -1184,12 +1188,15 @@ namespace
         RE::NiTransform world{};   // where it is shown
         bool placed{ false };
         float radius{ 6.0f };
+        bool moved{ false };       // the reference itself was sent to its spot (3D moved alone vanished up close)
+        RE::NiPoint3 movedTo{};
     };
     std::vector<std::uint32_t> g_boards;
     std::vector<BoardItem> g_boardItems;
     std::uint64_t g_boardRevision{ 0 };
     std::array<std::uint32_t, 2> g_boardHover{};
     std::unordered_set<RE::NiAVObject*> g_boardToolsHidden;
+    std::unordered_set<std::uint32_t> g_storing;   // parts sent back to the stash, waiting for the script
 
     struct BoardFrame
     {
@@ -1200,6 +1207,7 @@ namespace
         float halfWidth{ 30.0f };
         float halfHeight{ 24.0f };
     };
+    std::vector<BoardFrame> g_boardFrames;
 
     RE::NiPoint3 cross(const RE::NiPoint3& a, const RE::NiPoint3& b) noexcept
     {
@@ -1307,6 +1315,9 @@ namespace
         g_boards = boards;
         g_boardItems = std::move(next);
         g_boardHover = {};
+        if (g_boards.empty() || g_boardItems.empty()) {
+            g_boardFrames.clear();
+        }
         char text[120]{};
         std::snprintf(text, sizeof(text), "Board: %zu boards, %zu parts", g_boards.size(), g_boardItems.size());
         logNote(text);
@@ -1339,6 +1350,7 @@ namespace
                 logNote(text);
             }
         }
+        g_boardFrames = frames;
         for (auto& item : g_boardItems) {
             item.placed = false;
             if (board >= frames.size()) {
@@ -1418,9 +1430,62 @@ namespace
             }
             auto world = item.world;
             world.translate = world.translate - offset;
+            if (!item.moved || distance(item.movedTo, world.translate) > 2.0f) {
+                // move the reference too: a 3D far from its reference vanished when the player came close
+                item.moved = true;
+                item.movedTo = world.translate;
+                PendingCommand command;
+                command.type = kBoardPlace;
+                command.part = item.ref;
+                command.pose = poseOf(world.translate, 0.0f);
+                pushCommand(command);
+            }
             place3D(root, world);
             if (auto* fade = root->IsFadeNode()) {
                 fade->GetFadeNodeRuntimeData().currentFade = item.state == 2 ? 1.0f : 0.3f;   // grey: not made yet
+            }
+        }
+    }
+
+    // A loose part put or thrown onto a board (not in a hand) goes back to the stash.
+    void updateBoardStore() noexcept
+    {
+        if (g_boardFrames.empty()) {
+            return;
+        }
+        for (auto& [id, part] : g_parts) {
+            if (part.carriedBy != -1 || g_storing.contains(id)) {
+                continue;
+            }
+            auto* ref = lookupRef(id);
+            auto* root = ref ? ref->Get3D() : nullptr;
+            if (!looksLikeObject(root)) {
+                continue;
+            }
+            const auto at = centerOf(root);
+            bool held = false;
+            for (const auto& hand : g_hands_state) {
+                if (hand.valid && (hand.grip || hand.previousGrip) && distance(hand.point, at) < g_settings.heldRadius + root->worldBound.fRadius) {
+                    held = true;
+                }
+            }
+            if (held) {
+                continue;
+            }
+            for (const auto& f : g_boardFrames) {
+                const auto d = at - f.center;
+                const float out = dot(d, f.normal);
+                if (std::abs(dot(d, f.width)) < f.halfWidth + 6.0f && std::abs(dot(d, f.up)) < f.halfHeight + 6.0f &&
+                    out > -8.0f && out < g_settings.boardStoreDepth) {
+                    g_storing.insert(id);
+                    PendingCommand command;
+                    command.type = kBoardStore;
+                    command.part = id;
+                    command.mod = part.mod;
+                    pushCommand(command);
+                    logNote("Board: part " + std::to_string(id) + " put on the board, back to the stash");
+                    break;
+                }
             }
         }
     }
@@ -1825,6 +1890,7 @@ namespace
         }
         for (const auto id : forgotten) {
             g_parts.erase(id);
+            g_storing.erase(id);
             for (auto& hand : g_hands_state) {
                 if (hand.part == id && hand.mode == Hand::Mode::Carry) {
                     hand.mode = hand.grip ? Hand::Mode::Done : Hand::Mode::Idle;
@@ -2227,6 +2293,7 @@ namespace
         updateSnaps();
         applyGhosts();
         updateBoard();
+        updateBoardStore();
         updateFrame();
     }
 

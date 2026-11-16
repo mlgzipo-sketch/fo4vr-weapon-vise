@@ -29,6 +29,8 @@ int Property CmdSound = 8 AutoReadOnly
 int Property CmdFramePose = 9 AutoReadOnly
 int Property CmdBoardHover = 10 AutoReadOnly
 int Property CmdBoardTake = 11 AutoReadOnly
+int Property CmdBoardPlace = 12 AutoReadOnly
+int Property CmdBoardStore = 13 AutoReadOnly
 int Property TimerScan = 1 AutoReadOnly
 int Property TimerFast = 2 AutoReadOnly
 int Property MaxParts = 120 AutoReadOnly
@@ -318,6 +320,14 @@ Function Handle()
 			BoardHover(CmdPart(), WeaponVise.CommandFlag())
 		elseif cmd == CmdBoardTake
 			BoardTake(CmdPart(), WeaponVise.CommandModID())
+		elseif cmd == CmdBoardPlace
+			ObjectReference bp = CmdPart()
+			if bp
+				float[] bpose = WeaponVise.CommandPose()
+				bp.SetPosition(bpose[0], bpose[1], bpose[2])
+			endif
+		elseif cmd == CmdBoardStore
+			StorePart(CmdPart())
 		elseif cmd == CmdFramePose
 			if FrameRef
 				float[] fp = WeaponVise.CommandPose()
@@ -1022,6 +1032,35 @@ Function BoardTake(ObjectReference r, int modId)
 	else
 		WeaponVise.Hud(BoardText(modId, st, ws))
 	endif
+	RefreshStates()
+EndFunction
+
+; A part put or thrown onto a stand goes back to the settlement's stash (the inventory if there is none).
+Function StorePart(ObjectReference part)
+	int k = -1
+	if part
+		k = Parts.Find(part)
+	endif
+	if k < 0
+		return
+	endif
+	int i = WV_Mods.Find(PartMods[k])
+	Parts.Remove(k)
+	PartMods.Remove(k)
+	WeaponVise.ForgetPart(part)
+	part.Disable()
+	part.Delete()
+	if i >= 0
+		Form loose = WV_LooseMods.GetAt(i)
+		ObjectReference ws = WorkshopOf(Bench)
+		if ws
+			ws.AddItem(loose, 1, true)
+		else
+			Game.GetPlayer().AddItem(loose, 1, true)
+		endif
+		WeaponVise.Hud("Убрано на стенд: " + NameOf(loose))
+	endif
+	PlaySound(2)
 	RefreshStates()
 EndFunction
 
