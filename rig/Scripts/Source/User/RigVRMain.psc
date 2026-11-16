@@ -184,6 +184,11 @@ Function Handle()
 			endif
 		elseif cmd == 10
 			if f
+				; a gun the game still counts as worn (hidden) is taken off first, or equipping it does nothing
+				if player.IsEquipped(f)
+					player.UnequipItem(f, false, true)
+					Utility.Wait(0.1)
+				endif
 				player.EquipItem(f, false, true)
 				if !player.IsEquipped(f)
 					Utility.Wait(0.2)
@@ -193,7 +198,14 @@ Function Handle()
 		elseif cmd == 11
 			if f
 				int want = RigVR.CommandKind()
+				; taken off until the game really has it off (once is not always enough)
+				int tries = 0
 				player.UnequipItem(f, false, true)
+				while player.IsEquipped(f) && tries < 4
+					Utility.Wait(0.1)
+					player.UnequipItem(f, false, true)
+					tries += 1
+				endwhile
 				Recollect(f, want)
 			endif
 		elseif cmd == 12

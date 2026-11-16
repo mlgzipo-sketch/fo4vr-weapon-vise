@@ -892,7 +892,7 @@ namespace
         return kind == RE::ENUM_FORM_ID::kMISC || kind == RE::ENUM_FORM_ID::kALCH || kind == RE::ENUM_FORM_ID::kAMMO ||
                kind == RE::ENUM_FORM_ID::kBOOK || kind == RE::ENUM_FORM_ID::kNOTE || kind == RE::ENUM_FORM_ID::kKEYM ||
                kind == RE::ENUM_FORM_ID::kINGR || kind == RE::ENUM_FORM_ID::kARMO ||
-               (kind == RE::ENUM_FORM_ID::kWEAP && static_cast<RE::TESObjectWEAP*>(form)->weaponData.type.get() != RE::WEAPON_TYPE::kGun);
+               kind == RE::ENUM_FORM_ID::kWEAP;   // guns too: a gun let go in the bag goes to the inventory
     }
 
     // ------------------------------------------------------------ controllers and hands
@@ -1989,15 +1989,23 @@ namespace
 
     // ------------------------------------------------------------ on the body
 
-    // The Weapon node of your body (the gun in the hand hangs under it).
-    RE::NiNode* weaponNode(RE::PlayerCharacter* player) noexcept
+    // The Weapon node of your body that holds the model of this gun ("Weapon  (<form id>)").
+    RE::NiNode* weaponNode(RE::PlayerCharacter* player, std::uint32_t form) noexcept
     {
+        char tag[16]{};
+        std::snprintf(tag, sizeof(tag), "(%08X)", form);
         RE::NiAVObject* roots[3]{ player->Get3D(true), player->Get3D(false), player->Get3D() };
         for (auto* root : roots) {
             if (!looksLikeObject(root)) continue;
             auto* node = findNode(root, "Weapon");
-            if (node && node->GetRuntimeData().children.size() > 0) {
-                return node;
+            if (!node) continue;
+            auto& children = node->GetRuntimeData().children;
+            if (children.size() == 0 || children.size() > 16) continue;
+            for (std::uint16_t i = 0; i < children.size(); ++i) {
+                auto* child = children[i].get();
+                if (looksLikeObject(child) && child->name.c_str() && std::strstr(child->name.c_str(), tag)) {
+                    return node;
+                }
             }
         }
         return nullptr;
@@ -2011,11 +2019,11 @@ namespace
         if (!gun) {
             return;
         }
-        auto* node = weaponNode(player);
+        auto* node = weaponNode(player, gun->GetFormID());
         if (!node) {
             if (!g_state.weaponLogged) {
                 g_state.weaponLogged = true;
-                note("Weapon node not found: a gun put away is shown by its plain model");
+                note("No model of gun %08X under a Weapon node: it cannot be copied for the holster", gun->GetFormID());
             }
             return;
         }
