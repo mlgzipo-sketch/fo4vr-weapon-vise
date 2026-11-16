@@ -578,6 +578,7 @@ namespace
         RE::NiAVObject* detached{ nullptr };   // 3D we took out of physics while carrying
         int collision{ -1 };        // -1 not checked yet; 0: the model has no physics (ROCK can not hold it)
         bool previewing{ false };   // ghost shown while a gripping hand holds it near its place
+        bool boardArmed{ false };   // has been away from the stands since it appeared (one just taken there stays)
         Clock::time_point previewSince{};
     };
     std::unordered_map<std::uint32_t, LoosePart> g_parts;
@@ -1508,6 +1509,21 @@ namespace
             if (held) {
                 continue;
             }
+            bool nearAny = false;
+            for (const auto& f : g_boardFrames) {
+                const auto d = at - f.center;
+                const float out = dot(d, f.normal);
+                if (std::abs(dot(d, f.width)) < f.halfWidth + 30.0f && std::abs(dot(d, f.up)) < f.halfHeight + 30.0f &&
+                    out > -30.0f && out < g_settings.boardStoreDepth + 30.0f) {
+                    nearAny = true;
+                }
+            }
+            if (!nearAny) {
+                part.boardArmed = true;
+            }
+            if (!part.boardArmed) {
+                continue;   // just taken off a stand: not put back until carried away first
+            }
             for (const auto& f : g_boardFrames) {
                 const auto d = at - f.center;
                 const float out = dot(d, f.normal);
@@ -1626,11 +1642,21 @@ namespace
             return false;
         }
         forEachNode(g_font.get(), [](RE::NiAVObject* object, int depth) {
-            if (depth == 1 && object->IsNode()) {
-                g_fontGlyphs[object->name.c_str()] = object->IsNode();
+            // "<colour><4 hex digits>", at whatever depth the loader put them
+            const char* n = object->name.c_str();
+            if (object->IsNode() && n && std::strlen(n) == 5 && std::strchr("wgry", n[0]) && std::isxdigit(static_cast<unsigned char>(n[1]))) {
+                g_fontGlyphs[n] = object->IsNode();
             }
         });
         logNote("Font: " + std::to_string(g_fontGlyphs.size()) + " letters");
+        if (g_fontGlyphs.empty()) {
+            int shown = 0;
+            forEachNode(g_font.get(), [&](RE::NiAVObject* object, int depth) {
+                if (shown++ < 8) {
+                    logNote("  font node '" + std::string(object->name.c_str() ? object->name.c_str() : "") + "' depth " + std::to_string(depth));
+                }
+            });
+        }
         return !g_fontGlyphs.empty();
     }
 

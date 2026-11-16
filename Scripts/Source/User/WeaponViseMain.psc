@@ -277,7 +277,7 @@ Function Scan()
 	endif
 	if Clamped && Bench && WV_Pegboard && !Busy
 		BoardTicks += 1
-		if BoardTicks >= 3
+		if BoardTicks >= 10
 			BoardTicks = 0
 			Busy = true
 			; a stand built or removed while the weapon is in the vise
@@ -292,8 +292,6 @@ Function Scan()
 			endif
 			if count != had
 				RefreshBoard()
-			elseif BoardRefs && BoardRefs.Length > 0
-				RefreshStates()
 			endif
 			Busy = false
 		endif
@@ -809,6 +807,14 @@ bool Function CanCraft(int modId, ObjectReference ws)
 	return true
 EndFunction
 
+; Owned or not: a few calls. Whether a grey one can be made costs dozens of calls per part, so it is asked on hover.
+int Function QuickState(int k, ObjectReference ws)
+	if OwnedCount(k, ws) > 0
+		return 2
+	endif
+	return 0
+EndFunction
+
 int Function StateOf(int modId, ObjectReference ws)
 	int k = WV_Mods.Find(Game.GetForm(modId))
 	if k >= 0 && OwnedCount(k, ws) > 0
@@ -871,7 +877,7 @@ Function RefreshBoard()
 			if r
 				refs.Add(r)
 				mods.Add(ids[i])
-				states.Add(StateOf(ids[i], ws))
+				states.Add(QuickState(k, ws))   ; exact (can it be made) only when a hand points at it
 			endif
 		endif
 		i += 1
@@ -901,7 +907,10 @@ Function RefreshStates()
 	bool changed = false
 	int i = 0
 	while i < BoardModIds.Length
-		int st = StateOf(BoardModIds[i], ws)
+		int st = QuickState(WV_Mods.Find(Game.GetForm(BoardModIds[i])), ws)
+		if st == 0 && BoardStates[i] == 1
+			st = 1   ; kept from the last hover
+		endif
 		if st != BoardStates[i]
 			BoardStates[i] = st
 			changed = true
@@ -1003,7 +1012,11 @@ Function BoardHover(ObjectReference r, int entered)
 		WeaponVise.Panel(None, "")
 		return
 	endif
-	int st = BoardStates[b]
+	int st = StateOf(BoardModIds[b], WorkshopOf(Bench))
+	if st != BoardStates[b]
+		BoardStates[b] = st
+		WeaponVise.SetBoard(Boards, BoardRefs, BoardModIds, BoardStates)
+	endif
 	if st == 1
 		OutlineAttach.Play(r, -1.0)
 	elseif st == 0
