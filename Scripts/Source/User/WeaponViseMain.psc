@@ -913,6 +913,7 @@ Function ClearBoard()
 	BoardStates = new int[0]
 	Boards = new ObjectReference[0]
 	WeaponVise.SetBoard(Boards, BoardRefs, BoardModIds, BoardStates)
+	WeaponVise.Panel(None, "")
 EndFunction
 
 string Function NameOf(Form f)
@@ -925,30 +926,32 @@ string Function NameOf(Form f)
 	return "?"
 EndFunction
 
-; What the hand points at: its name, how many there are, or what making it takes.
+; What the hand points at, for the text above it: ~w ~g ~r ~y colours, | new line.
 string Function BoardText(int modId, int st, ObjectReference ws)
 	int k = WV_Mods.Find(Game.GetForm(modId))
 	if k < 0
 		return ""
 	endif
-	string text = NameOf(WV_LooseMods.GetAt(k))
+	string text = "~w" + NameOf(WV_LooseMods.GetAt(k)) + "|"
 	if st == 2
-		return text + ": есть " + OwnedCount(k, ws) + ". Грип: взять"
+		return text + "~gЕсть: " + OwnedCount(k, ws) + ". Грип: взять"
 	endif
 	int[] recipe = WeaponVise.RecipeOf(modId)
 	if !recipe || recipe.Length == 0
-		return text + ": не создаётся"
+		return text + "~rНе создаётся"
 	endif
 	Actor player = Game.GetPlayer()
-	string need = ""
 	int i = 0
 	while i + 1 < recipe.Length
 		Form f = Game.GetForm(recipe[i])
 		if f
-			if need != ""
-				need += ", "
+			int have = CountOf(f, ws)
+			if have >= recipe[i + 1]
+				text += "~g"
+			else
+				text += "~r"
 			endif
-			need += NameOf(f) + " " + CountOf(f, ws) + "/" + recipe[i + 1]
+			text += NameOf(f) + " " + have + "/" + recipe[i + 1] + "|"
 		endif
 		i += 2
 	endwhile
@@ -957,18 +960,19 @@ string Function BoardText(int modId, int st, ObjectReference ws)
 	while perks && i < perks.Length
 		Perk p = Game.GetForm(perks[i]) as Perk
 		if p
-			string mark = ""
-			if !player.HasPerk(p)
-				mark = " (нет)"
+			if player.HasPerk(p)
+				text += "~g"
+			else
+				text += "~r"
 			endif
-			need += ", навык " + NameOf(p) + mark
+			text += "Навык: " + NameOf(p) + "|"
 		endif
 		i += 1
 	endwhile
 	if st == 1
-		return text + ": " + need + ". Грип: создать"
+		return text + "~yГрип: создать"
 	endif
-	return text + ": не хватает. " + need
+	return text + "~rНе хватает"
 EndFunction
 
 Function BoardHover(ObjectReference r, int entered)
@@ -982,6 +986,7 @@ Function BoardHover(ObjectReference r, int entered)
 	OutlineAttach.Stop(r)
 	OutlineRemove.Stop(r)
 	if entered == 0
+		WeaponVise.Panel(None, "")
 		return
 	endif
 	int st = BoardStates[b]
@@ -990,7 +995,7 @@ Function BoardHover(ObjectReference r, int entered)
 	elseif st == 0
 		OutlineRemove.Play(r, -1.0)
 	endif
-	WeaponVise.Hud(BoardText(BoardModIds[b], st, WorkshopOf(Bench)))
+	WeaponVise.Panel(r, BoardText(BoardModIds[b], st, WorkshopOf(Bench)))
 EndFunction
 
 ; Grip on a part on the board: an owned one comes into the palm (ROCK takes it);
@@ -1029,10 +1034,9 @@ Function BoardTake(ObjectReference r, int modId)
 				WeaponVise.Hud("Создано: " + NameOf(loose))
 			endif
 		endif
-	else
-		WeaponVise.Hud(BoardText(modId, st, ws))
 	endif
 	RefreshStates()
+	WeaponVise.Panel(r, BoardText(modId, StateOf(modId, ws), ws))
 EndFunction
 
 ; A part put or thrown onto a stand goes back to the settlement's stash (the inventory if there is none).

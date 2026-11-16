@@ -29,3 +29,4 @@ int[] Function RecipeOf(int aiModID) global native     ; component/item id, coun
 int[] Function PerksOf(int aiModID) global native
 Function SetBoard(ObjectReference[] akBoards, ObjectReference[] akItems, int[] aiMods, int[] aiStates) global native
 Function Hud(string asText) global native
+Function Panel(ObjectReference akItem, string asText) global native   ; text above a part on a stand ("" hides it)

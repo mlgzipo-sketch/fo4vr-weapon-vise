@@ -101,6 +101,7 @@ namespace
         float boardGap{ 2.0f };         // space between parts on the board
         float boardHover{ 3.0f };       // hand this close to a part on the board points at it (plus its size)
         float boardStoreDepth{ 30.0f };
+        float panelLetter{ 1.3f };         // letter height of the text above a part on a stand
         float boardPointRange{ 250.0f };   // point at a part on a stand from this far (0: touch only)
         float boardPointSign{ 1.0f };      // -1 if pointing picks parts behind the hand // a loose part let go or thrown this close in front of a board goes to the stash
     } g_settings;
@@ -159,6 +160,7 @@ namespace
                 else if (key == "fBoardHover") s.boardHover = value;
                 else if (key == "fBoardStoreDepth") s.boardStoreDepth = value;
                 else if (key == "fBoardPointRange") s.boardPointRange = value;
+                else if (key == "fPanelLetter") s.panelLetter = value;
                 else if (key == "fBoardPointSign") s.boardPointSign = value;
                 else if (key == "bLogGrab") s.logGrab = value != 0.0f;
                 else if (key == "bRemoveIntoHand") s.removeIntoHand = value != 0.0f;
@@ -355,6 +357,9 @@ namespace
         std::vector<std::uint32_t> boardItems;   // display references
         std::vector<std::uint32_t> boardMods;    // the mod of each
         std::vector<std::int32_t> boardStates;   // 0 grey (can not craft), 1 grey (can craft), 2 owned
+        std::uint32_t panelItem{ 0 };            // board item the text panel hangs above (0: none)
+        std::string panelText;                   // ~w ~g ~r ~y colours, | new line
+        std::uint64_t panelRevision{ 0 };
         std::uint64_t boardRevision{ 0 };
     } g_shared;
 
@@ -1192,6 +1197,7 @@ namespace
         RE::NiTransform world{};   // where it is shown
         bool placed{ false };
         float radius{ 6.0f };
+        std::size_t frame{ 0 };    // which board it hangs on
         bool moved{ false };       // the reference itself was sent to its spot (3D moved alone vanished up close)
         RE::NiPoint3 movedTo{};
     };
@@ -1399,6 +1405,7 @@ namespace
             world.scale = 1.0f;
             item.world = world;
             item.placed = true;
+            item.frame = board;
         }
     }
 
@@ -1511,6 +1518,263 @@ namespace
             }
         }
         return best;
+    }
+
+    // ------------------------------------------------------------ text above a part on a stand
+    //
+    // Meshes\WeaponVise\Font.nif holds one quad per letter and colour (tools/build_font.py), node "<colour><hex>".
+    // Letters are clones of those nodes (the game's clone), hung under the board's 3D and turned to the player.
+
+    constexpr float kFontAdvance = 0.62f;
+    RE::NiPointer<RE::NiNode> g_font;
+    bool g_fontTried{ false };
+    std::unordered_map<std::string, RE::NiNode*> g_fontGlyphs;
+    std::unordered_map<std::string, std::vector<RE::NiPointer<RE::NiNode>>> g_glyphPool;
+    struct Letter
+    {
+        std::string key;
+        RE::NiPointer<RE::NiNode> node;
+        float x{ 0.0f };
+        float z{ 0.0f };
+    };
+    std::vector<Letter> g_letters;
+    RE::NiNode* g_lettersParent{ nullptr };
+    std::uint64_t g_panelRevision{ ~0ull };
+    std::uint32_t g_panelItem{ 0 };
+
+    RE::NiNode* cloneNode(RE::NiNode* source) noexcept
+    {
+        if (!looksLikeObject(source)) {
+            return nullptr;
+        }
+        // CreateClone + ProcessClone at its address in Fallout4VR.exe 1.2.72, checked by its first bytes (as in RigVR)
+        using Clone = RE::NiObject* (*)(RE::NiObject*, RE::NiCloningProcess*);
+        static Clone clone = [] {
+            constexpr std::uintptr_t rva = 0x1C13FF0;
+            constexpr std::uint8_t expected[]{ 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20,
+                0x48, 0x8B, 0x01, 0x48, 0x8B, 0xFA, 0x48, 0x8B, 0xF1, 0xFF, 0x90, 0xE0, 0, 0, 0 };
+            const auto* at = reinterpret_cast<const std::uint8_t*>(REL::Module::get().base() + rva);
+            const bool ok = std::memcmp(at, expected, sizeof(expected)) == 0;
+            logNote(ok ? "Game clone function found" : "Game clone function NOT found: no text above parts");
+            return ok ? reinterpret_cast<Clone>(REL::Module::get().base() + rva) : nullptr;
+        }();
+        if (!clone) {
+            return nullptr;
+        }
+        RE::NiCloningProcess process{};
+        process.copyType = RE::NiCloningProcess::CopyType::kCopyExact;
+        process.appendChar = '$';
+        process.scale = { 1.0f, 1.0f, 1.0f };
+        auto* av = static_cast<RE::NiAVObject*>(clone(source, &process));
+        auto* node = looksLikeObject(av) ? av->IsNode() : nullptr;
+        if (!node || node == source) {
+            return nullptr;
+        }
+        node->parent = nullptr;
+        return node;
+    }
+
+    bool loadFont() noexcept
+    {
+        if (g_fontTried) {
+            return !g_fontGlyphs.empty();
+        }
+        g_fontTried = true;
+        RE::BSModelDB::DBTraits::ArgsType args{};
+        args.lodFadeMult = RE::ENUM_LOD_MULT::kObjects;
+        args.loadLevel = 0;
+        args.prepareAfterLoad = 1;
+        args.useErrorMarker = 0;
+        args.performProcess = 1;
+        args.createFadeNode = 0;
+        args.loadTextures = 1;
+        for (const char* name : { "WeaponVise\\Font.nif", "Meshes\\WeaponVise\\Font.nif" }) {
+            RE::NiPointer<RE::NiNode> node;
+            const auto error = RE::BSModelDB::Demand(name, &node, args);
+            if (node && looksLikeObject(node.get())) {
+                g_font = node;
+                break;
+            }
+            logNote(std::string("Font ") + name + ": error " + std::to_string(static_cast<int>(error)));
+        }
+        if (!g_font) {
+            return false;
+        }
+        forEachNode(g_font.get(), [](RE::NiAVObject* object, int depth) {
+            if (depth == 1 && object->IsNode()) {
+                g_fontGlyphs[object->name.c_str()] = object->IsNode();
+            }
+        });
+        logNote("Font: " + std::to_string(g_fontGlyphs.size()) + " letters");
+        return !g_fontGlyphs.empty();
+    }
+
+    void clearLetters() noexcept
+    {
+        for (auto& letter : g_letters) {
+            auto* node = letter.node.get();
+            if (looksLikeObject(node) && node->parent) {
+                if (looksLikeObject(node->parent)) {
+                    node->parent->DetachChild(node);
+                }
+                node->parent = nullptr;
+            }
+            g_glyphPool[letter.key].push_back(letter.node);
+        }
+        g_letters.clear();
+        g_lettersParent = nullptr;
+    }
+
+    std::vector<std::uint32_t> codePoints(const std::string& text) noexcept
+    {
+        std::vector<std::uint32_t> out;
+        for (std::size_t i = 0; i < text.size();) {
+            const auto c = static_cast<unsigned char>(text[i]);
+            std::uint32_t cp = c;
+            int extra = 0;
+            if (c >= 0xF0) { cp = c & 0x07; extra = 3; }
+            else if (c >= 0xE0) { cp = c & 0x0F; extra = 2; }
+            else if (c >= 0xC0) { cp = c & 0x1F; extra = 1; }
+            ++i;
+            for (int k = 0; k < extra && i < text.size(); ++k, ++i) {
+                cp = (cp << 6) | (static_cast<unsigned char>(text[i]) & 0x3F);
+            }
+            out.push_back(cp);
+        }
+        return out;
+    }
+
+    // Lines of (colour, letter); long lines wrap at a space.
+    std::vector<std::vector<std::pair<char, std::uint32_t>>> panelLines(const std::string& text) noexcept
+    {
+        constexpr std::size_t kWidth = 30;
+        std::vector<std::vector<std::pair<char, std::uint32_t>>> lines(1);
+        char colour = 'w';
+        const auto cps = codePoints(text);
+        for (std::size_t i = 0; i < cps.size(); ++i) {
+            const auto cp = cps[i];
+            if (cp == '~' && i + 1 < cps.size()) {
+                colour = static_cast<char>(cps[++i]);
+                continue;
+            }
+            if (cp == '|') {
+                lines.emplace_back();
+                continue;
+            }
+            auto& line = lines.back();
+            line.emplace_back(colour, cp);
+            if (line.size() > kWidth) {
+                std::size_t cut = line.size();
+                while (cut > 0 && line[cut - 1].second != ' ') {
+                    --cut;
+                }
+                if (cut == 0) {
+                    cut = line.size() - 1;
+                }
+                std::vector<std::pair<char, std::uint32_t>> rest(line.begin() + cut, line.end());
+                line.resize(cut);
+                lines.push_back(std::move(rest));
+            }
+        }
+        for (auto& line : lines) {
+            while (!line.empty() && line.back().second == ' ') {
+                line.pop_back();
+            }
+        }
+        return lines;
+    }
+
+    void updatePanel() noexcept
+    {
+        std::uint32_t itemId = 0;
+        std::string text;
+        std::uint64_t revision = 0;
+        {
+            std::scoped_lock guard(g_shared.lock);
+            itemId = g_shared.panelItem;
+            text = g_shared.panelText;
+            revision = g_shared.panelRevision;
+        }
+        const BoardItem* item = nullptr;
+        for (const auto& candidate : g_boardItems) {
+            if (candidate.ref == itemId && candidate.placed) {
+                item = &candidate;
+            }
+        }
+        auto* itemRef = item ? lookupRef(item->ref) : nullptr;
+        auto* itemRoot = itemRef ? itemRef->Get3D() : nullptr;
+        auto* boardRef = item && item->frame < g_boards.size() ? lookupRef(g_boards[item->frame]) : nullptr;
+        auto* boardRoot = boardRef ? boardRef->Get3D() : nullptr;
+        auto* parent = looksLikeObject(boardRoot) ? boardRoot->IsNode() : nullptr;
+        if (!item || text.empty() || !looksLikeObject(itemRoot) || !parent || item->frame >= g_boardFrames.size() || !loadFont()) {
+            if (!g_letters.empty()) {
+                clearLetters();
+            }
+            return;
+        }
+        if (revision != g_panelRevision || parent != g_lettersParent || g_panelItem != itemId) {
+            clearLetters();
+            g_panelRevision = revision;
+            g_panelItem = itemId;
+            const auto lines = panelLines(text);
+            for (std::size_t l = 0; l < lines.size(); ++l) {
+                const auto& line = lines[l];
+                for (std::size_t i = 0; i < line.size(); ++i) {
+                    if (line[i].second == ' ') {
+                        continue;
+                    }
+                    char key[16]{};
+                    std::snprintf(key, sizeof(key), "%c%04X", line[i].first, static_cast<unsigned>(line[i].second));
+                    auto glyph = g_fontGlyphs.find(key);
+                    if (glyph == g_fontGlyphs.end()) {
+                        std::snprintf(key, sizeof(key), "w%04X", static_cast<unsigned>(line[i].second));
+                        glyph = g_fontGlyphs.find(key);
+                        if (glyph == g_fontGlyphs.end()) {
+                            continue;
+                        }
+                    }
+                    Letter letter;
+                    letter.key = key;
+                    auto& pool = g_glyphPool[key];
+                    if (!pool.empty()) {
+                        letter.node = pool.back();
+                        pool.pop_back();
+                    } else {
+                        letter.node = RE::NiPointer<RE::NiNode>(cloneNode(glyph->second));
+                    }
+                    if (!letter.node) {
+                        continue;
+                    }
+                    letter.x = (static_cast<float>(i) - static_cast<float>(line.size()) * 0.5f) * kFontAdvance;
+                    letter.z = static_cast<float>(lines.size() - 1 - l) * 1.25f;
+                    parent->AttachChild(letter.node.get(), true);
+                    g_letters.push_back(std::move(letter));
+                }
+            }
+            g_lettersParent = parent;
+        }
+        // above the part, in front of the board, turned to the player
+        const auto& f = g_boardFrames[item->frame];
+        const float h = std::max(0.3f, g_settings.panelLetter);
+        const auto anchor = centerOf(itemRoot) + f.up * (item->radius * 0.6f + 2.0f) + f.normal * 4.0f;
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        RE::NiPoint3 toPlayer = player ? player->GetPosition() - anchor : f.normal;
+        toPlayer.z = 0.0f;
+        if (dot(toPlayer, toPlayer) < 1.0f) {
+            toPlayer = f.normal;
+        }
+        const auto away = unit(toPlayer) * -1.0f;
+        const RE::NiPoint3 up{ 0.0f, 0.0f, 1.0f };
+        const auto right = unit(cross(away, up));
+        RE::NiTransform world{};
+        world.rotate.entry[0][0] = right.x; world.rotate.entry[0][1] = right.y; world.rotate.entry[0][2] = right.z;
+        world.rotate.entry[1][0] = away.x;  world.rotate.entry[1][1] = away.y;  world.rotate.entry[1][2] = away.z;
+        world.rotate.entry[2][0] = up.x;    world.rotate.entry[2][1] = up.y;    world.rotate.entry[2][2] = up.z;
+        world.scale = h;
+        for (auto& letter : g_letters) {
+            world.translate = anchor + right * (letter.x * h) + up * (letter.z * h);
+            place3D(letter.node.get(), world);
+        }
     }
 
     // The part the hand points at from afar (along the fingers), the nearest one on the ray.
@@ -2341,6 +2605,7 @@ namespace
         applyGhosts();
         updateBoard();
         updateBoardStore();
+        updatePanel();
         updateFrame();
     }
 
@@ -2586,6 +2851,14 @@ namespace
         ++g_shared.boardRevision;
     }
 
+    void Panel(std::monostate, RE::TESObjectREFR* item, RE::BSFixedString text)
+    {
+        std::scoped_lock guard(g_shared.lock);
+        g_shared.panelItem = item ? item->GetFormID() : 0;
+        g_shared.panelText = text.c_str() ? text.c_str() : "";
+        ++g_shared.panelRevision;
+    }
+
     void Hud(std::monostate, RE::BSFixedString text)
     {
         hud(text.c_str());
@@ -2644,6 +2917,7 @@ namespace
         vm->BindNativeMethod(kScript, "PerksOf", PerksOf, true);
         vm->BindNativeMethod(kScript, "SetBoard", SetBoard, true);
         vm->BindNativeMethod(kScript, "Hud", Hud, true);
+        vm->BindNativeMethod(kScript, "Panel", Panel, true);
         logNote("Papyrus functions of script WeaponVise registered");
         return true;
     }

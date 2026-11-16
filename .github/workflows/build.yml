@@ -91,6 +91,9 @@ jobs:
           python tools\build_esp.py package\WeaponVise.esp
           New-Item -ItemType Directory -Force package\Meshes\WeaponVise | Out-Null
           python tools\build_frame_nif.py package\Meshes\WeaponVise\ZoneFrame.nif
+          Copy-Item data\Font.nif package\Meshes\WeaponVise\Font.nif
+          New-Item -ItemType Directory -Force package\Textures\WeaponVise | Out-Null
+          Copy-Item data\Font.dds package\Textures\WeaponVise\Font.dds
           if (-not (Test-Path "$plugins\WeaponVise_parts.csv")) { throw "parts table missing" }
           Copy-Item README.md package\WeaponVise-README.md
           Compress-Archive -Path package\* -DestinationPath WeaponVise.zip
