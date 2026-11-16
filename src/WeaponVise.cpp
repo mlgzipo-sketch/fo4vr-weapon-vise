@@ -101,6 +101,7 @@ namespace
         float boardGap{ 2.0f };         // space between parts on the board
         float boardHover{ 3.0f };       // hand this close to a part on the board points at it (plus its size)
         float boardStoreDepth{ 30.0f };
+        float boardGreyFade{ 0.55f };     // how solid a part not made yet looks on a stand
         float panelLetter{ 1.3f };         // letter height of the text above a part on a stand
         float boardPointRange{ 250.0f };   // point at a part on a stand from this far (0: touch only)
         float boardPointSign{ 1.0f };      // -1 if pointing picks parts behind the hand // a loose part let go or thrown this close in front of a board goes to the stash
@@ -161,6 +162,7 @@ namespace
                 else if (key == "fBoardStoreDepth") s.boardStoreDepth = value;
                 else if (key == "fBoardPointRange") s.boardPointRange = value;
                 else if (key == "fPanelLetter") s.panelLetter = value;
+                else if (key == "fBoardGreyFade") s.boardGreyFade = value;
                 else if (key == "fBoardPointSign") s.boardPointSign = value;
                 else if (key == "bLogGrab") s.logGrab = value != 0.0f;
                 else if (key == "bRemoveIntoHand") s.removeIntoHand = value != 0.0f;
@@ -604,7 +606,19 @@ namespace
     void pushCommand(const PendingCommand& command) noexcept
     {
         std::scoped_lock guard(g_shared.lock);
+        if (command.type == kBoardPlace || command.type == kBoardHover) {
+            // only the latest one matters: a flood of these held up the weapon's release for a minute
+            for (auto& pending : g_shared.commands) {
+                if (pending.type == command.type && pending.part == command.part) {
+                    pending = command;
+                    return;
+                }
+            }
+        }
         g_shared.commands.push_back(command);
+        if (command.type == kBoardPlace || command.type == kBoardHover) {
+            return;   // not logged: many of them
+        }
         char message[128]{};
         std::snprintf(message, sizeof(message), "Command %d mod=%08X part=%08X at (%.0f, %.0f, %.0f) h=%.0f",
             command.type, command.mod, command.part, command.pose[0], command.pose[1], command.pose[2], command.pose[3]);
@@ -1198,6 +1212,9 @@ namespace
         bool placed{ false };
         float radius{ 6.0f };
         std::size_t frame{ 0 };    // which board it hangs on
+        bool measured{ false };
+        RE::NiPoint3 centerLocal{};
+        Clock::time_point movedAt{};
         bool moved{ false };       // the reference itself was sent to its spot (3D moved alone vanished up close)
         RE::NiPoint3 movedTo{};
     };
@@ -1206,6 +1223,7 @@ namespace
     std::uint64_t g_boardRevision{ 0 };
     std::array<std::uint32_t, 2> g_boardHover{};
     std::unordered_set<RE::NiAVObject*> g_boardToolsHidden;
+    std::uint64_t g_boardLayoutRevision{ 0 };
     std::unordered_set<std::uint32_t> g_storing;   // parts sent back to the stash, waiting for the script
 
     struct BoardFrame
@@ -1434,17 +1452,24 @@ namespace
                 continue;
             }
             setCulled(root, false);
-            // the part's middle at the cell's middle (its root is its attach point, not its middle)
-            const auto offset = centerOf(root) - root->world.translate;
-            if (root->worldBound.fRadius > 0.5f && root->worldBound.fRadius < 60.0f) {
+            // the part's middle at the cell's middle (its root is its attach point, not its middle).
+            // Measured once in the part's own frame: measured every frame it swung with the part's turn and size,
+            // the layout flipped between two answers and two parts jumped over each other.
+            if (!item.measured && root->worldBound.fRadius > 0.5f && root->worldBound.fRadius < 60.0f) {
+                item.measured = true;
                 item.radius = root->worldBound.fRadius;
+                item.centerLocal = relative(root->world, pointTransform(centerOf(root))).translate;
+                ++g_boardLayoutRevision;
             }
             auto world = item.world;
-            world.translate = world.translate - offset;
-            if (!item.moved || distance(item.movedTo, world.translate) > 2.0f) {
+            RE::NiTransform turned = world;
+            turned.translate = {};
+            world.translate = world.translate - compose(turned, pointTransform(item.centerLocal)).translate;
+            if (!item.moved || (distance(item.movedTo, world.translate) > 5.0f && seconds(item.movedAt) > 2.0f)) {
                 // move the reference too: a 3D far from its reference vanished when the player came close
                 item.moved = true;
                 item.movedTo = world.translate;
+                item.movedAt = Clock::now();
                 PendingCommand command;
                 command.type = kBoardPlace;
                 command.part = item.ref;
@@ -1453,7 +1478,7 @@ namespace
             }
             place3D(root, world);
             if (auto* fade = root->IsFadeNode()) {
-                fade->GetFadeNodeRuntimeData().currentFade = item.state == 2 ? 1.0f : 0.3f;   // grey: not made yet
+                fade->GetFadeNodeRuntimeData().currentFade = item.state == 2 ? 1.0f : g_settings.boardGreyFade;   // grey: not made yet
             }
         }
     }
@@ -1778,7 +1803,7 @@ namespace
     }
 
     // The part the hand points at from afar (along the fingers), the nearest one on the ray.
-    const BoardItem* boardItemPointed(const Hand& hand) noexcept
+    const BoardItem* boardItemPointed(const Hand& hand, std::uint32_t current) noexcept
     {
         if (g_settings.boardPointRange <= 0.0f) {
             return nullptr;
@@ -1807,8 +1832,9 @@ namespace
             const auto across = v - dir * t;
             const float off = std::sqrt(dot(across, across));
             const float allowed = item.radius * 0.7f + 1.5f + t * 0.02f;
-            if (off < allowed && off / allowed < bestScore) {
-                bestScore = off / allowed;
+            const float score = off / allowed * (item.ref == current ? 0.6f : 1.0f);   // stays on the one it is on
+            if (off < allowed * (item.ref == current ? 1.3f : 1.0f) && score < bestScore) {
+                bestScore = score;
                 best = &item;
             }
         }
@@ -1830,7 +1856,7 @@ namespace
         // pointing from afar, but not from the vise (a grip there is for the weapon and its parts)
         const bool atVise = looksLikeObject(weapon3D) && distance(hand.point, centerOf(weapon3D)) < 40.0f;
         if (!item && !atVise && !(hand.grip && !pressed)) {
-            item = boardItemPointed(hand);
+            item = boardItemPointed(hand, g_boardHover[index]);
         }
         const std::uint32_t hover = item ? item->ref : 0;
         if (hover != g_boardHover[index]) {

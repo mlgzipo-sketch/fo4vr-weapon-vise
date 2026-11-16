@@ -275,12 +275,26 @@ Function Scan()
 		ReturnBench = None
 		Busy = false
 	endif
-	if Clamped && BoardRefs && BoardRefs.Length > 0 && !Busy
+	if Clamped && Bench && WV_Pegboard && !Busy
 		BoardTicks += 1
 		if BoardTicks >= 3
 			BoardTicks = 0
 			Busy = true
-			RefreshStates()
+			; a stand built or removed while the weapon is in the vise
+			ObjectReference[] near = Bench.FindAllReferencesOfType(WV_Pegboard, 700.0)
+			int count = 0
+			if near
+				count = near.Length
+			endif
+			int had = 0
+			if Boards
+				had = Boards.Length
+			endif
+			if count != had
+				RefreshBoard()
+			elseif BoardRefs && BoardRefs.Length > 0
+				RefreshStates()
+			endif
 			Busy = false
 		endif
 	endif
