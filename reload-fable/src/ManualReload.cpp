@@ -4926,6 +4926,14 @@ namespace
             }
             b.freezeUntil = now + std::chrono::milliseconds(static_cast<int>(std::max(g_settings.freezeSeconds, 1.0f) * 1000.0f));
         }
+        // the reload button opens and closes this gun by hand: the game, seeing it open (no rounds), would also start its own
+        // reload on the same press and play it (the double barrel, 0.50). Cut short while open and just after the button.
+        if (g_settings.blockReload && gunState == reloading && (b.open || now - b.toggled < std::chrono::milliseconds(1200))) {
+            player->gunState = static_cast<RE::GUN_STATE>(g_settings.idleGunState);
+            if (reloadStarted) {
+                note("The game's reload of a gun opened by hand is cut short (gunState %u -> %d)", gunState, g_settings.idleGunState);
+            }
+        }
         // a break action's barrels (or a launcher's breech) hang on a hinge: gravity and the gun's own jerks swing them;
         // they fall open freely, and only a pull shut stronger than fHingeHold (a flick) carries them shut
         const bool swinging = hinged && !revolver && !single && !cellCover && !capacitors && b.open && b.known && g_play.openAngle > 0.1f;
@@ -6708,7 +6716,13 @@ namespace
             st.idleKnown = all;
             learnSlide(root, bolt);
         }
-        if (quiet && !st.railKnown && looksLikeObject(magazine)) {
+        // the rail (where the magazine sits) is learned at rest even when the gun was taken empty: an empty gun froze the parts
+        // (lastAmmo 0) and so was never quiet, and its magazine could never be taken out (EJECT refused, rail known 0; 0.50)
+        const bool restingForRail = g_settings.blockReload && st.place == kSeated && st.s <= 0.0f &&
+                                    gunState == static_cast<std::uint32_t>(g_settings.idleGunState) && !pressed && now >= st.freezeUntil &&
+                                    !st.racking && now - st.equippedAt > std::chrono::milliseconds(700) &&
+                                    now - st.lastDrive > std::chrono::milliseconds(700);
+        if ((quiet || restingForRail) && !st.railKnown && looksLikeObject(magazine)) {
             learnRail(root, magazine);
         }
         useRockBoxes(root, bolt, quiet && gun.data->ammoCount > 0);
