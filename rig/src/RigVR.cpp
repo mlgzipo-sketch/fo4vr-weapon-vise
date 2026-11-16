@@ -411,6 +411,39 @@ namespace
     }
 
 
+    // Writes the parts of a model to the log: kind, name, hidden or not, fade, where it is and how big.
+    void logTree(const char* label, RE::NiAVObject* root) noexcept
+    {
+        int lines = 0;
+        forEachNode(root, [&](RE::NiAVObject* object, int depth) {
+            if (++lines > 60) return false;
+            const auto* rtti = object->GetRTTI();
+            const char* kind = rtti && rtti->GetName() ? rtti->GetName() : "?";
+            float fade = -1.0f;
+            if (kind && std::strcmp(kind, "BSFadeNode") == 0) {
+                fade = static_cast<RE::BSFadeNode*>(object)->GetFadeNodeRuntimeData().currentFade;
+            }
+            const auto& w = object->world.translate;
+            note("%s %*s%s '%s' flags %llX%s fade %.2f at (%.0f, %.0f, %.0f) scale %.2f bound %.1f", label, depth * 2, "", kind,
+                object->name.c_str() ? object->name.c_str() : "", static_cast<unsigned long long>(object->flags.flags),
+                (object->flags.flags & 1ull) ? " HIDDEN" : "", fade, w.x, w.y, w.z, object->world.scale, object->worldBound.fRadius);
+            return true;
+        });
+    }
+
+    // A copied gun is drawn whatever the hand's copy was: nothing in it hidden, faded nodes fully shown.
+    void unhideCopy(RE::NiAVObject* root) noexcept
+    {
+        forEachNode(root, [&](RE::NiAVObject* object, int) {
+            const auto* rtti = object->GetRTTI();
+            if (rtti && rtti->GetName() && std::strcmp(rtti->GetName(), "BSFadeNode") == 0) {
+                auto& fade = static_cast<RE::BSFadeNode*>(object)->GetFadeNodeRuntimeData();
+                fade.currentFade = 1.0f;
+            }
+            return true;
+        });
+    }
+
     // ------------------------------------------------------------ math (the game's row convention: rows are the local axes)
 
     float distance(const RE::NiPoint3& a, const RE::NiPoint3& b) noexcept
@@ -709,6 +742,7 @@ namespace
         Instance* inst{ nullptr };
         std::uint32_t form{ 0 };
         RE::NiTransform inPouch{};   // the gun in the pouch's own space
+        bool logged{ false };        // its parts written to the log once shown
     };
     std::array<GunVisual, 16> g_gunVisuals{};
 
@@ -1506,6 +1540,14 @@ namespace
             if (v.inst && v.form == p.items[0].form && looksLikeObject(v.inst->node.get())) {
                 v.inst->used = true;
                 show(v.inst, parent, compose(h.localFor(bone, p.pose), v.inPouch));
+                unhideCopy(v.inst->node.get());
+                if (!v.logged && h.body) {
+                    v.logged = true;
+                    const auto& pw = parent->world.translate;
+                    note("Gun in pouch %d shown under %s at (%.0f, %.0f, %.0f); its parts:", static_cast<int>(index), parent->name.c_str(),
+                        pw.x, pw.y, pw.z);
+                    logTree("  copy", v.inst->node.get());
+                }
                 return;
             }
         }
@@ -1688,6 +1730,11 @@ namespace
         int bagHand{ 0 };
         Clock::time_point bagAt{};
         bool weaponLogged{ false };
+        std::array<int, 2> zone{ -1, -1 };    // the pouch zone each hand is in (to buzz on entering one)
+        int drawPouch{ -1 };                  // a gun asked from this pouch: checked a moment later
+        std::uint32_t drawForm{ 0 };
+        Clock::time_point drawAt{};
+        std::map<std::uint32_t, std::uint32_t> counts;   // guns you have (the one in the hand and those put away)
         bool wearArmed{ true };
         bool bodyLogged{ false };
     } g_state;
@@ -1978,6 +2025,12 @@ namespace
             return;
         }
         if (g.form != gun->GetFormID() || g.source != model) {   // a failed copy is not tried again for the same model
+            static int sourcesLogged = 0;
+            if (sourcesLogged < 2) {
+                ++sourcesLogged;
+                note("The gun in the hand (%08X), its parts:", gun->GetFormID());
+                logTree("  hand", node);
+            }
             auto* copy = cloneNode(node);
             g.copy.reset(copy);
             g.form = gun->GetFormID();
@@ -2013,6 +2066,8 @@ namespace
         }
         v.inst->node = g.copy;
         v.form = form;
+        v.logged = false;
+        setCulled(v.inst->node.get(), false);
         g.copy.reset();      // the next gun in the hand gets a copy of its own
         g.source = nullptr;
         const auto& p = g_rig.pouches[index];
@@ -2098,6 +2153,40 @@ namespace
         }
         const bool cooling = std::chrono::duration<float>(now - st.holsterAt).count() < g_settings.holsterCooldown;
 
+        // how many of each gun you have: every change is written to the log (to find where extra guns come from)
+        {
+            std::vector<std::uint32_t> forms;
+            if (gunNow) forms.push_back(gunNow->GetFormID());
+            for (const auto& p : g_rig.pouches) {
+                if ((p.kind == kHolster || p.kind == kSling) && p.items[0].form) forms.push_back(p.items[0].form);
+            }
+            for (const auto form : forms) {
+                const auto count = inventoryCount(player, form);
+                auto it = st.counts.find(form);
+                if (it == st.counts.end()) {
+                    st.counts[form] = count;
+                } else if (it->second != count) {
+                    note("Gun %08X: you have %u (was %u)%s", form, count, it->second, gunNow && gunNow->GetFormID() == form ? ", in the hand" : "");
+                    it->second = count;
+                }
+            }
+        }
+
+        // a gun asked from a holster: in the hand by now? If not, it goes back to the holster
+        if (st.drawPouch >= 0 && now - st.drawAt > std::chrono::milliseconds(900)) {
+            const int index = st.drawPouch;
+            st.drawPouch = -1;
+            if (gunNow && gunNow->GetFormID() == st.drawForm) {
+                note("Gun %08X is in the hand", st.drawForm);
+            } else if (index < static_cast<int>(g_rig.pouches.size()) && g_rig.pouches[index].total() == 0) {
+                note("Gun %08X did not come to the hand (in the hand: %08X, you have %u): left in pouch %d", st.drawForm,
+                    gunNow ? gunNow->GetFormID() : 0, inventoryCount(player, st.drawForm), index);
+                g_rig.pouches[index].items[0] = Stack{ st.drawForm, 1 };
+                hud("Оружие не далось в руку, оно осталось в кобуре");
+                markDirty();
+            }
+        }
+
         // an item let go in the bag a moment ago that was not found then
         if (st.bagPouch >= 0) {
             if (now - st.bagAt > std::chrono::milliseconds(400) || st.bagPouch >= static_cast<int>(g_rig.pouches.size())) {
@@ -2123,6 +2212,14 @@ namespace
             const bool gunHand = hi == g_settings.gunHand;
             int index = gunHand ? gunPlaceNear(h, palm, gun != nullptr) : -1;
             if (index < 0) index = nearestPouch(palm);
+            // a light buzz when the hand comes into a holster, carbine holder or the bag
+            if (index != st.zone[hi]) {
+                st.zone[hi] = index;
+                if (index >= 0) {
+                    const int kind = g_rig.pouches[index].kind;
+                    if (kind == kHolster || kind == kSling || kind == kDump) buzz(hi, 900);
+                }
+            }
             if (index < 0) continue;
             auto& pouch = g_rig.pouches[index];
             const bool gunPlace = pouch.kind == kHolster || pouch.kind == kSling;
@@ -2153,6 +2250,9 @@ namespace
                     note("Gun %08X taken from pouch %d (you have %u)", form, index, have);
                     if (have > 0) {
                         pushSimple(kEquip, 0, form);
+                        st.drawPouch = index;
+                        st.drawForm = form;
+                        st.drawAt = now;
                         sound(1);
                         buzz(hi, 2000);
                     } else {

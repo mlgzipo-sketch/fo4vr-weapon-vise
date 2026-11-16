@@ -185,6 +185,10 @@ Function Handle()
 		elseif cmd == 10
 			if f
 				player.EquipItem(f, false, true)
+				if !player.IsEquipped(f)
+					Utility.Wait(0.2)
+					player.EquipItem(f, false, true)
+				endif
 			endif
 		elseif cmd == 11
 			if f
