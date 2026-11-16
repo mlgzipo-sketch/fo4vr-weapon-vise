@@ -656,8 +656,10 @@ namespace
     RE::NiAVObject* findPartNode(RE::NiAVObject* root, const PartInfo& info, bool& byStem) noexcept
     {
         RE::NiAVObject* byName = nullptr;
+        RE::NiAVObject* byPoint = nullptr;
         RE::NiAVObject* bySlot = nullptr;
         const std::string slotWord = lower(info.slot.size() > 7 ? info.slot.substr(7) : info.slot);  // ap_gun_Mag -> mag
+        const std::string pointName = "p-" + slotWord;
         forEachNode(root, [&](RE::NiAVObject* object, int depth) {
             if (depth == 0 || byName) {
                 return;
@@ -668,12 +670,16 @@ namespace
             }
             if (!info.stem.empty() && name.find(info.stem) != std::string::npos) {
                 byName = object;
+            } else if (!byPoint && name == pointName && object->worldBound.fRadius > 0.5f) {
+                // the slot's own attach point with the part in it (a pipe gun's magazine sits
+                // under P-Mag inside WeaponExtra3, far from its WeaponMagazine node)
+                byPoint = object;
             } else if (!bySlot && !slotWord.empty() && name.find(slotWord) != std::string::npos) {
                 bySlot = object;
             }
         });
         byStem = byName != nullptr;
-        return byName ? byName : bySlot;
+        return byName ? byName : byPoint ? byPoint : bySlot;
     }
 
     // Model stems of all part mods in the table whose model shows in this 3D.
@@ -1365,7 +1371,8 @@ namespace
             for (int index = 0; index < 2; ++index) {
                 const auto& hand = g_hands_state[index];
                 const bool gripping = hand.grip || hand.previousGrip;
-                if (hand.valid && gripping && (hand.mode == Hand::Mode::Idle || hand.mode == Hand::Mode::Done) && distance(hand.point, centerOf(root)) < g_settings.heldRadius) {
+                if (hand.valid && gripping && (hand.mode == Hand::Mode::Idle || hand.mode == Hand::Mode::Done) && distance(hand.point, centerOf(root)) < g_settings.heldRadius + root->worldBound.fRadius) {
+                    // a long part (a pipe gun's sights) is held at one end, far from its middle
                     holder = index;
                 }
             }
