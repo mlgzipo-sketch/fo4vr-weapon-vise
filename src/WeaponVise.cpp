@@ -100,7 +100,9 @@ namespace
         float boardFill{ 0.85f };       // share of the board the parts may cover
         float boardGap{ 2.0f };         // space between parts on the board
         float boardHover{ 3.0f };       // hand this close to a part on the board points at it (plus its size)
-        float boardStoreDepth{ 30.0f }; // a loose part let go or thrown this close in front of a board goes to the stash
+        float boardStoreDepth{ 30.0f };
+        float boardPointRange{ 250.0f };   // point at a part on a stand from this far (0: touch only)
+        float boardPointSign{ 1.0f };      // -1 if pointing picks parts behind the hand // a loose part let go or thrown this close in front of a board goes to the stash
     } g_settings;
 
     void loadSettings() noexcept
@@ -156,6 +158,8 @@ namespace
                 else if (key == "fBoardGap") s.boardGap = value;
                 else if (key == "fBoardHover") s.boardHover = value;
                 else if (key == "fBoardStoreDepth") s.boardStoreDepth = value;
+                else if (key == "fBoardPointRange") s.boardPointRange = value;
+                else if (key == "fBoardPointSign") s.boardPointSign = value;
                 else if (key == "bLogGrab") s.logGrab = value != 0.0f;
                 else if (key == "bRemoveIntoHand") s.removeIntoHand = value != 0.0f;
                 else if (key == "bRefresh3D") s.refresh3D = value != 0.0f;
@@ -1509,8 +1513,46 @@ namespace
         return best;
     }
 
+    // The part the hand points at from afar (along the fingers), the nearest one on the ray.
+    const BoardItem* boardItemPointed(const Hand& hand) noexcept
+    {
+        if (g_settings.boardPointRange <= 0.0f) {
+            return nullptr;
+        }
+        for (const auto& [id, part] : g_parts) {   // a loose part right at the hand: the grip is for it
+            auto* ref = lookupRef(id);
+            auto* root = ref ? ref->Get3D() : nullptr;
+            if (looksLikeObject(root) && distance(hand.point, centerOf(root)) < g_settings.heldRadius + root->worldBound.fRadius) {
+                return nullptr;
+            }
+        }
+        const auto dir = unit(fingers(hand) * g_settings.boardPointSign);
+        const BoardItem* best = nullptr;
+        float bestScore = 1e9f;
+        for (const auto& item : g_boardItems) {
+            auto* ref = item.placed ? lookupRef(item.ref) : nullptr;
+            auto* root = ref ? ref->Get3D() : nullptr;
+            if (!looksLikeObject(root)) {
+                continue;
+            }
+            const auto v = centerOf(root) - hand.point;
+            const float t = dot(v, dir);
+            if (t < 5.0f || t > g_settings.boardPointRange) {
+                continue;
+            }
+            const auto across = v - dir * t;
+            const float off = std::sqrt(dot(across, across));
+            const float allowed = item.radius * 0.7f + 1.5f + t * 0.02f;
+            if (off < allowed && off / allowed < bestScore) {
+                bestScore = off / allowed;
+                best = &item;
+            }
+        }
+        return best;
+    }
+
     // A free hand at the board: lights the part it points at; grip takes it (or asks to craft it).
-    bool boardHand(int index, Hand& hand, bool pressed) noexcept
+    bool boardHand(int index, Hand& hand, bool pressed, RE::NiAVObject* weapon3D) noexcept
     {
         if (g_boardItems.empty() || hand.select) {
             if (g_boardHover[index]) {
@@ -1521,6 +1563,11 @@ namespace
             return false;
         }
         const auto* item = (hand.grip && !pressed) ? nullptr : boardItemAt(hand.point);
+        // pointing from afar, but not from the vise (a grip there is for the weapon and its parts)
+        const bool atVise = looksLikeObject(weapon3D) && distance(hand.point, centerOf(weapon3D)) < 40.0f;
+        if (!item && !atVise && !(hand.grip && !pressed)) {
+            item = boardItemPointed(hand);
+        }
         const std::uint32_t hover = item ? item->ref : 0;
         if (hover != g_boardHover[index]) {
             if (g_boardHover[index]) {
@@ -1560,7 +1607,7 @@ namespace
         switch (hand.mode) {
         case Hand::Mode::Idle:
             {
-                if (boardHand(index, hand, pressed)) {
+                if (boardHand(index, hand, pressed, weapon3D)) {
                     break;
                 }
                 // A / X held: the part under the hand shows in red; grip takes it off
