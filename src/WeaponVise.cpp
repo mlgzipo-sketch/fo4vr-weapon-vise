@@ -875,6 +875,8 @@ namespace
         pushCommand(command);
     }
 
+    std::array<bool, 2> g_noClampUntilOut{};
+
     // Weapon in hand, let go of in the vise area: it stays there.
     void updateClampGesture() noexcept
     {
@@ -882,7 +884,13 @@ namespace
         for (int index = 0; index < 2; ++index) {
             auto& hand = g_hands_state[index];
             if (!player || !hand.valid || !inViseArea(hand.point)) {
+                if (hand.valid) {
+                    g_noClampUntilOut[index] = false;
+                }
                 continue;
+            }
+            if (g_noClampUntilOut[index]) {
+                continue;   // the hand just took the weapon out of the vise: letting go here does not clamp it again
             }
             // a weapon let go here (drawn or carried loose) is looked for by the script
             const bool released = hand.previousGrip && !hand.grip;
@@ -2019,6 +2027,7 @@ namespace
                     command.type = kUnclamp;
                     command.mod = 2;   // flag: leave it loose for ROCK, do not put it in the inventory
                     pushCommand(command);
+                    g_noClampUntilOut = { true, true };
                     buzz(index, 2500);
                     soundCue(3);
                     hand.mode = Hand::Mode::Done;
@@ -2471,6 +2480,28 @@ namespace
                 if (key.rfind(prefix, 0) == 0) {
                     g_slotFrames.try_emplace(key.substr(prefix.size()), frame);
                 }
+            }
+        }
+        // no muzzle on the gun and no P-Muzzle on its barrel (hunting rifle): the barrel's end, where shots leave
+        if (!g_slotFrames.contains("ap_gun_Muzzle")) {
+            RE::NiAVObject* projectile = nullptr;
+            forEachNode(root, [&](RE::NiAVObject* object, int) {
+                const char* n = object->name.c_str();
+                if (!projectile && n && _stricmp(n, "ProjectileNode") == 0) {
+                    projectile = object;
+                }
+            });
+            if (projectile) {
+                RE::NiTransform frame{};
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 3; ++c) {
+                        frame.rotate.entry[r][c] = r == c ? 1.0f : 0.0f;
+                    }
+                }
+                frame.translate = relative(root->world, projectile->world).translate;
+                frame.scale = 1.0f;
+                g_slotFrames["ap_gun_Muzzle"] = frame;
+                logNote("Muzzle slot from ProjectileNode (no P-Muzzle on this weapon)");
             }
         }
         if (changed) {

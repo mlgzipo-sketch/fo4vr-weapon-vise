@@ -80,15 +80,17 @@ def build_nif():
 
     color_keys = list(COLORS)
     nglyph = len(CHARS) * len(color_keys)
-    # block layout: 0 root, then per glyph a node and a shape, then shaders, then alpha
-    first_shader = 1 + 2 * nglyph
+    # block layout: 0 root, 1..4 one node per colour (a node shows at most 256 children to the DLL),
+    # then per glyph a node and a shape, then shaders, then alpha
+    groups = len(color_keys)
+    first_shader = 1 + groups + 2 * nglyph
     alpha_index = first_shader + len(color_keys)
-    children = []
+    children = [[] for _ in color_keys]
     glyph_blocks = []
     for ci, ck in enumerate(color_keys):
         for gi, ch in enumerate(CHARS):
-            node_index = 1 + 2 * (ci * len(CHARS) + gi)
-            children.append(node_index)
+            node_index = 1 + groups + 2 * (ci * len(CHARS) + gi)
+            children[ci].append(node_index)
             u0 = (gi % GRID) * CELL / SIZE
             v0 = (gi // GRID) * CELL / SIZE
             u1 = u0 + CELL * ADVANCE / SIZE
@@ -103,8 +105,13 @@ def build_nif():
                      + bytes.fromhex('0502430000b00100')
                      + struct.pack('<IHI', 2, 4, len(verts) + len(tris)) + verts + tris)
             glyph_blocks += [(1, node), (2, shape)]
-    root = av_object(0) + struct.pack('<I', len(children)) + b''.join(struct.pack('<i', c) for c in children)
-    blocks = [(0, root)] + glyph_blocks
+    root = av_object(0) + struct.pack('<I', groups) + b''.join(struct.pack('<i', 1 + g) for g in range(groups))
+    group_blocks = []
+    for ci, ck in enumerate(color_keys):
+        kids = children[ci]
+        group_blocks.append((1, av_object(name_index('colour_' + ck)) + struct.pack('<I', len(kids))
+                             + b''.join(struct.pack('<i', c) for c in kids)))
+    blocks = [(0, root)] + group_blocks + glyph_blocks
     for ck in color_keys:
         blocks.append((3, shader_for(COLORS[ck])))
     alpha = bytearray(ALPHA)
