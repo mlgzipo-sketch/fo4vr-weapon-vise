@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "NiMath.h"
+#include "Runtime.h"
 
 namespace mrf
 {
