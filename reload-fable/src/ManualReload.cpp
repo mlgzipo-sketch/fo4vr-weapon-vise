@@ -264,6 +264,7 @@ namespace
         std::int32_t token{ 0 };
         std::array<float, 6> pose{};   // x, y, z, angle x, y, z (degrees)
         std::array<float, 4> impulse{};   // x, y, z, magnitude
+        float scale{ 1.0f };              // a magazine is made at the gun's scale (FRIK or a mod can scale the gun)
     };
 
     struct NewMag
@@ -375,6 +376,12 @@ namespace
         return { g_shared.current.impulse.begin(), g_shared.current.impulse.end() };
     }
 
+    float CommandScale(std::monostate)
+    {
+        std::scoped_lock guard(g_shared.lock);
+        return g_shared.current.scale;
+    }
+
     std::vector<float> FreshPose(std::monostate, std::int32_t token)
     {
         std::scoped_lock guard(g_shared.lock);
@@ -412,6 +419,7 @@ namespace
         vm->BindNativeMethod(kScript, "CommandPose", CommandPose, true);
         vm->BindNativeMethod(kScript, "FreshPose", FreshPose, true);
         vm->BindNativeMethod(kScript, "CommandImpulse", CommandImpulse, true);
+        vm->BindNativeMethod(kScript, "CommandScale", CommandScale, true);
         vm->BindNativeMethod(kScript, "AddMag", AddMag, true);
         vm->BindNativeMethod(kScript, "Notify", Notify, true);
         logNote("Papyrus functions of script ManualReloadF registered");
@@ -1686,6 +1694,7 @@ namespace
         command.kind = g_state.kind;
         command.token = token;
         command.pose = poseForScript(loose);
+        command.scale = loose.scale > 0.05f && loose.scale < 20.0f ? loose.scale : 1.0f;
         {
             std::scoped_lock guard(g_shared.lock);
             g_shared.fresh[token] = command.pose;
@@ -6344,6 +6353,12 @@ namespace
                 st.prevDriveKnown = true;
                 link.magazine.drive = true;
                 link.magazine.parentLocal = toLinkPose(relative(parentWorld, target));
+            } else if (draw && st.place == kGone && st.railKnown && looksLikeObject(magazine) && looksLikeObject(magazine->parent)) {
+                // no magazine in the gun: ROCK's collider of the old one would stay in the well and push a fresh one aside
+                // (the pipe pistol, 0.50): it is carried far out along the way out while the well is empty
+                st.prevDriveKnown = false;
+                link.magazine.drive = true;
+                link.magazine.parentLocal = toLinkPose(relative(magazine->parent->world, railPose(root, 200.0f)));
             } else {
                 st.prevDriveKnown = false;
             }

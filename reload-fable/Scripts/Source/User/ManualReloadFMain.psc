@@ -46,7 +46,7 @@ Function Handle()
 	int n = 0
 	while cmd != 0 && n < 8
 		if cmd == CmdSpawn
-			Spawn(ManualReloadF.CommandKind(), ManualReloadF.CommandPose(), ManualReloadF.CommandToken())
+			Spawn(ManualReloadF.CommandKind(), ManualReloadF.CommandPose(), ManualReloadF.CommandToken(), ManualReloadF.CommandScale())
 		elseif cmd == CmdDelete
 			ObjectReference ref = Game.GetForm(ManualReloadF.CommandRefID()) as ObjectReference
 			if ref
@@ -65,7 +65,7 @@ Function Handle()
 	endwhile
 EndFunction
 
-Function Spawn(int kind, float[] pose, int token)
+Function Spawn(int kind, float[] pose, int token, float scale)
 	if kind < 0 || kind >= MRF_Mags.GetSize()
 		kind = 0
 	endif
@@ -78,6 +78,9 @@ Function Spawn(int kind, float[] pose, int token)
 	float[] fresh = ManualReloadF.FreshPose(token)
 	if fresh && fresh.Length == 6
 		pose = fresh
+	endif
+	if scale > 0.05 && (scale < 0.99 || scale > 1.01)
+		mag.SetScale(scale)   ; the gun is scaled (FRIK, a weapon mod): so is its magazine
 	endif
 	mag.SetPosition(pose[0], pose[1], pose[2])
 	mag.SetAngle(pose[3], pose[4], pose[5])
