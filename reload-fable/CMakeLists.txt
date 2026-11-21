@@ -35,6 +35,8 @@ add_library(ManualReloadF SHARED
   src/Runtime.cpp
   src/Runtime.h
   src/ManualReload.cpp
+  src/Angles.cpp
+  src/Angles.h
   src/GripHook.cpp
   src/GripHook.h
   src/Log.cpp

@@ -1,5 +1,7 @@
 #include "NiMath.h"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 
 namespace mrf
@@ -64,5 +66,54 @@ namespace mrf
     RE::NiPoint3 directionToWorld(const RE::NiTransform& t, const RE::NiPoint3& v) noexcept
     {
         return axisOf(t, 0) * v.x + axisOf(t, 1) * v.y + axisOf(t, 2) * v.z;
+    }
+
+    RE::NiPoint3 cross(const RE::NiPoint3& a, const RE::NiPoint3& b) noexcept
+    {
+        return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+    }
+
+    RE::NiTransform identityTransform() noexcept
+    {
+        RE::NiTransform t;
+        t.MakeIdentity();
+        return t;
+    }
+
+    // The transform that undoes `t`: compose(t, inverse(t)) is the identity.
+    RE::NiTransform inverse(const RE::NiTransform& t) noexcept
+    {
+        return relative(t, identityTransform());
+    }
+
+    void setRows(RE::NiTransform& t, const RE::NiPoint3& x, const RE::NiPoint3& y, const RE::NiPoint3& z) noexcept
+    {
+        const std::array<RE::NiPoint3, 3> rows{ x, y, z };
+        for (int i = 0; i < 3; ++i) {
+            t.rotate.entry[i][0] = rows[i].x;
+            t.rotate.entry[i][1] = rows[i].y;
+            t.rotate.entry[i][2] = rows[i].z;
+        }
+    }
+
+    // Between two poses: t = 0 is a, 1 is b. Rotation by blended axes, made square again.
+    RE::NiTransform blend(const RE::NiTransform& a, const RE::NiTransform& b, float t) noexcept
+    {
+        RE::NiTransform r = b;
+        r.translate = a.translate + (b.translate - a.translate) * t;
+        r.scale = a.scale + (b.scale - a.scale) * t;
+        const auto x = normalized(axisOf(a, 0) * (1.0f - t) + axisOf(b, 0) * t);
+        auto y = axisOf(a, 1) * (1.0f - t) + axisOf(b, 1) * t;
+        y = normalized(y - x * dot(y, x));
+        setRows(r, x, y, cross(x, y));
+        return r;
+    }
+
+    float approach(float value, float target, float step) noexcept
+    {
+        if (value < target) {
+            return std::min(value + step, target);
+        }
+        return std::max(value - step, target);
     }
 }
