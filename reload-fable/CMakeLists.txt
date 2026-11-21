@@ -38,6 +38,10 @@ add_library(ManualReloadF SHARED
   src/Angles.cpp
   src/Angles.h
   src/GripHook.cpp
+  src/State.cpp
+  src/State.h
+  src/Paths.cpp
+  src/Paths.h
   src/ScriptBridge.cpp
   src/ScriptBridge.h
   src/Nodes.cpp
