@@ -37,6 +37,14 @@ add_library(ManualReloadF SHARED
   src/ManualReload.cpp
   src/GripHook.cpp
   src/GripHook.h
+  src/Log.cpp
+  src/Log.h
+  src/NiMath.cpp
+  src/NiMath.h
+  src/SafeMemory.cpp
+  src/SafeMemory.h
+  src/Settings.cpp
+  src/Settings.h
   src/RockLink.cpp
   src/RockLink.h
 )
