@@ -2889,7 +2889,7 @@ namespace
                     st.handSpare = false;
                     if (st.handStash) {
                         deleteMagazine(mag.ref);
-                        hud("Магазин убран, патроны вернулись в запас");
+                        hud("Magazine stowed, rounds returned to inventory");
                     }
                 } else if (st.place == kHand || st.handSpare) {
                     // the real one is in the palm: the gun's own magazine is hidden, ROCK closes the hand on the real one
@@ -3049,7 +3049,7 @@ namespace
             syncAmmo(gun);
         }
         if (!st.chamber) {
-            hud(st.rounds > 0 ? "Магазин вставлен. Патронник пуст: передёрни затвор" : "Магазин пустой");
+            hud(st.rounds > 0 ? "Magazine in. Chamber empty: rack the slide" : "Magazine is empty");
         }
         note("INSERT: seated, %u rounds, ammoCount %u, chamber %s", st.rounds, gun.data->ammoCount, st.chamber ? "loaded" : "empty");
     }
@@ -3074,7 +3074,7 @@ namespace
     {
         auto& st = g_state;
         char text[96]{};
-        std::snprintf(text, sizeof(text), "Магазин убран (%u патр. вернулись в запас)", st.rounds);
+        std::snprintf(text, sizeof(text), "Magazine stowed (%u rounds returned to inventory)", st.rounds);
         hud(text);
         note("STASH (%s): magazine with %u rounds put away", where, st.rounds);
         st.rounds = 0;
@@ -3312,7 +3312,7 @@ namespace
                 // gone, or put away over the shoulder through ROCK: its rounds are back with the ammo you carry
                 if (ref && !ref->IsDeleted() && loose.rounds > 0) {
                     char text[96]{};
-                    std::snprintf(text, sizeof(text), "Магазин убран (%u патр. вернулись в запас)", loose.rounds);
+                    std::snprintf(text, sizeof(text), "Magazine stowed (%u rounds returned to inventory)", loose.rounds);
                     hud(text);
                 }
                 gone.push_back(id);
@@ -3639,7 +3639,7 @@ namespace
         }
         g_recorded[r.weapon] = true;
         g_playStale = true;
-        hud("Запись перезарядки сохранена: со следующего раза ствол заряжается руками");
+        hud("Reload recorded: from now on this gun is reloaded by hand");
     }
 
     void recordReload(RE::PlayerCharacter* player, const Gun& gun, Clock::time_point now) noexcept
@@ -4363,7 +4363,7 @@ namespace
                 const auto rounds = it != g_loose.end() ? it->second.rounds : 0u;
                 deleteMagazine(st.handRef);
                 char text[96]{};
-                std::snprintf(text, sizeof(text), "Магазин убран (%u патр. вернулись в запас)", rounds);
+                std::snprintf(text, sizeof(text), "Magazine stowed (%u rounds returned to inventory)", rounds);
                 hud(text);
                 playSound(4);
             }
@@ -4650,7 +4650,7 @@ namespace
                     buzz(g_settings.gunHand, 1500);
                     note("CRANK: one more charge, %u of %u", gun.data->ammoCount, capacity);
                 } else {
-                    hud(inventory <= gun.data->ammoCount ? "Нет батарей" : "Заряжено полностью");
+                    hud(inventory <= gun.data->ammoCount ? "No cells left" : "Fully loaded");
                     note("CRANK: a full turn, nothing to charge (%u of %u, %u cells)", gun.data->ammoCount, capacity, inventory);
                 }
             }
@@ -5190,7 +5190,7 @@ namespace
                         note("EJECTOR: pushed %.1f of %.1f: %u rounds back to the pouch, %u fired cases out", b.ejectPushed, length, b.live, b.spent);
                         ejectCasings(gun, root, breechAt, barrel * -1.0f, b.live + b.spent, "pushed out by the ejector");
                         if (b.live > 0) {
-                            hud("Патроны выброшены и вернулись в запас");
+                            hud("Rounds ejected, returned to inventory");
                         }
                         b.live = 0;
                         b.spent = 0;
@@ -5218,7 +5218,7 @@ namespace
             note("EMPTIED: %u rounds back to the pouch, %u fired cases gone", b.live, b.spent);
             ejectCasings(gun, root, breechAt, barrel * -1.0f, cellCover ? 1u : b.live + b.spent, "fell out, muzzle up");
             if (b.live > 0) {
-                hud("Патроны высыпались и вернулись в запас");
+                hud("Rounds fell out, returned to inventory");
             }
             b.live = 0;
             b.spent = 0;
@@ -5249,11 +5249,11 @@ namespace
                     note("BELT: nothing taken (%u carried, %u in the gun, room %u)", inventory, b.live, room);
                 }
                 if (cellCover && room == 0) {
-                    hud("Сначала достань батарею: вытащи рукой или подними ствол вверх");
+                    hud("Take the cell out first: pull it by hand or tip the gun up");
                 } else if (b.spent > 0 && room == 0) {
-                    hud("Сначала вытряхни гильзы: подними ствол вверх");
+                    hud("Shake the empty shells out first: tip the gun up");
                 } else if (take == 0) {
-                    hud(have == 0 ? "Патронов нет" : "Заряжено полностью");
+                    hud(have == 0 ? "No ammo left" : "Fully loaded");
                 } else {
                     b.held = take;
                     dropHandRound("a new one from the belt");
@@ -5400,7 +5400,7 @@ namespace
                     writeHoldLine(gun.weapon->GetFormID(), "roundhold", hold);
                     st.roundHold = hold;
                     st.roundHoldKnown = true;
-                    hud("Хват патрона сохранён: следующий с пояса придёт так");
+                    hud("Round grip saved: rounds from the belt will come like this");
                     buzz(freeIndex(), 3000);
                 }
                 clickWas = click;
@@ -5776,28 +5776,28 @@ namespace
     const char* zoneTypeName(int type) noexcept
     {
         switch (type) {
-        case 0: return "коробка";
-        case 1: return "гнездо";
-        case 2: return "маршрут";
-        default: return "точка";
+        case 0: return "box";
+        case 1: return "well";
+        case 2: return "route";
+        default: return "point";
         }
     }
 
     std::vector<std::string> modesOf(const EditZone& z)
     {
         switch (z.type) {
-        case 0: return { "двигать, стик = размер весь", "размер X (вбок)", "размер Y (вдоль ствола)", "размер Z (вверх)", "сдвиг X (вбок)",
-            "сдвиг Y (вдоль ствола)", "сдвиг Z (вверх)" };
-        case 1: return { "двигать, стик = ширина", "двигать, стик = глубина", "поворот рукой (вокруг горла)", "сдвиг X (вбок)", "сдвиг Y (вдоль ствола)",
-            "сдвиг Z (вверх)" };
+        case 0: return { "move, stick = whole size", "size X (sideways)", "size Y (along the barrel)", "size Z (up)", "shift X (sideways)",
+            "shift Y (along the barrel)", "shift Z (up)" };
+        case 1: return { "move, stick = width", "move, stick = depth", "turn by hand (about the mouth)", "shift X (sideways)", "shift Y (along the barrel)",
+            "shift Z (up)" };
         case 2: {
-            std::vector<std::string> modes{ "двигать весь", "поворот рукой (вокруг 1-й точки)", "сдвиг X (вбок)", "сдвиг Y (вдоль ствола)", "сдвиг Z (вверх)" };
+            std::vector<std::string> modes{ "move all", "turn by hand (about point 1)", "shift X (sideways)", "shift Y (along the barrel)", "shift Z (up)" };
             for (std::size_t i = 0; i < z.pts.size(); ++i) {
-                modes.push_back("точка " + std::to_string(i + 1) + (i == 0 ? " (покой)" : ""));
+                modes.push_back("point " + std::to_string(i + 1) + (i == 0 ? " (rest)" : ""));
             }
             return modes;
         }
-        default: return { "двигать", "сдвиг X (вбок)", "сдвиг Y (вдоль ствола)", "сдвиг Z (вверх)" };
+        default: return { "move", "shift X (sideways)", "shift Y (along the barrel)", "shift Z (up)" };
         }
     }
 
@@ -5858,7 +5858,7 @@ namespace
                 if (well < 0) {
                     z.type = 1;
                     z.head = "well";
-                    z.name = "well (горловина магазина)";
+                    z.name = "well (magazine well mouth)";
                     ed.zones.push_back(z);
                     well = static_cast<int>(ed.zones.size()) - 1;
                 }
@@ -6164,10 +6164,10 @@ namespace
         const auto& z = ed.zones[ed.sel];
         const auto modes = modesOf(z);
         char text[256];
-        const std::string label = z.name == "magtop" ? "magtop (кончик магазина в оружии: этой точкой магазин входит в цилиндр)" :
-                                  z.name == "maghold" ? "maghold (где ладонь держит магазин с пояса)" :
-                                  z.name == "hinge" ? "hinge (ось, вокруг которой откидывается ствол/казённик)" : z.name;
-        std::snprintf(text, sizeof(text), "Зона %d/%d: %s (%s). Режим: %s%s%s", ed.sel + 1, static_cast<int>(ed.zones.size()), label.c_str(), zoneTypeName(z.type),
+        const std::string label = z.name == "magtop" ? "magtop (magazine tip in the gun: this point enters the well)" :
+                                  z.name == "maghold" ? "maghold (where the palm holds a magazine from the belt)" :
+                                  z.name == "hinge" ? "hinge (axis the barrel/breech swings about)" : z.name;
+        std::snprintf(text, sizeof(text), "Zone %d/%d: %s (%s). Mode: %s%s%s", ed.sel + 1, static_cast<int>(ed.zones.size()), label.c_str(), zoneTypeName(z.type),
             modes[std::clamp(ed.mode, 0, static_cast<int>(modes.size()) - 1)].c_str(), extra ? ". " : "", extra ? extra : "");
         RE::SendHUDMessage::ShowHUDMessage(text, nullptr, false, false);
         note("EDITOR: %s", text);
@@ -6226,11 +6226,11 @@ namespace
         if (save && ed.dirty) {
             const bool ok = saveEditZones(ed.weapon);
             note("EDITOR: off (%s), zones of %08X %s", why, ed.weapon, ok ? "saved" : "NOT saved (the file could not be written)");
-            hud(ok ? "Зоны сохранены. Ствол перечитает их сейчас." : "Не удалось записать файл зон!");
+            hud(ok ? "Zones saved. The gun reloads them now." : "Could not write the zones file!");
             g_state.weapon = nullptr;   // read the zones again, as if the gun were drawn anew
         } else {
             note("EDITOR: off (%s), nothing changed", why);
-            hud("Редактор зон закрыт (ничего не менялось)");
+            hud("Zone editor closed (nothing changed)");
         }
     }
 
@@ -6267,7 +6267,7 @@ namespace
                 ed.gripWas = false;
                 if (!loadEditZones(weapon) || ed.zones.empty()) {
                     ed.zones.clear();
-                    hud("У этого ствола нет файла зон (сначала выгрузи из Blender)");
+                    hud("This gun has no zones file (export one from Blender first)");
                     note("EDITOR: no zones for %08X", weapon);
                     ed.on = false;
                 } else {
@@ -6275,7 +6275,7 @@ namespace
                     griphook::setArmed(false);
                     griphook::setEditing(true);
                     note("EDITOR: on for %08X, %zu zones", weapon, ed.zones.size());
-                    editorHud("Стик вбок = другая зона, клик = режим, грип = двигать, держать стик = сохранить");
+                    editorHud("Stick sideways = next zone, click = mode, grip = move, hold stick = save");
                 }
             }
         }
@@ -6551,7 +6551,7 @@ namespace
             }
             if (unrecorded && !st.recordTold) {
                 st.recordTold = true;
-                hud("Этот ствол ещё не записан: выстрели хотя бы раз и перезаряди как обычно, мод запишет анимацию");
+                hud("This gun is not recorded yet: fire once and reload as usual, the mod records the animation");
                 note("RECORD: %08X has no recording yet, the next reload is the game's own and is written down", gun.weapon->GetFormID());
             }
             releaseHand();
@@ -6830,7 +6830,7 @@ namespace
             } else if (st.place == kRailAuto) {
                 st.autoHold = false;
             } else if (st.place == kGone) {
-                hud("Магазина нет: возьми новый с пояса (грип свободной рукой у пояса)");
+                hud("No magazine: take a new one from your belt (grip with the free hand at the belt)");
             }
         }
 
@@ -6854,7 +6854,7 @@ namespace
             } else if (st.armReason == kArmBelt && st.place == kGone) {
                 const auto rounds = freshMagazineRounds(gun, inventory);
                 if (rounds == 0) {
-                    hud("Патронов для магазина нет");
+                    hud("No ammo for this magazine");
                 } else {
                     const auto pose = beltPose(root, free, magScale);
                     st.place = kHand;
@@ -7331,7 +7331,7 @@ namespace
             const bool markNow = free.valid && (free.buttons & buttonMask(g_settings.markButton)) != 0 &&
                                  (free.previousButtons & buttonMask(g_settings.markButton)) == 0;
             if (markNow && saveHold(gun)) {
-                hud("Хват магазина сохранён: так он будет доставаться с пояса");
+                hud("Magazine grip saved: magazines from the belt will come like this");
                 buzz(freeIndex(), 3000);
             } else if (markNow) {
                 ++marks;
@@ -7340,7 +7340,7 @@ namespace
                 logNote("==================================================================");
                 writeState(tag, gun, root, magazine, bolt);
                 char text[96];
-                std::snprintf(text, sizeof(text), "Метка %d записана в лог", marks);
+                std::snprintf(text, sizeof(text), "Mark %d written to the log", marks);
                 hud(text);
                 buzz(freeIndex(), 3000);
             } else if (g_settings.traceState) {
