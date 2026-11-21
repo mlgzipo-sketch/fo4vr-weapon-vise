@@ -53,7 +53,7 @@ namespace mrf
     // A point's place along the rail measured from the seated magazine's origin (more = further out), in the
     // gun's units, and its distance off the rail's line.
 
-    float alongRail(const RE::NiAVObject* root, const RE::NiPoint3& point, float* side = nullptr) noexcept
+    float alongRail(const RE::NiAVObject* root, const RE::NiPoint3& point, float* side) noexcept
     {
         const auto rel = relative(root->world, pointTransform(point)).translate - g_state.magRest.translate - (side ? g_state.sideInGun : RE::NiPoint3{});
         const float along = dot(rel, g_state.axis);

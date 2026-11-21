@@ -202,7 +202,7 @@ namespace mrf
         }
     }
 
-    void zonesFor(std::uint32_t weapon, bool mayWrite = true) noexcept
+    void zonesFor(std::uint32_t weapon, bool mayWrite) noexcept
     {
         auto& st = g_state;
         char path[160];
