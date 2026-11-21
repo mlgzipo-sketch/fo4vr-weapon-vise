@@ -76,6 +76,7 @@ namespace mrf
         std::uint32_t     lastAmmo{ 0xFFFFFFFF };
         Clock::time_point toggled{};
         Clock::time_point opened{};
+        Clock::time_point loadedAt{};       // a round last went in (the palm that put it there does not shut the gun at once)
         Clock::time_point freezeUntil{};
         RE::NiPoint3      prevAt{};
         bool              prevKnown{ false };

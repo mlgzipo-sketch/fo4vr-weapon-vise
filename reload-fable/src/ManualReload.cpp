@@ -837,6 +837,23 @@ namespace
         return available < capacity ? available : capacity;
     }
 
+    // The belt gave a short magazine (or none) because rounds sit in magazines dropped nearby: say so once.
+    // Those rounds come back when the dropped magazine is picked up or stowed.
+    void hintDroppedRounds(const Gun& gun, std::uint32_t rounds) noexcept
+    {
+        const auto inDropped = looseRounds();
+        auto capacity = capacityOf(gun);
+        if (capacity == 0) {
+            capacity = 12;
+        }
+        if (inDropped > 0 && rounds < capacity) {
+            char text[128];
+            std::snprintf(text, sizeof(text), "%u rounds are in magazines you dropped: pick them up to get them back", inDropped);
+            hud(text);
+            note("BELT: %u of %u rounds, %u are in dropped magazines", rounds, capacity, inDropped);
+        }
+    }
+
     // The rounds seen on top of a magazine: as many as it holds (up to the ones the model has).
     bool isGunPartOnMag(std::string name) noexcept
     {
@@ -2852,13 +2869,21 @@ namespace
             b.ejectTouch = touch;
         }
 
-        // muzzle up: everything falls out
+        // a break action throws its fired cases out by itself as it opens (extractor); live rounds stay in
+        if (b.mech == 2 && fullyOpen && b.spent > 0 && now - b.opened > std::chrono::milliseconds(150)) {
+            note("EXTRACTED: %u fired case(s) thrown out as the gun opened, %u live round(s) stay in", b.spent, b.live);
+            ejectCasings(gun, root, breechAt, barrel * -1.0f, b.spent, "thrown out by the extractor");
+            b.spent = 0;
+            buzz(g_settings.gunHand, 1000);
+        }
+
+        // muzzle up: everything falls out (not from a break action: its rounds stay in)
         // (held up for a moment and fairly still: a jerk to shut it does not throw them out on the way)
         const bool muzzleUp = barrel.z > (revolver ? 0.5f : 0.3f) && dot(b.velocity, b.velocity) < 90.0f * 90.0f * scale * scale;
         if (!muzzleUp) {
             b.upSince = now;
         }
-        if (!single && fullyOpen && b.live + b.spent > 0 && muzzleUp && now - b.upSince > std::chrono::milliseconds(250) &&
+        if (!single && b.mech != 2 && fullyOpen && b.live + b.spent > 0 && muzzleUp && now - b.upSince > std::chrono::milliseconds(250) &&
             now - b.opened > std::chrono::milliseconds(350)) {
             note("EMPTIED: %u rounds back to the pouch, %u fired cases gone", b.live, b.spent);
             ejectCasings(gun, root, breechAt, barrel * -1.0f, cellCover ? 1u : b.live + b.spent, "fell out, muzzle up");
@@ -2956,7 +2981,7 @@ namespace
         }
         // the open palm pushes it shut (no grip needed): only a move towards closed carries it
         const bool touching = hinged && !single && b.open && !b.driving && b.held == 0 && spare.valid && !spare.grip && !atBelt &&
-                              touchesPart(8.0f);
+                              now - b.loadedAt > std::chrono::milliseconds(600) && touchesPart(8.0f);
         if (touching) {
             const float angle = hingeAngle(root, spare.palm);
             if (b.pushing) {
@@ -3116,6 +3141,7 @@ namespace
                 note("LOAD: capacitor %u of 3 in", b.caps);
             } else {
                 b.live += b.held;
+                b.loadedAt = now;
                 note("LOAD: %u round(s) in, %u of %u in the gun", b.held, b.live, capacity);
             }
             b.held = 0;
@@ -4499,8 +4525,13 @@ namespace
             } else if (st.armReason == kArmBelt && st.place == kGone) {
                 const auto rounds = freshMagazineRounds(gun, inventory);
                 if (rounds == 0) {
-                    hud("No ammo for this magazine");
+                    if (looseRounds() > 0) {
+                        hintDroppedRounds(gun, rounds);
+                    } else {
+                        hud("No ammo for this magazine");
+                    }
                 } else {
+                    hintDroppedRounds(gun, rounds);
                     const auto pose = beltPose(root, free, magScale);
                     st.place = kHand;
                     st.rounds = rounds;
@@ -4534,6 +4565,7 @@ namespace
             // the gun still has its magazine: a spare one is a real object for ROCK to hold
             const auto rounds = freshMagazineRounds(gun, inventory);
             st.lastBelt = now;
+            hintDroppedRounds(gun, rounds);
             if (rounds > 0 && g_settings.core2) {
                 if (!st.handToken && !st.handRef) {
                     st.handToken = spawnLoose(beltPose(root, free, magScale), rounds, "a spare from the belt");
