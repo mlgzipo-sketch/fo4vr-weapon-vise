@@ -38,6 +38,12 @@ add_library(ManualReloadF SHARED
   src/Angles.cpp
   src/Angles.h
   src/GripHook.cpp
+  src/Zones.cpp
+  src/Zones.h
+  src/Palm.cpp
+  src/Palm.h
+  src/Rail.cpp
+  src/Rail.h
   src/Hands.cpp
   src/Hands.h
   src/State.cpp
