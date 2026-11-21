@@ -318,30 +318,27 @@ namespace
     std::uint32_t freshMagazineRounds(const Gun& gun, std::uint32_t inventory) noexcept
     {
         const auto& st = g_state;
-        const auto used = gun.data->ammoCount + (st.place != kSeated ? st.rounds : 0u) + looseRounds();
+        // Magazines dropped on the ground do not hold rounds back: the next one from the belt is full while the pouch
+        // has the ammo (the rounds are the inventory's, a dropped magazine is only a thing lying there). Only the one
+        // in the free hand counts.
+        std::uint32_t inHand = 0;
+        if (st.handRef) {
+            if (const auto it = g_loose.find(st.handRef); it != g_loose.end()) {
+                inHand = it->second.rounds;
+            }
+        }
+        if (st.handToken) {
+            if (const auto it = g_pending.find(st.handToken); it != g_pending.end()) {
+                inHand += it->second.rounds;
+            }
+        }
+        const auto used = gun.data->ammoCount + (st.place != kSeated ? st.rounds : 0u) + inHand;
         const auto available = inventory > used ? inventory - used : 0u;
         auto capacity = capacityOf(gun);
         if (capacity == 0) {
             capacity = 12;
         }
         return available < capacity ? available : capacity;
-    }
-
-    // The belt gave a short magazine (or none) because rounds sit in magazines dropped nearby: say so once.
-    // Those rounds come back when the dropped magazine is picked up or stowed.
-    void hintDroppedRounds(const Gun& gun, std::uint32_t rounds) noexcept
-    {
-        const auto inDropped = looseRounds();
-        auto capacity = capacityOf(gun);
-        if (capacity == 0) {
-            capacity = 12;
-        }
-        if (inDropped > 0 && rounds < capacity) {
-            char text[128];
-            std::snprintf(text, sizeof(text), "%u rounds are in magazines you dropped: pick them up to get them back", inDropped);
-            hud(text);
-            note("BELT: %u of %u rounds, %u are in dropped magazines", rounds, capacity, inDropped);
-        }
     }
 
     // The rounds seen on top of a magazine: as many as it holds (up to the ones the model has).
@@ -4015,13 +4012,8 @@ namespace
             } else if (st.armReason == kArmBelt && st.place == kGone) {
                 const auto rounds = freshMagazineRounds(gun, inventory);
                 if (rounds == 0) {
-                    if (looseRounds() > 0) {
-                        hintDroppedRounds(gun, rounds);
-                    } else {
-                        hud("No ammo for this magazine");
-                    }
+                    hud("No ammo for this magazine");
                 } else {
-                    hintDroppedRounds(gun, rounds);
                     const auto pose = beltPose(root, free, magScale);
                     st.place = kHand;
                     st.rounds = rounds;
@@ -4055,7 +4047,6 @@ namespace
             // the gun still has its magazine: a spare one is a real object for ROCK to hold
             const auto rounds = freshMagazineRounds(gun, inventory);
             st.lastBelt = now;
-            hintDroppedRounds(gun, rounds);
             if (rounds > 0 && g_settings.core2) {
                 if (!st.handToken && !st.handRef) {
                     st.handToken = spawnLoose(beltPose(root, free, magScale), rounds, "a spare from the belt");
