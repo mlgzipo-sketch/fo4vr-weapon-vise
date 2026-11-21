@@ -11,6 +11,17 @@
 #include <vector>
 
 #include "Runtime.h"
+#include "Log.h"
+#include "NiMath.h"
+#include "Settings.h"
+#include "SafeMemory.h"
+#include "Angles.h"
+#include "Gun.h"
+#include "Nodes.h"
+#include "Hands.h"
+#include "Paths.h"
+#include "ScriptBridge.h"
+#include "State.h"
 #include "Rail.h"
 #include "Palm.h"
 
