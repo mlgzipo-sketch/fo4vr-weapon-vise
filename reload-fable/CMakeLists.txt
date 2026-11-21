@@ -38,6 +38,10 @@ add_library(ManualReloadF SHARED
   src/Angles.cpp
   src/Angles.h
   src/GripHook.cpp
+  src/Nodes.cpp
+  src/Nodes.h
+  src/Gun.cpp
+  src/Gun.h
   src/GripHook.h
   src/Log.cpp
   src/Log.h
